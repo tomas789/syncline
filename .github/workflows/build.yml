@@ -16,6 +16,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -41,5 +46,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-
 
-      - name: Build
-        run: cargo build --release --all-targets
+      - name: Build native binaries
+        run: cargo build --release -p client_folder -p server
+
+      - name: Build WASM library
+        run: wasm-pack build syncline --release --target web --out-dir pkg
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: target/release/client_folder
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: target/release/server
+
+      - name: Upload WASM library artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncline-wasm
+          path: syncline/pkg
