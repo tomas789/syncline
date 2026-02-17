@@ -1,0 +1,3 @@
+[workspace]
+members = ["syncline", "server", "client_folder"]
+resolver = "2"
