@@ -2,6 +2,7 @@
   "name": "syncline-obsidian",
   "version": "0.1.0",
   "description": "Syncline sync plugin for Obsidian",
+  "type": "module",
   "main": "main.js",
   "scripts": {
     "build:wasm": "cd ../syncline && wasm-pack build --target web --out-dir ../obsidian-plugin/wasm",
@@ -19,6 +20,8 @@
     "@rollup/plugin-commonjs": "^25.0.0",
     "@rollup/plugin-node-resolve": "^15.0.0",
     "@rollup/plugin-typescript": "^11.0.0",
+    "eslint": "^9.39.2",
+    "eslint-plugin-obsidianmd": "^0.1.9",
     "obsidian": "latest",
     "rollup": "^4.0.0",
     "rollup-plugin-base64": "^1.0.1",

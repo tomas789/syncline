@@ -75,10 +75,10 @@ export default class SynclinePlugin extends Plugin {
       this.showStatusDetails();
     });
 
-    this.registerEvent(this.app.vault.on('modify', this.onFileModify.bind(this)));
-    this.registerEvent(this.app.vault.on('create', this.onFileCreate.bind(this)));
-    this.registerEvent(this.app.vault.on('delete', this.onFileDelete.bind(this)));
-    this.registerEvent(this.app.vault.on('rename', this.onFileRename.bind(this)));
+    this.registerEvent(this.app.vault.on('modify', this.onFileModify));
+    this.registerEvent(this.app.vault.on('create', this.onFileCreate));
+    this.registerEvent(this.app.vault.on('delete', this.onFileDelete));
+    this.registerEvent(this.app.vault.on('rename', this.onFileRename));
 
     if (this.settings.autoSync) {
       await this.connect();
@@ -91,7 +91,7 @@ export default class SynclinePlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()) as SynclineSettings;
   }
 
   async saveSettings() {
@@ -240,6 +240,8 @@ export default class SynclinePlugin extends Plugin {
     
     this.app.vault.read(file).then(content => {
       this.client?.set_text(docId, content);
+    }).catch(error => {
+      console.error(`[Syncline] Error reading file ${docId}:`, error);
     });
   }
 
@@ -274,7 +276,9 @@ export default class SynclinePlugin extends Plugin {
   deleteLocalFile(path: string) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
-      this.app.vault.delete(file);
+      this.app.fileManager.trashFile(file).catch(error => {
+        console.error(`[Syncline] Error deleting file ${path}:`, error);
+      });
     }
     this.client?.remove_doc(path);
   }
@@ -289,9 +293,13 @@ export default class SynclinePlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(docId);
     
     if (file instanceof TFile) {
-      this.app.vault.modify(file, content).finally(() => {
-        setTimeout(() => this.ignoreChanges.delete(docId), 100);
-      });
+      this.app.vault.modify(file, content)
+        .finally(() => {
+          setTimeout(() => this.ignoreChanges.delete(docId), 100);
+        })
+        .catch(error => {
+          console.error(`[Syncline] Error updating file ${docId}:`, error);
+        });
     }
   }
 
@@ -309,13 +317,13 @@ export default class SynclinePlugin extends Plugin {
     }
   }, 300);
 
-  onFileCreate(file: TAbstractFile) {
+  onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (!['md', 'txt'].includes(file.extension ?? '')) return;
     this.addFile(file);
   }
 
-  onFileDelete(file: TAbstractFile) {
+  onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     const docId = file.path;
     
@@ -324,7 +332,7 @@ export default class SynclinePlugin extends Plugin {
     this.knownFiles.delete(docId);
   }
 
-  onFileRename(file: TAbstractFile, oldPath: string) {
+  onFileRename = (file: TAbstractFile, oldPath: string) => {
     this.client?.index_remove(oldPath);
     this.client?.remove_doc(oldPath);
     this.knownFiles.delete(oldPath);
@@ -348,13 +356,14 @@ class SynclineSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
-      .setName('Syncline settings')
+      .setName('Connection')
       .setHeading();
 
     new Setting(containerEl)
-      .setName('Server URL')
+      .setName('Server address')
       .setDesc('WebSocket URL (e.g., ws://localhost:3030/sync)')
       .addText(text => text
+        // eslint-disable-next-line obsidianmd/ui/sentence-case
         .setPlaceholder('ws://localhost:3030/sync')
         .setValue(this.plugin.settings.serverUrl)
         .onChange(async (value) => {
