@@ -5,6 +5,5 @@
   "minAppVersion": "1.0.0",
   "description": "Real-time collaborative editing for your vault using CRDTs.",
   "author": "Tomas Krejci",
-  "authorUrl": "https://github.com/tomas789/syncline",
   "isDesktopOnly": false
 }
