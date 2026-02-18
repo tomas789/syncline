@@ -13,3 +13,5 @@ wasm/.gitignore
 wasm/package.json
 
 main.js
+
+target/
