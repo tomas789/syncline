@@ -110,8 +110,8 @@ The server runs on any Linux, macOS, or Windows machine. For always-on sync, run
 
 **Option B — Manual Installation**
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/tomas789/syncline-obsidian/releases)
-2. Copy them to `<your-vault>/.obsidian/plugins/syncline-obsidian/`
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/tomas789/syncline/releases)
+2. Copy them to `<your-vault>/.obsidian/plugins/syncline/`
 3. Reload Obsidian and enable the plugin in Settings → Community Plugins
 
 ### Step 3: Connect
@@ -146,10 +146,9 @@ Yes. The plugin works on both desktop and mobile Obsidian.
 
 ---
 
-## Server Links
+## Repository
 
-- **Server repository:** [github.com/tomas789/syncline](https://github.com/tomas789/syncline)
-- **Plugin repository:** [github.com/tomas789/syncline-obsidian](https://github.com/tomas789/syncline-obsidian)
+- **Main repository:** [github.com/tomas789/syncline](https://github.com/tomas789/syncline)
 
 ---
 
