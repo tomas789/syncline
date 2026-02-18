@@ -19,6 +19,7 @@ struct DocState {
     doc: Doc,
     suppress: Arc<AtomicBool>,
     _sub: Arc<SendSubscription>,
+    txn_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -93,18 +94,29 @@ impl Client {
                                     match income {
                                         Some(Ok(Message::Binary(data))) => {
                                             if let Some((msg_type, doc_id, payload)) = decode_message(&data) {
-                                                let docs = docs_clone.read().await;
-                                                if let Some(state) = docs.get(doc_id) {
-                                                    match msg_type {
-                                                        MSG_SYNC_STEP_2 | MSG_UPDATE => {
-                                                            state.suppress.store(true, Ordering::SeqCst);
-                                                            if let Ok(u) = Update::decode_v1(payload) {
-                                                                let mut txn = state.doc.transact_mut();
-                                                                txn.apply_update(u);
+                                                // Clone the txn_lock out under a brief read guard.
+                                                // The lock must be acquired BEFORE re-acquiring the
+                                                // read guard to prevent deadlock (lock ordering:
+                                                // txn_lock -> docs RwLock).
+                                                let txn_lock_opt = {
+                                                    let docs = docs_clone.read().await;
+                                                    docs.get(doc_id).map(|s| s.txn_lock.clone())
+                                                };
+                                                if let Some(txn_lock) = txn_lock_opt {
+                                                    let _guard = txn_lock.lock().await;
+                                                    let docs = docs_clone.read().await;
+                                                    if let Some(state) = docs.get(doc_id) {
+                                                        match msg_type {
+                                                            MSG_SYNC_STEP_2 | MSG_UPDATE => {
+                                                                state.suppress.store(true, Ordering::SeqCst);
+                                                                if let Ok(u) = Update::decode_v1(payload) {
+                                                                    let mut txn = state.doc.transact_mut();
+                                                                    txn.apply_update(u);
+                                                                }
+                                                                state.suppress.store(false, Ordering::SeqCst);
                                                             }
-                                                            state.suppress.store(false, Ordering::SeqCst);
+                                                            _ => {}
                                                         }
-                                                        _ => {}
                                                     }
                                                 }
                                             }
@@ -130,7 +142,7 @@ impl Client {
         Ok(Self { tx, docs })
     }
 
-    pub async fn add_doc(&self, doc_id: String, doc: Doc) -> anyhow::Result<()> {
+    pub async fn add_doc(&self, doc_id: String, doc: Doc) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
         let suppress = Arc::new(AtomicBool::new(false));
         let tx_clone = self.tx.clone();
         let suppress_clone = suppress.clone();
@@ -148,6 +160,8 @@ impl Client {
             sub.map_err(|_| anyhow::anyhow!("Failed to observe doc"))?,
         ));
 
+        let txn_lock = Arc::new(tokio::sync::Mutex::new(()));
+
         // Register doc BEFORE sending Sync Step 1 so we can receive the response
         self.docs.write().await.insert(
             doc_id.clone(),
@@ -155,6 +169,7 @@ impl Client {
                 doc: doc.clone(),
                 suppress,
                 _sub: sub,
+                txn_lock: txn_lock.clone(),
             },
         );
 
@@ -163,7 +178,7 @@ impl Client {
         let msg = encode_message(MSG_SYNC_STEP_1, &doc_id, &sv);
         let _ = self.tx.send(msg).await;
 
-        Ok(())
+        Ok(txn_lock)
     }
 
     pub async fn remove_doc(&self, doc_id: &str) {

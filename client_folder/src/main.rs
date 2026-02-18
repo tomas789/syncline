@@ -29,6 +29,7 @@ unsafe impl Sync for SendSubscription {}
 struct ActiveFile {
     doc: Doc,
     file_path: PathBuf,
+    txn_lock: Arc<tokio::sync::Mutex<()>>,
     _sub: SendSubscription,
 }
 
@@ -79,6 +80,19 @@ fn meta_dir(root_dir: &Path) -> PathBuf {
 fn crdt_state_path(root_dir: &Path, rel_path: &str) -> PathBuf {
     let safe_name = rel_path.replace(['/', '\\'], "_");
     meta_dir(root_dir).join(format!("{}.yrs", safe_name))
+}
+
+fn is_system_path(path: &Path) -> bool {
+    const SYSTEM_DIRS: &[&str] = &[
+        ".syncline",
+        "node_modules",
+        ".git",
+        ".obsidian",
+        "target",
+        ".DS_Store",
+    ];
+    path.components()
+        .any(|c| SYSTEM_DIRS.iter().any(|d| c.as_os_str() == *d))
 }
 
 fn persist_doc(root_dir: &Path, rel_path: &str, doc: &Doc) {
@@ -227,8 +241,8 @@ async fn main() -> anyhow::Result<()> {
         persist_update_incremental(&dir_for_index_persist, "__index__", &event.update);
     });
 
-    // Add index doc to client
-    client.add_doc("__index__".to_string(), index_doc.clone()).await?;
+    // Add index doc to client; capture per-doc transaction lock
+    let index_txn_lock = client.add_doc("__index__".to_string(), index_doc.clone()).await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     persist_doc(&canonical_dir, "__index__", &index_doc);
@@ -242,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
         {
             let path = entry.path();
             if path.is_file() {
-                if path.components().any(|c| c.as_os_str() == ".syncline") {
+                if is_system_path(path) {
                     continue;
                 }
                 if let Some(ext) = path.extension() {
@@ -256,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if !local_files.is_empty() {
+            let _guard = index_txn_lock.lock().await;
             let mut txn = index_doc.transact_mut();
             for f in &local_files {
                 index_map.insert(&mut txn, f.clone(), "1");
@@ -314,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(event) = rx.recv().await {
         for path in event.paths {
-            if path.components().any(|c| c.as_os_str() == ".syncline") {
+            if is_system_path(&path) {
                 continue;
             }
 
@@ -323,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if path.exists() && path.is_file() {
                     {
+                        let _guard = index_txn_lock.lock().await;
                         let mut txn = index_doc.transact_mut();
                         let in_index = index_map.contains_key(&txn, &rel_path_str);
                         if !in_index {
@@ -362,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 } else if !path.exists() {
                     {
+                        let _guard = index_txn_lock.lock().await;
                         let mut txn = index_doc.transact_mut();
                         if index_map.contains_key(&txn, &rel_path_str) {
                             index_map.remove(&mut txn, &rel_path_str);
@@ -514,7 +531,7 @@ async fn start_file_sync(
         }
     }));
 
-    client.add_doc(doc_id.clone(), doc.clone()).await?;
+    let txn_lock = client.add_doc(doc_id.clone(), doc.clone()).await?;
 
     let initial_update = {
         let txn = doc.transact();
@@ -568,6 +585,7 @@ async fn start_file_sync(
     let handler = Arc::new(ActiveFile {
         doc,
         file_path,
+        txn_lock,
         _sub: sub,
     });
 
@@ -613,6 +631,7 @@ async fn sync_local_change(handler: &ActiveFile) -> anyhow::Result<()> {
     );
 
     let diffs = diff::chars(&current_y_text, &content);
+    let _guard = handler.txn_lock.lock().await;
     let mut txn = handler.doc.transact_mut();
     let mut index = 0u32;
 

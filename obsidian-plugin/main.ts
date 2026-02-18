@@ -254,21 +254,47 @@ export default class SynclinePlugin extends Plugin {
     this.addDocOnly(file);
   }
 
+  private async ensureParentFolders(filePath: string): Promise<void> {
+    const parts = filePath.split('/');
+    parts.pop(); // remove filename, keep only directory parts
+    let currentPath = '';
+    for (const part of parts) {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const existing = this.app.vault.getAbstractFileByPath(currentPath);
+      if (!existing) {
+        try {
+          await this.app.vault.createFolder(currentPath);
+        } catch (e) {
+          // createFolder throws if folder already exists (race condition); re-check
+          if (!this.app.vault.getAbstractFileByPath(currentPath)) {
+            console.error(`[Syncline] Failed to create folder ${currentPath}:`, e);
+            throw e;
+          }
+        }
+      }
+    }
+  }
+
   async createFileFromRemote(docId: string) {
     if (!this.client) return;
-    
+
     this.client.add_doc(docId, () => {
       this.onRemoteUpdate(docId);
     });
-    
+
     await new Promise(resolve => setTimeout(resolve, 500));
-    
+
     const content = this.client.get_text(docId);
     if (content) {
       const file = this.app.vault.getAbstractFileByPath(docId);
       if (!(file instanceof TFile)) {
-        await this.app.vault.create(docId, content);
-        this.knownFiles.add(docId);
+        try {
+          await this.ensureParentFolders(docId);
+          await this.app.vault.create(docId, content);
+          this.knownFiles.add(docId);
+        } catch (error) {
+          console.error(`[Syncline] Failed to create file ${docId}:`, error);
+        }
       }
     }
   }
