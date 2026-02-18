@@ -20,6 +20,11 @@ struct Args {
 
     #[arg(short, long)]
     dir: PathBuf,
+
+    /// Path component names to exclude from sync (directory or file names).
+    /// If provided, replaces the defaults entirely. .syncline is always excluded regardless.
+    #[arg(long, value_name = "NAME", default_values = ["node_modules", ".git", ".obsidian", "target", ".DS_Store"])]
+    exclude: Vec<String>,
 }
 
 struct SendSubscription(#[allow(dead_code)] Subscription);
@@ -82,17 +87,14 @@ fn crdt_state_path(root_dir: &Path, rel_path: &str) -> PathBuf {
     meta_dir(root_dir).join(format!("{}.yrs", safe_name))
 }
 
-fn is_system_path(path: &Path) -> bool {
-    const SYSTEM_DIRS: &[&str] = &[
-        ".syncline",
-        "node_modules",
-        ".git",
-        ".obsidian",
-        "target",
-        ".DS_Store",
-    ];
-    path.components()
-        .any(|c| SYSTEM_DIRS.iter().any(|d| c.as_os_str() == *d))
+fn is_excluded(path: &Path, exclusions: &[String]) -> bool {
+    path.components().any(|c| {
+        let s = c.as_os_str();
+        if s == ".syncline" {
+            return true;
+        }
+        exclusions.iter().any(|e| s == e.as_str())
+    })
 }
 
 fn persist_doc(root_dir: &Path, rel_path: &str, doc: &Doc) {
@@ -256,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         {
             let path = entry.path();
             if path.is_file() {
-                if is_system_path(path) {
+                if is_excluded(path, &args.exclude) {
                     continue;
                 }
                 if let Some(ext) = path.extension() {
@@ -329,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(event) = rx.recv().await {
         for path in event.paths {
-            if is_system_path(&path) {
+            if is_excluded(&path, &args.exclude) {
                 continue;
             }
 
