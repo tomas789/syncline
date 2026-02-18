@@ -12,14 +12,11 @@ A CRDT-based synchronization plugin for Obsidian that enables real-time collabor
 
 ## Installation
 
-### Manual Installation
-
-1. Download the latest release or build from source
+1. Download the latest release from [github.com/tomas789/syncline/releases](https://github.com/tomas789/syncline/releases)
 2. Copy the following files to your Obsidian vault's `.obsidian/plugins/syncline-obsidian/` folder:
    - `main.js`
    - `manifest.json`
    - `styles.css`
-   - `wasm/` folder (containing `syncline.js`, `syncline_bg.wasm`, and `.d.ts` files)
 3. Restart Obsidian
 4. Enable the plugin in Settings > Community plugins
 
@@ -27,7 +24,7 @@ A CRDT-based synchronization plugin for Obsidian that enables real-time collabor
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/syncline.git
+git clone https://github.com/tomas789/syncline.git
 cd syncline
 
 # Build the WASM module
@@ -55,6 +52,7 @@ npm run build
 ### Prerequisites
 
 1. Build and run the Syncline server:
+
    ```bash
    cd syncline
    cargo run --bin server -- --port 3030
@@ -95,7 +93,7 @@ npm run build
    - Enable "File Transfer" mode on Android
    - Navigate to your Obsidian vault folder on the device
    - Create the folder `.obsidian/plugins/syncline-obsidian/`
-   - Copy all plugin files (`main.js`, `manifest.json`, `styles.css`, `wasm/` folder)
+   - Copy the plugin files (`main.js`, `manifest.json`, `styles.css`)
    - Disconnect the device
 
 3. **Configure and test**:
@@ -122,7 +120,7 @@ npm run build
    - On your computer, locate your Obsidian vault in iCloud Drive
    - Navigate to `.obsidian/plugins/`
    - Create `syncline-obsidian/` folder
-   - Copy all plugin files (`main.js`, `manifest.json`, `styles.css`, `wasm/` folder)
+   - Copy the plugin files (`main.js`, `manifest.json`, `styles.css`)
    - Wait for iCloud to sync
 
 3. **Alternative: Using Obsidian Git or other sync methods**:
@@ -161,6 +159,7 @@ cargo run --bin client_folder -- --url ws://SERVER_IP:3030 --dir /path/to/vault
 ```
 
 This is useful for:
+
 - Syncing to a Linux server or NAS
 - Running automated backups
 - Testing synchronization without Obsidian
@@ -168,6 +167,7 @@ This is useful for:
 ## Architecture
 
 The plugin uses:
+
 - **WASM module** (Rust/yr) for CRDT-based conflict resolution
 - **WebSocket** for real-time communication with the server
 - **Obsidian Vault API** for file system operations
