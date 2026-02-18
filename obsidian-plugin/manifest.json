@@ -1,10 +1,10 @@
 {
-  "id": "syncline-obsidian",
-  "name": "Syncline Sync",
+  "id": "syncline",
+  "name": "Syncline (live sync)",
   "version": "0.1.0",
   "minAppVersion": "1.0.0",
-  "description": "CRDT-based synchronization for Obsidian vaults using Syncline",
-  "author": "Syncline",
+  "description": "Real-time collaborative editing for your vault using CRDTs.",
+  "author": "Tomas Krejci",
   "authorUrl": "https://github.com/tomas789/syncline",
   "isDesktopOnly": false
 }
