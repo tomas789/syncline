@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Rust Binaries (Linux amd64)
+        run: cargo build --release -p client_folder -p server
+
+      - name: Build Obsidian Plugin
+        run: |
+          cd obsidian-plugin
+          npm install
+          npm run build
+
+      - name: Prepare artifacts
+        run: |
+          mkdir artifacts
+          cp target/release/server artifacts/syncline-server-linux-amd64
+          cp target/release/client_folder artifacts/syncline-client-linux-amd64
+          cp obsidian-plugin/main.js artifacts/main.js
+          cp obsidian-plugin/manifest.json artifacts/manifest.json
+          cp obsidian-plugin/styles.css artifacts/styles.css
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/syncline-server-linux-amd64
+            artifacts/syncline-client-linux-amd64
+            artifacts/main.js
+            artifacts/manifest.json
+            artifacts/styles.css
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
