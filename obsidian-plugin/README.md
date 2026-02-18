@@ -36,7 +36,9 @@ cd ../obsidian-plugin
 npm install
 npm run build
 
-# The plugin files are now ready in the obsidian-plugin directory
+# The plugin files are ready:
+# - main.js and styles.css in obsidian-plugin/
+# - manifest.json in the root directory
 ```
 
 ## Configuration

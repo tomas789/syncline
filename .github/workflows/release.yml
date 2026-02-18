@@ -41,7 +41,7 @@ jobs:
           cp target/release/server artifacts/syncline-server-linux-amd64
           cp target/release/client_folder artifacts/syncline-client-linux-amd64
           cp obsidian-plugin/main.js artifacts/main.js
-          cp obsidian-plugin/manifest.json artifacts/manifest.json
+          cp manifest.json artifacts/manifest.json
           cp obsidian-plugin/styles.css artifacts/styles.css
 
       - name: Upload Release Assets
