@@ -45,7 +45,7 @@ async function initWasm(): Promise<WasmModule> {
   await wasmModule.default(Promise.resolve(buffer));
   wasmInitialized = true;
   wasm = wasmModule as unknown as WasmModule;
-  console.log('[Syncline] WASM initialized');
+  console.debug('[Syncline] WASM initialized');
   return wasm;
 }
 
@@ -62,7 +62,7 @@ export default class SynclinePlugin extends Plugin {
   knownFiles: Set<string> = new Set();
 
   async onload() {
-    console.log('[Syncline] Loading plugin...');
+    console.debug('[Syncline] Loading plugin...');
     await this.loadSettings();
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
@@ -122,14 +122,14 @@ export default class SynclinePlugin extends Plugin {
     new Notice(`Syncline: ${status}`);
     
     if (this.syncStatus === 'error' || this.syncStatus === 'disconnected') {
-      this.connect();
+      void this.connect();
     }
   }
 
   async connect() {
     try {
       this.updateStatus('syncing', 'Syncline: Connecting...');
-      console.log('[Syncline] Connecting to:', this.settings.serverUrl);
+      console.debug('[Syncline] Connecting to:', this.settings.serverUrl);
       
       const wasmMod = await initWasm();
       this.client = new wasmMod.SynclineClient(this.settings.serverUrl);
@@ -141,7 +141,7 @@ export default class SynclinePlugin extends Plugin {
       
       // Add all files to index BEFORE connecting
       const files = this.app.vault.getMarkdownFiles();
-      console.log('[Syncline] Adding', files.length, 'files to index');
+      console.debug('[Syncline] Adding', files.length, 'files to index');
       
       for (const file of files) {
         const docId = file.path;
@@ -208,7 +208,7 @@ export default class SynclinePlugin extends Plugin {
     if (!this.client) return;
     
     const keys = this.client.index_keys();
-    console.log('[Syncline] Index update, keys:', keys);
+    console.debug('[Syncline] Index update, keys:', keys);
     
     for (const key of keys) {
       if (!this.knownFiles.has(key)) {
@@ -217,7 +217,7 @@ export default class SynclinePlugin extends Plugin {
         if (file instanceof TFile) {
           this.addDocOnly(file);
         } else {
-          this.createFileFromRemote(key);
+          void this.createFileFromRemote(key);
         }
       }
     }
@@ -309,13 +309,13 @@ export default class SynclinePlugin extends Plugin {
     }
   }, 300);
 
-  async onFileCreate(file: TAbstractFile) {
+  onFileCreate(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
     if (!['md', 'txt'].includes(file.extension ?? '')) return;
     this.addFile(file);
   }
 
-  async onFileDelete(file: TAbstractFile) {
+  onFileDelete(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
     const docId = file.path;
     
@@ -324,7 +324,7 @@ export default class SynclinePlugin extends Plugin {
     this.knownFiles.delete(docId);
   }
 
-  async onFileRename(file: TAbstractFile, oldPath: string) {
+  onFileRename(file: TAbstractFile, oldPath: string) {
     this.client?.index_remove(oldPath);
     this.client?.remove_doc(oldPath);
     this.knownFiles.delete(oldPath);
@@ -347,7 +347,9 @@ class SynclineSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: 'Syncline Settings' });
+    new Setting(containerEl)
+      .setName('Syncline settings')
+      .setHeading();
 
     new Setting(containerEl)
       .setName('Server URL')
@@ -361,7 +363,7 @@ class SynclineSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Auto Sync')
+      .setName('Auto sync')
       .setDesc('Sync automatically when Obsidian starts')
       .addToggle(toggle => toggle
         .setValue(this.plugin.settings.autoSync)
@@ -377,7 +379,7 @@ class SynclineSettingTab extends PluginSettingTab {
         .setButtonText('Reconnect')
         .onClick(() => {
           this.plugin.disconnect();
-          this.plugin.connect();
+          void this.plugin.connect();
         }));
   }
 }
