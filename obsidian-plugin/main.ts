@@ -363,8 +363,7 @@ class SynclineSettingTab extends PluginSettingTab {
       .setName('Server address')
       .setDesc('WebSocket URL (e.g., ws://localhost:3030/sync)')
       .addText(text => text
-        // eslint-disable-next-line obsidianmd/ui/sentence-case
-        .setPlaceholder('ws://localhost:3030/sync')
+        .setPlaceholder('Enter server address')
         .setValue(this.plugin.settings.serverUrl)
         .onChange(async (value) => {
           this.plugin.settings.serverUrl = value;
