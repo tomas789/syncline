@@ -536,6 +536,7 @@ async fn start_file_sync(
     let txn_lock = client.add_doc(doc_id.clone(), doc.clone()).await?;
 
     let initial_update = {
+        let _g = txn_lock.lock().await;
         let txn = doc.transact();
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
     };
@@ -548,9 +549,13 @@ async fn start_file_sync(
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    persist_doc(root_dir, &rel_path, &doc);
+    {
+        let _g = txn_lock.lock().await;
+        persist_doc(root_dir, &rel_path, &doc);
+    }
 
     {
+        let _g = txn_lock.lock().await;
         let txn = doc.transact();
         let content = text.get_string(&txn);
         if !content.is_empty() {
@@ -616,6 +621,7 @@ async fn sync_local_change(handler: &ActiveFile) -> anyhow::Result<()> {
     };
     let text = handler.doc.get_or_insert_text("content");
 
+    let _guard = handler.txn_lock.lock().await;
     let current_y_text = {
         let txn = handler.doc.transact();
         text.get_string(&txn)
@@ -633,7 +639,6 @@ async fn sync_local_change(handler: &ActiveFile) -> anyhow::Result<()> {
     );
 
     let diffs = diff::chars(&current_y_text, &content);
-    let _guard = handler.txn_lock.lock().await;
     let mut txn = handler.doc.transact_mut();
     let mut index = 0u32;
 
