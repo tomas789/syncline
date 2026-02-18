@@ -1,0 +1,28 @@
+{
+  "name": "syncline-obsidian",
+  "version": "0.1.0",
+  "description": "Syncline sync plugin for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "build:wasm": "cd ../syncline && wasm-pack build --target web --out-dir ../obsidian-plugin/wasm",
+    "build": "npm run build:wasm && rollup --config rollup.config.js",
+    "dev": "rollup --config rollup.config.js --watch"
+  },
+  "keywords": [
+    "obsidian",
+    "sync",
+    "crdt"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "obsidian": "latest",
+    "rollup": "^4.0.0",
+    "rollup-plugin-base64": "^1.0.1",
+    "tslib": "^2.6.0",
+    "typescript": "^5.3.0"
+  }
+}

@@ -112,7 +112,7 @@ impl TestCluster {
         }
 
         let bin_path = env!("CARGO_BIN_EXE_client_folder");
-        let url = format!("ws://127.0.0.1:{}", self.server_port);
+        let url = format!("ws://127.0.0.1:{}/sync", self.server_port);
 
         // We use client_folder here as it's the main sync agent
         let mut child = Command::new(bin_path)

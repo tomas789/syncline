@@ -15,29 +15,23 @@ use yrs::{Doc, GetString, Map, Observable, ReadTxn, Subscription, Text, Transact
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "ws://127.0.0.1:3030")]
+    #[arg(short, long, default_value = "ws://127.0.0.1:3030/sync")]
     url: String,
 
     #[arg(short, long)]
     dir: PathBuf,
 }
 
-// Wrapper to make Subscription Send + Sync
 struct SendSubscription(#[allow(dead_code)] Subscription);
 unsafe impl Send for SendSubscription {}
 unsafe impl Sync for SendSubscription {}
 
-// Map: Relative Path -> Active File Handler Info
 struct ActiveFile {
-    _client: Arc<Client>,
     doc: Doc,
     file_path: PathBuf,
-    // Text observer subscription must be kept alive
     _sub: SendSubscription,
 }
 
-/// Tracks which files are being synced or are in the process of connecting.
-/// Uses a HashSet for pending (connecting) and a HashMap for active (connected).
 struct FileRegistry {
     active: HashMap<String, Arc<ActiveFile>>,
     pending: HashSet<String>,
@@ -51,7 +45,6 @@ impl FileRegistry {
         }
     }
 
-    /// Try to claim a file for sync. Returns true if this caller should proceed.
     fn try_claim(&mut self, rel_path: &str) -> bool {
         if self.active.contains_key(rel_path) || self.pending.contains(rel_path) {
             false
@@ -79,19 +72,15 @@ impl FileRegistry {
     }
 }
 
-/// Returns the path to the `.syncline` metadata directory inside root_dir.
 fn meta_dir(root_dir: &Path) -> PathBuf {
     root_dir.join(".syncline")
 }
 
-/// Returns the path where a file's CRDT state is persisted.
 fn crdt_state_path(root_dir: &Path, rel_path: &str) -> PathBuf {
     let safe_name = rel_path.replace(['/', '\\'], "_");
     meta_dir(root_dir).join(format!("{}.yrs", safe_name))
 }
 
-/// Save the full CRDT document state to disk.
-/// MUST NOT be called from inside an observer callback (would deadlock on transaction).
 fn persist_doc(root_dir: &Path, rel_path: &str, doc: &Doc) {
     let path = crdt_state_path(root_dir, rel_path);
     if let Some(parent) = path.parent() {
@@ -104,16 +93,12 @@ fn persist_doc(root_dir: &Path, rel_path: &str, doc: &Doc) {
     }
 }
 
-/// Incrementally persist a CRDT update to disk by appending it.
-/// This is safe to call from observer callbacks since it doesn't open a transaction.
 fn persist_update_incremental(root_dir: &Path, rel_path: &str, update_data: &[u8]) {
     let path = crdt_state_path(root_dir, rel_path);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Read existing state, merge with new update, and write back.
-    // This is safer than appending raw updates (which would require multi-update replay).
     let doc = Doc::new();
     if path.exists() {
         if let Ok(existing) = std::fs::read(&path) {
@@ -134,8 +119,6 @@ fn persist_update_incremental(root_dir: &Path, rel_path: &str, update_data: &[u8
     }
 }
 
-/// Load persisted CRDT state into a Doc, if it exists.
-/// Returns the Doc (either restored or fresh).
 fn load_or_create_doc(root_dir: &Path, rel_path: &str) -> Doc {
     let doc = Doc::new();
     let path = crdt_state_path(root_dir, rel_path);
@@ -177,31 +160,30 @@ async fn main() -> anyhow::Result<()> {
     }
     let canonical_dir = args.dir.canonicalize()?;
 
-    // Ensure .syncline metadata directory exists
     let _ = std::fs::create_dir_all(meta_dir(&canonical_dir));
 
     log::info!("Syncing directory: {}", canonical_dir.display());
 
     let registry: Arc<Mutex<FileRegistry>> = Arc::new(Mutex::new(FileRegistry::new()));
 
+    // Create single client connection
+    let client = Arc::new(Client::new(&args.url).await?);
+
     // 1. Setup Index Document (Root)
     let index_doc = load_or_create_doc(&canonical_dir, "__index__");
     let index_map = index_doc.get_or_insert_map("files");
-    let index_url = format!("{}/sync/index_root", args.url);
 
     // 2. Observe Index for Remote Changes
     let registry_clone = registry.clone();
-    let url_clone = args.url.clone();
+    let client_clone = client.clone();
     let dir_clone = canonical_dir.clone();
 
     let _index_sub = {
         let map_clone = index_map.clone();
         index_map.observe(move |txn, event| {
-            // Check for removals first
             for key in event.keys(txn).keys() {
                 let rel_path = key.to_string();
 
-                // If key is NOT in map, it was removed -> Delete local file
                 if !map_clone.contains_key(txn, &rel_path) {
                     log::info!("Remote deletion detected: {}", rel_path);
                     let file_path = dir_clone.join(&rel_path);
@@ -209,19 +191,15 @@ async fn main() -> anyhow::Result<()> {
                         if let Err(e) = std::fs::remove_file(&file_path) {
                             log::error!("Failed to delete local file {}: {}", rel_path, e);
                         } else {
-                            // Also remove .yrs state file
                             let yrs_path = crdt_state_path(&dir_clone, &rel_path);
                             if yrs_path.exists() {
                                 let _ = std::fs::remove_file(yrs_path);
                             }
                             log::info!("Deleted local file: {}", rel_path);
-
-                            // Unclaim from registry
                             registry_clone.lock().unwrap().unclaim(&rel_path);
                         }
                     }
                 } else {
-                    // Key exists -> Start sync if needed
                     let should_start = {
                         let mut reg = registry_clone.lock().unwrap();
                         reg.try_claim(&rel_path)
@@ -229,13 +207,12 @@ async fn main() -> anyhow::Result<()> {
                     if should_start {
                         log::info!("Discovered remote file in index: {}", rel_path);
                         let reg = registry_clone.clone();
-                        let u = url_clone.clone();
+                        let c = client_clone.clone();
                         let d = dir_clone.clone();
                         let rp = rel_path.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = start_file_sync(&u, &d, rp.clone(), &reg).await {
+                            if let Err(e) = start_file_sync(&c, &d, rp.clone(), &reg).await {
                                 log::error!("Error starting file sync for {}: {}", rp, e);
-                                // Unclaim on error
                                 reg.lock().unwrap().unclaim(&rp);
                             }
                         });
@@ -245,23 +222,18 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Persist index doc on every update using observe_update_v1
-    // (safe from inside observer because we create a separate temporary doc for merging)
     let dir_for_index_persist = canonical_dir.clone();
     let _index_persist_sub = index_doc.observe_update_v1(move |_txn, event| {
         persist_update_incremental(&dir_for_index_persist, "__index__", &event.update);
     });
 
-    // Connect index doc to server. Client auto-sends doc mutations.
-    let index_client = Client::new(&index_url, index_doc.clone()).await?;
+    // Add index doc to client
+    client.add_doc("__index__".to_string(), index_doc.clone()).await?;
 
-    // Give server time to send us existing index state
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Persist after initial sync (full state, outside any observer)
     persist_doc(&canonical_dir, "__index__", &index_doc);
 
-    // 3. Scan Local Files, update index, and start file sync for each
+    // 3. Scan Local Files
     {
         let mut local_files = Vec::new();
         for entry in WalkDir::new(&canonical_dir)
@@ -270,7 +242,6 @@ async fn main() -> anyhow::Result<()> {
         {
             let path = entry.path();
             if path.is_file() {
-                // Skip .syncline metadata directory
                 if path.components().any(|c| c.as_os_str() == ".syncline") {
                     continue;
                 }
@@ -284,7 +255,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Insert local files into index (auto-sent to server)
         if !local_files.is_empty() {
             let mut txn = index_doc.transact_mut();
             for f in &local_files {
@@ -292,7 +262,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Start sync for local files
         for f in local_files {
             let should_start = {
                 let mut reg = registry.lock().unwrap();
@@ -300,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
             };
             if should_start {
                 if let Err(e) =
-                    start_file_sync(&args.url, &canonical_dir, f.clone(), &registry).await
+                    start_file_sync(&client, &canonical_dir, f.clone(), &registry).await
                 {
                     log::error!("Error starting file sync for {}: {}", f, e);
                     registry.lock().unwrap().unclaim(&f);
@@ -309,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Also sync any files already in the remote index that we don't have locally
+    // Sync remote-only files
     {
         let txn = index_doc.transact();
         let remote_files: Vec<String> = index_map.keys(&txn).map(|k| k.to_string()).collect();
@@ -323,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
             if should_start {
                 log::info!("Found remote-only file in index: {}", f);
                 if let Err(e) =
-                    start_file_sync(&args.url, &canonical_dir, f.clone(), &registry).await
+                    start_file_sync(&client, &canonical_dir, f.clone(), &registry).await
                 {
                     log::error!("Error starting file sync for {}: {}", f, e);
                     registry.lock().unwrap().unclaim(&f);
@@ -343,33 +312,24 @@ async fn main() -> anyhow::Result<()> {
 
     log::info!("Watching for changes...");
 
-    // Keep index_client alive
-    let _keep_index = index_client;
-
     while let Some(event) = rx.recv().await {
         for path in event.paths {
-            // Filter out .syncline
             if path.components().any(|c| c.as_os_str() == ".syncline") {
                 continue;
             }
 
-            // We need rel_path.
             if let Ok(rel_path) = path.strip_prefix(&canonical_dir) {
                 let rel_path_str = rel_path.to_string_lossy().to_string();
 
                 if path.exists() && path.is_file() {
-                    // FILE EXISTS -> UPSERT (Create / Modify / Rename Dest)
-
-                    // Ensure it's in the index
                     {
-                        let mut txn = index_doc.transact_mut(); // Transact mut immediately to insert
+                        let mut txn = index_doc.transact_mut();
                         let in_index = index_map.contains_key(&txn, &rel_path_str);
                         if !in_index {
                             index_map.insert(&mut txn, rel_path_str.clone(), "1");
                         }
                     }
 
-                    // Ensure sync is active
                     let (is_active, handler) = {
                         let reg = registry.lock().unwrap();
                         let active = reg.is_active(&rel_path_str);
@@ -384,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
                         };
                         if should_start {
                             if let Err(e) = start_file_sync(
-                                &args.url,
+                                &client,
                                 &canonical_dir,
                                 rel_path_str.clone(),
                                 &registry,
@@ -401,12 +361,6 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 } else if !path.exists() {
-                    // FILE DOES NOT EXIST -> REMOVE (Delete)
-                    // Note: If a directory is deleted, we might see the dir path.
-                    // If we tracked files inside it, we rely on individual file events or catch them later?
-                    // notify usually sends events for children on recursive watch.
-
-                    // Remove from index
                     {
                         let mut txn = index_doc.transact_mut();
                         if index_map.contains_key(&txn, &rel_path_str) {
@@ -415,7 +369,6 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Unclaim
                     registry.lock().unwrap().unclaim(&rel_path_str);
                 }
             }
@@ -426,25 +379,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_file_sync(
-    url_base: &str,
+    client: &Arc<Client>,
     root_dir: &Path,
     rel_path: String,
     registry: &Arc<Mutex<FileRegistry>>,
 ) -> anyhow::Result<()> {
     let file_path = root_dir.join(&rel_path);
-    let doc_id = rel_path.replace(['/', '\\'], "_");
-    let url = format!("{}/sync/{}", url_base, doc_id);
+    let doc_id = rel_path.clone();
 
     log::info!("Starting sync for file: {} (doc_id: {})", rel_path, doc_id);
 
-    // Step 1: Load persisted CRDT state (preserves offline edits as proper CRDT ops)
     let doc = load_or_create_doc(root_dir, &rel_path);
     let text = doc.get_or_insert_text("content");
 
-    // Step 2: Apply any local file changes made while daemon was off.
     if file_path.exists() {
         if let Ok(file_bytes) = tokio::fs::read(&file_path).await {
-            // Check if looks like text (valid utf8)
             let (_is_binary, local_content) = match String::from_utf8(file_bytes.clone()) {
                 Ok(s) => (false, s),
                 Err(_) => (
@@ -492,11 +441,8 @@ async fn start_file_sync(
         }
     }
 
-    // Persist after applying local edits (before connecting, outside any observer)
     persist_doc(root_dir, &rel_path, &doc);
 
-    // Step 3: Register observers BEFORE connecting so they catch all incoming changes.
-    // Observe text changes to write to local file AND persist CRDT state.
     let file_path_clone = file_path.clone();
     let text_clone = text.clone();
     let root_dir_persist = root_dir.to_path_buf();
@@ -504,16 +450,10 @@ async fn start_file_sync(
     let sub = SendSubscription(text.observe(move |txn, _event| {
         let content = text_clone.get_string(txn);
 
-        // Handle BINARY: encoding
-        // Handle BINARY: encoding
         let trimmed = content.trim();
         if trimmed.starts_with("BINARY:") {
-            // Handle potential newlines in base64? decode ignores whitespace usually if configured, but standard might not.
-            // We strip prefix first.
             let items: Vec<&str> = trimmed.splitn(2, "BINARY:").collect();
-            let b64 = items.get(1).unwrap_or(&""); // Should be safe if starts_with matched
-
-            // Remove whitespace from b64 string before decoding just in case
+            let b64 = items.get(1).unwrap_or(&"");
             let b64_clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
 
             if let Ok(bytes) = BASE64_STANDARD.decode(&b64_clean) {
@@ -560,7 +500,6 @@ async fn start_file_sync(
                 );
             }
         }
-        // Persist CRDT state (encode from the transaction we already have)
         let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
         let path = crdt_state_path(&root_dir_persist, &rel_path_persist);
         if let Some(parent) = path.parent() {
@@ -575,23 +514,13 @@ async fn start_file_sync(
         }
     }));
 
-    // Step 4: NOW connect to server. The sync protocol exchanges state vectors,
-    // so only missing deltas are sent in each direction. Both clients' offline
-    // edits are proper CRDT operations and will merge correctly.
-    // Because observers are already registered, any incoming content will
-    // automatically be written to the local file.
-    let client = Client::new(&url, doc.clone()).await?;
-    let client = Arc::new(client);
+    client.add_doc(doc_id.clone(), doc.clone()).await?;
 
-    // Step 5: Explicitly push our local state to the server.
-    // Client::new() only sends our SV (asking "what am I missing?").
-    // The server responds with what we're missing, but never asks what IT'S missing.
-    // So we send our full state as an update — the server will merge it + broadcast.
     let initial_update = {
         let txn = doc.transact();
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
     };
-    if let Err(e) = client.send_update(initial_update).await {
+    if let Err(e) = client.send_update(&doc_id, initial_update).await {
         log::error!(
             "Failed to send initial state to server for {}: {}",
             rel_path,
@@ -599,14 +528,9 @@ async fn start_file_sync(
         );
     }
 
-    // Give time for initial sync exchange
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Persist after server sync (outside any observer)
     persist_doc(root_dir, &rel_path, &doc);
 
-    // Write current doc content to file (in case remote had content that
-    // the observer already wrote, this is a safety net)
     {
         let txn = doc.transact();
         let content = text.get_string(&txn);
@@ -628,7 +552,6 @@ async fn start_file_sync(
                         bytes.len()
                     );
                 } else {
-                    // Fallback? Or log error?
                     log::error!("Failed to decode binary content in safety net");
                 }
             } else {
@@ -643,13 +566,11 @@ async fn start_file_sync(
     }
 
     let handler = Arc::new(ActiveFile {
-        _client: client,
         doc,
         file_path,
         _sub: sub,
     });
 
-    // Check for pending local changes that occurred during startup
     if let Err(e) = sync_local_change(&handler).await {
         log::error!("Initial sync_local_change failed for {}: {}", rel_path, e);
     }
@@ -691,7 +612,6 @@ async fn sync_local_change(handler: &ActiveFile) -> anyhow::Result<()> {
         &content[..content.len().min(50)]
     );
 
-    // Apply character-level diff to CRDT (auto-sent by Client observer)
     let diffs = diff::chars(&current_y_text, &content);
     let mut txn = handler.doc.transact_mut();
     let mut index = 0u32;
@@ -711,8 +631,6 @@ async fn sync_local_change(handler: &ActiveFile) -> anyhow::Result<()> {
             }
         }
     }
-
-    // Persist is handled by the observer
 
     Ok(())
 }

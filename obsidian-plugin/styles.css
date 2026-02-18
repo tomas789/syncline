@@ -1,0 +1,40 @@
+.syncline-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.syncline-status-bar .status-icon {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.syncline-status-bar .status-icon.synced {
+  background-color: #4caf50;
+}
+
+.syncline-status-bar .status-icon.syncing {
+  background-color: #ff9800;
+  animation: pulse 1s infinite;
+}
+
+.syncline-status-bar .status-icon.error {
+  background-color: #f44336;
+}
+
+.syncline-status-bar .status-icon.disconnected {
+  background-color: #9e9e9e;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.syncline-notice {
+  padding: 8px 12px;
+  border-radius: 4px;
+}

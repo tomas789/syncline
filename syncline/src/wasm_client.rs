@@ -1,196 +1,386 @@
 use js_sys::{Function, Uint8Array};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, Subscription, Text, Transact, Update};
+use yrs::{Doc, GetString, Map, ReadTxn, StateVector, Subscription, Text, Transact, Update};
 
-use crate::protocol::{MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE};
+use crate::protocol::{
+    decode_message, encode_message, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
+};
 
-#[wasm_bindgen]
-pub struct SynclineFile {
-    url: String,
+struct DocState {
     doc: Doc,
-    ws: Option<WebSocket>,
-    // We need to keep closures alive
-    _closures: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>>,
-    // Keep subscription alive
-    _sub: Option<Subscription>,
     callback: Function,
-    is_synced: Rc<RefCell<bool>>,
+    _sub: Subscription,
+    is_receiving: Rc<RefCell<bool>>,
+    doc_type: DocType,
+}
+
+enum DocType {
+    Text,
+    Map,
 }
 
 #[wasm_bindgen]
-impl SynclineFile {
+pub struct SynclineClient {
+    url: String,
+    ws: Option<WebSocket>,
+    docs: Rc<RefCell<HashMap<String, DocState>>>,
+    closures: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>>,
+    is_connected: Rc<RefCell<bool>>,
+    index_callback: Rc<RefCell<Option<Function>>>,
+}
+
+#[wasm_bindgen]
+impl SynclineClient {
     #[wasm_bindgen(constructor)]
-    pub fn new(url: String, callback: Function) -> Result<SynclineFile, JsValue> {
-        // Set panic hook for better debugging
+    pub fn new(url: String) -> Result<SynclineClient, JsValue> {
         console_error_panic_hook::set_once();
 
-        let doc = Doc::new();
-        let client = SynclineFile {
+        Ok(SynclineClient {
             url,
-            doc,
             ws: None,
-            _closures: Rc::new(RefCell::new(Vec::new())),
-            _sub: None,
-            callback,
-            is_synced: Rc::new(RefCell::new(false)),
-        };
-        Ok(client)
+            docs: Rc::new(RefCell::new(HashMap::new())),
+            closures: Rc::new(RefCell::new(Vec::new())),
+            is_connected: Rc::new(RefCell::new(false)),
+            index_callback: Rc::new(RefCell::new(None)),
+        })
     }
 
     pub fn connect(&mut self) -> Result<(), JsValue> {
         let ws = WebSocket::new(&self.url)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let doc = self.doc.clone();
-        let ws_clone = ws.clone();
-        let closures = self._closures.clone();
-        let callback = self.callback.clone();
+        let docs_clone = self.docs.clone();
+        let is_connected_open = self.is_connected.clone();
+        let is_connected_err = self.is_connected.clone();
+        let is_connected_close = self.is_connected.clone();
+        let url_err = self.url.clone();
+        let ws_send = ws.clone();
 
-        // 1. ON OPEN
-
+        // ON OPEN
+        let docs_on_open = self.docs.clone();
         let onopen = Closure::wrap(Box::new(move |_| {
-            // Send Sync Step 1: State Vector
-            let sv = doc.transact().state_vector().encode_v1();
-            let mut msg = vec![MSG_SYNC_STEP_1];
-            msg.extend(sv);
+            *is_connected_open.borrow_mut() = true;
+            web_sys::console::log_1(&JsValue::from_str("[Syncline] Connected"));
 
-            let array = Uint8Array::from(&msg[..]);
-            if let Err(e) = ws_clone.send_with_array_buffer_view(&array) {
-                web_sys::console::error_1(&e);
+            let docs = docs_on_open.borrow();
+            for (doc_id, state) in docs.iter() {
+                // Send SYNC_STEP_1 to request remote state
+                let sv = state.doc.transact().state_vector().encode_v1();
+                let msg = encode_message(MSG_SYNC_STEP_1, doc_id, &sv);
+                let array = Uint8Array::from(&msg[..]);
+                if let Err(e) = ws_send.send_with_array_buffer_view(&array) {
+                    web_sys::console::error_1(&e);
+                }
+
+                // Also send current state as UPDATE
+                let txn = state.doc.transact();
+                let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+                if !update.is_empty() {
+                    let msg = encode_message(MSG_UPDATE, doc_id, &update);
+                    let array = Uint8Array::from(&msg[..]);
+                    if let Err(e) = ws_send.send_with_array_buffer_view(&array) {
+                        web_sys::console::error_1(&e);
+                    }
+                }
             }
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-        closures.borrow_mut().push(onopen);
+        self.closures.borrow_mut().push(onopen);
 
-        // 2. ON MESSAGE
-        let doc_on_msg = self.doc.clone();
-        let callback_clone = callback.clone();
-        let is_synced_msg = self.is_synced.clone();
-
+        // ON MESSAGE
+        let index_callback = self.index_callback.clone();
         let onmessage = Closure::wrap(Box::new(move |val: JsValue| {
             let e = val.unchecked_into::<MessageEvent>();
             if let Ok(ab) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let array = Uint8Array::new(&ab);
-                let vec = array.to_vec();
+                let data = array.to_vec();
 
-                if vec.is_empty() {
-                    return;
-                }
-                let msg_type = vec[0];
-                let payload = &vec[1..];
-
-                match msg_type {
-                    MSG_SYNC_STEP_2 | MSG_UPDATE => {
+                if let Some((msg_type, doc_id, payload)) = decode_message(&data) {
+                    // Handle index document specially
+                    if doc_id == "__index__" {
                         if let Ok(u) = Update::decode_v1(payload) {
-                            // Set flag to avoid echoing back
-                            *is_synced_msg.borrow_mut() = true;
-                            {
-                                let mut txn = doc_on_msg.transact_mut();
-                                txn.apply_update(u);
-                            }
-                            *is_synced_msg.borrow_mut() = false;
+                            let callback_opt = {
+                                let docs = docs_clone.borrow();
+                                if let Some(state) = docs.get(doc_id) {
+                                    *state.is_receiving.borrow_mut() = true;
+                                    {
+                                        let mut txn = state.doc.transact_mut();
+                                        txn.apply_update(u);
+                                    }
+                                    *state.is_receiving.borrow_mut() = false;
+                                }
+                                index_callback.borrow().clone()
+                            };
 
-                            // Notify JS
-                            let this = JsValue::NULL;
-                            match callback_clone.call0(&this) {
-                                Ok(_) => {}
-                                Err(e) => web_sys::console::error_1(&e),
+                            if let Some(cb) = callback_opt {
+                                let _ = cb.call0(&JsValue::NULL);
                             }
                         }
+                    } else {
+                        let callback_opt = {
+                            let docs = docs_clone.borrow();
+                            if let Some(state) = docs.get(doc_id) {
+                                match msg_type {
+                                    MSG_SYNC_STEP_2 | MSG_UPDATE => {
+                                        if let Ok(u) = Update::decode_v1(payload) {
+                                            *state.is_receiving.borrow_mut() = true;
+                                            {
+                                                let mut txn = state.doc.transact_mut();
+                                                txn.apply_update(u);
+                                            }
+                                            *state.is_receiving.borrow_mut() = false;
+                                            Some(state.callback.clone())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(cb) = callback_opt {
+                            let _ = cb.call0(&JsValue::NULL);
+                        }
                     }
-                    _ => {}
                 }
             }
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        closures.borrow_mut().push(onmessage);
+        self.closures.borrow_mut().push(onmessage);
 
-        // 3. ON ERROR
+        // ON ERROR
         let onerror = Closure::wrap(Box::new(move |val: JsValue| {
-            web_sys::console::error_1(&val);
+            *is_connected_err.borrow_mut() = false;
+            web_sys::console::error_2(
+                &JsValue::from_str(&format!("[Syncline] WebSocket error: {}", url_err)),
+                &val,
+            );
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        closures.borrow_mut().push(onerror);
+        self.closures.borrow_mut().push(onerror);
 
-        // 4. OBSERVE LOCAL CHANGES
-        let ws_clone_3 = ws.clone();
-        let is_synced_obs = self.is_synced.clone();
-        // observe_update_v1 returns Result<Subscription, _>
-        // We use unwrap or map_err because we are in a Result returning function
-        let sub = self
-            .doc
-            .observe_update_v1(move |_, event| {
-                // Check flag
-                if *is_synced_obs.borrow() {
-                    return;
-                }
-
-                let update = event.update.clone();
-                let mut msg = vec![MSG_UPDATE];
-                msg.extend(update);
-                let array = Uint8Array::from(&msg[..]);
-                if let Err(e) = ws_clone_3.send_with_array_buffer_view(&array) {
-                    web_sys::console::error_1(&e);
-                }
-            })
-            .map_err(|_| JsValue::from_str("Failed to subscribe"))?;
+        // ON CLOSE
+        let onclose = Closure::wrap(Box::new(move |_| {
+            *is_connected_close.borrow_mut() = false;
+            web_sys::console::log_1(&JsValue::from_str("[Syncline] Disconnected"));
+        }) as Box<dyn FnMut(JsValue)>);
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+        self.closures.borrow_mut().push(onclose);
 
         self.ws = Some(ws);
-        self._sub = Some(sub);
+        Ok(())
+    }
+
+    pub fn add_doc(&self, doc_id: String, callback: Function) -> Result<(), JsValue> {
+        let doc = Doc::new();
+        let is_receiving = Rc::new(RefCell::new(false));
+
+        let ws_clone = self.ws.clone();
+        let doc_id_clone = doc_id.clone();
+        let is_receiving_clone = is_receiving.clone();
+        let is_connected_send = self.is_connected.clone();
+
+        let sub = doc
+            .observe_update_v1(move |_, event| {
+                if *is_receiving_clone.borrow() {
+                    return;
+                }
+                if !*is_connected_send.borrow() {
+                    return;
+                }
+                if let Some(ref ws) = ws_clone {
+                    let msg = encode_message(MSG_UPDATE, &doc_id_clone, &event.update);
+                    let array = Uint8Array::from(&msg[..]);
+                    let _ = ws.send_with_array_buffer_view(&array);
+                }
+            })
+            .map_err(|_| JsValue::from_str("Failed to subscribe to doc"))?;
+
+        self.docs.borrow_mut().insert(
+            doc_id.clone(),
+            DocState {
+                doc: doc.clone(),
+                callback,
+                _sub: sub,
+                is_receiving,
+                doc_type: DocType::Text,
+            },
+        );
+
+        if *self.is_connected.borrow() {
+            if let Some(ref ws) = self.ws {
+                let sv = doc.transact().state_vector().encode_v1();
+                let msg = encode_message(MSG_SYNC_STEP_1, &doc_id, &sv);
+                let array = Uint8Array::from(&msg[..]);
+                ws.send_with_array_buffer_view(&array)?;
+            }
+        }
 
         Ok(())
     }
 
-    pub fn get_text(&self) -> String {
-        let text = self.doc.get_or_insert_text("content");
-        let txn = self.doc.transact();
-        text.get_string(&txn)
-    }
+    pub fn create_index(&self, callback: Option<Function>) -> Result<(), JsValue> {
+        let doc = Doc::new();
+        let map = doc.get_or_insert_map("files");
+        let is_receiving = Rc::new(RefCell::new(false));
 
-    pub fn update(&mut self, new_content: String) {
-        let text = self.doc.get_or_insert_text("content");
-
-        // We need to release txn before sending (observer is async/callback but yrs might lock)
-        let mut txn = self.doc.transact_mut();
-        let current_content = text.get_string(&txn);
-
-        if current_content == new_content {
-            return;
+        if let Some(cb) = callback {
+            *self.index_callback.borrow_mut() = Some(cb);
         }
 
-        let diffs = diff::chars(&current_content, &new_content);
-        let mut index = 0u32;
+        let ws_clone = self.ws.clone();
+        let is_receiving_clone = is_receiving.clone();
+        let is_connected_send = self.is_connected.clone();
+        let doc_id = "__index__".to_string();
 
-        for d in diffs {
-            match d {
-                diff::Result::Left(_) => {
-                    text.remove_range(&mut txn, index, 1);
+        let sub = doc
+            .observe_update_v1(move |_, event| {
+                if *is_receiving_clone.borrow() {
+                    return;
                 }
-                diff::Result::Right(r) => {
-                    let s = r.to_string();
-                    text.insert(&mut txn, index, &s);
-                    index += 1;
+                if !*is_connected_send.borrow() {
+                    return;
                 }
-                diff::Result::Both(_, _) => {
-                    index += 1;
+                if let Some(ref ws) = ws_clone {
+                    let msg = encode_message(MSG_UPDATE, &doc_id, &event.update);
+                    let array = Uint8Array::from(&msg[..]);
+                    let _ = ws.send_with_array_buffer_view(&array);
+                }
+            })
+            .map_err(|_| JsValue::from_str("Failed to subscribe to index"))?;
+
+        let dummy_callback = js_sys::Function::new_no_args("");
+
+        self.docs.borrow_mut().insert(
+            "__index__".to_string(),
+            DocState {
+                doc,
+                callback: dummy_callback,
+                _sub: sub,
+                is_receiving,
+                doc_type: DocType::Map,
+            },
+        );
+
+        if *self.is_connected.borrow() {
+            if let Some(ref ws) = self.ws {
+                let docs = self.docs.borrow();
+                if let Some(state) = docs.get("__index__") {
+                    let sv = state.doc.transact().state_vector().encode_v1();
+                    let msg = encode_message(MSG_SYNC_STEP_1, "__index__", &sv);
+                    let array = Uint8Array::from(&msg[..]);
+                    ws.send_with_array_buffer_view(&array)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn index_insert(&self, key: String) -> Result<(), JsValue> {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get("__index__") {
+            let map = state.doc.get_or_insert_map("files");
+            let mut txn = state.doc.transact_mut();
+            map.insert(&mut txn, key, "1");
+        }
+        Ok(())
+    }
+
+    pub fn index_remove(&self, key: &str) -> Result<(), JsValue> {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get("__index__") {
+            let map = state.doc.get_or_insert_map("files");
+            let mut txn = state.doc.transact_mut();
+            map.remove(&mut txn, key);
+        }
+        Ok(())
+    }
+
+    pub fn index_keys(&self) -> Vec<String> {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get("__index__") {
+            let map = state.doc.get_or_insert_map("files");
+            let txn = state.doc.transact();
+            map.keys(&txn).map(|k| k.to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn remove_doc(&self, doc_id: &str) {
+        self.docs.borrow_mut().remove(doc_id);
+    }
+
+    pub fn get_text(&self, doc_id: &str) -> Option<String> {
+        let docs = self.docs.borrow();
+        docs.get(doc_id).map(|state| {
+            let text = state.doc.get_or_insert_text("content");
+            let txn = state.doc.transact();
+            text.get_string(&txn)
+        })
+    }
+
+    pub fn update(&self, doc_id: &str, new_content: String) {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get(doc_id) {
+            let text = state.doc.get_or_insert_text("content");
+            let mut txn = state.doc.transact_mut();
+            let current = text.get_string(&txn);
+
+            if current == new_content {
+                return;
+            }
+
+            let diffs = diff::chars(&current, &new_content);
+            let mut index = 0u32;
+
+            for d in diffs {
+                match d {
+                    diff::Result::Left(_) => {
+                        text.remove_range(&mut txn, index, 1);
+                    }
+                    diff::Result::Right(r) => {
+                        let s = r.to_string();
+                        text.insert(&mut txn, index, &s);
+                        index += 1;
+                    }
+                    diff::Result::Both(_, _) => {
+                        index += 1;
+                    }
                 }
             }
         }
     }
 
-    pub fn set_text(&mut self, content: String) {
-        let text = self.doc.get_or_insert_text("content");
-        let mut txn = self.doc.transact_mut();
-        let len = text.len(&txn);
-        if len > 0 {
-            text.remove_range(&mut txn, 0, len);
+    pub fn set_text(&self, doc_id: &str, content: String) {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get(doc_id) {
+            let text = state.doc.get_or_insert_text("content");
+            let mut txn = state.doc.transact_mut();
+            let len = text.len(&txn);
+            if len > 0 {
+                text.remove_range(&mut txn, 0, len);
+            }
+            text.insert(&mut txn, 0, &content);
         }
-        text.insert(&mut txn, 0, &content);
+    }
+
+    pub fn is_connected(&self) -> bool {
+        *self.is_connected.borrow()
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.docs.borrow().len()
     }
 }

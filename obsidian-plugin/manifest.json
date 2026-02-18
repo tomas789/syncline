@@ -1,0 +1,10 @@
+{
+  "id": "syncline-obsidian",
+  "name": "Syncline Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "CRDT-based synchronization for Obsidian vaults using Syncline",
+  "author": "Syncline",
+  "authorUrl": "https://github.com/tomas789/syncline",
+  "isDesktopOnly": false
+}
