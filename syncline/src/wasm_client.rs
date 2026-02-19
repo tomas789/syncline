@@ -347,16 +347,16 @@ impl SynclineClient {
 
             for d in diffs {
                 match d {
-                    diff::Result::Left(_) => {
-                        text.remove_range(&mut txn, index, 1);
+                    diff::Result::Left(c) => {
+                        text.remove_range(&mut txn, index, c.len_utf16() as u32);
                     }
                     diff::Result::Right(r) => {
                         let s = r.to_string();
                         text.insert(&mut txn, index, &s);
-                        index += 1;
+                        index += r.len_utf16() as u32;
                     }
-                    diff::Result::Both(_, _) => {
-                        index += 1;
+                    diff::Result::Both(c, _) => {
+                        index += c.len_utf16() as u32;
                     }
                 }
             }
