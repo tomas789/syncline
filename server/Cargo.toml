@@ -20,3 +20,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.5.58", features = ["derive"] }
+bytes = "1.11.1"
+
+[dev-dependencies]
+tokio-tungstenite = "0.28.0"
+url = "2.5.8"

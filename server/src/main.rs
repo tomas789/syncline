@@ -1,9 +1,6 @@
 use clap::Parser;
-mod db;
-mod server;
-
-use crate::db::Db;
-use crate::server::run_server;
+use server::db::Db;
+use server::server::run_server;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
