@@ -53,15 +53,10 @@ npm run build
 
 ### Prerequisites
 
-1. Build and run the Syncline server:
+1. Download and run the Syncline Desktop Application (from [releases](https://github.com/tomas789/syncline/releases)).
+2. Launch the App. The Syncline server automatically starts in the background on port `3030`.
 
-   ```bash
-   cd syncline
-   cargo run -- server --port 3030
-   ```
-
-2. Note your server's IP address:
-   - On macOS/Linux: `ifconfig | grep "inet " | grep -v 127.0.0.1`
+3. Note your server's IP address by clicking the Syncline Tray Icon -> "Copy Connection URL"
    - On Windows: `ipconfig`
 
 ### Testing on macOS / Windows / Linux (Desktop)
@@ -153,11 +148,11 @@ Click the status bar to see details or reconnect.
 
 ## Using with CLI Client
 
-You can also sync files outside of Obsidian using the CLI client:
+You can also sync folders autonomously outside of Obsidian using the standalone CLI client:
 
 ```bash
-# In the syncline directory
-cargo run --bin client_folder -- --url ws://SERVER_IP:3030 --dir /path/to/vault
+# Download the unified 'syncline' binary from Releases, or build from source:
+syncline sync -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
 ```
 
 This is useful for:
