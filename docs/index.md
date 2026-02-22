@@ -29,9 +29,9 @@ Most sync solutions for Obsidian ask you to trust a third party with your notes.
 
 ---
 
-# 🚀 Getting Started
+## 🚀 Getting Started
 
-## Step 1: Run the Syncline Server
+### Step 1: Run the Syncline Server
 
 The server is a small, self-contained binary you run on any machine accessible from your devices.
 
@@ -64,7 +64,7 @@ cargo run -p client_folder --bin client_folder -- -f /path/to/my/vault -u ws://1
 
 Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
 
-## Step 2: Install the Plugin
+### Step 2: Install the Plugin
 
 **Option A — Community Plugins (recommended)**
 
@@ -78,7 +78,7 @@ Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) 
 2. Copy them to `<your-vault>/.obsidian/plugins/syncline-obsidian/`
 3. Reload Obsidian and enable the plugin in Settings → Community Plugins
 
-## Step 3: Connect
+### Step 3: Connect
 
 1. Open Settings → Syncline
 2. Enter your server URL (e.g. `ws://192.168.1.100:3030/sync` or `wss://sync.yourdomain.com/sync`)
