@@ -100,4 +100,53 @@ mod tests {
             assert_eq!(text_ref.get_string(&txn), "🚀b");
         }
     }
+
+    #[test]
+    fn test_apply_diff_equal() {
+        let doc = Doc::new();
+        let text_ref = doc.get_or_insert_text("content");
+
+        {
+            let mut txn = doc.transact_mut();
+            text_ref.insert(&mut txn, 0, "Same");
+        }
+
+        apply_diff_to_yrs(&doc, &text_ref, "Same", "Same");
+
+        {
+            let txn = doc.transact();
+            assert_eq!(text_ref.get_string(&txn), "Same");
+        }
+    }
+
+    #[test]
+    fn test_apply_diff_old_empty() {
+        let doc = Doc::new();
+        let text_ref = doc.get_or_insert_text("content");
+
+        apply_diff_to_yrs(&doc, &text_ref, "", "New Str");
+
+        {
+            let txn = doc.transact();
+            assert_eq!(text_ref.get_string(&txn), "New Str");
+        }
+    }
+
+    #[test]
+    fn test_apply_diff_new_empty() {
+        let doc = Doc::new();
+        let text_ref = doc.get_or_insert_text("content");
+
+        {
+            let mut txn = doc.transact_mut();
+            text_ref.insert(&mut txn, 0, "Old Str");
+        }
+
+        apply_diff_to_yrs(&doc, &text_ref, "Old Str", "");
+
+        {
+            let txn = doc.transact();
+            assert_eq!(text_ref.get_string(&txn), "");
+        }
+    }
 }

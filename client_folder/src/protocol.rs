@@ -75,3 +75,54 @@ impl Message {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_msg_type_try_from() {
+        assert_eq!(MsgType::try_from(0x00).unwrap(), MsgType::SyncStep1);
+        assert_eq!(MsgType::try_from(0x01).unwrap(), MsgType::SyncStep2);
+        assert_eq!(MsgType::try_from(0x02).unwrap(), MsgType::Update);
+        assert!(MsgType::try_from(0x03).is_err());
+        assert!(MsgType::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn test_encode_decode() {
+        let msg = Message::new(MsgType::SyncStep1, "test_doc".to_string(), vec![1, 2, 3]);
+        let encoded = msg.encode();
+
+        let decoded = Message::decode(&encoded).unwrap();
+        assert_eq!(decoded.msg_type, MsgType::SyncStep1);
+        assert_eq!(decoded.doc_id, "test_doc");
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_decode_invalid_length() {
+        assert!(Message::decode(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_msg_type() {
+        let mut buf = vec![0xFF, 0x00, 0x01]; // invalid msg_type
+        buf.extend_from_slice(b"a");
+        assert!(Message::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_doc_id_length() {
+        let mut buf = vec![0x00, 0x00, 0x05]; // length 5
+        buf.extend_from_slice(b"test"); // only 4 bytes
+        assert!(Message::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_utf8() {
+        let mut buf = vec![0x00, 0x00, 0x02];
+        buf.extend_from_slice(&[0xFF, 0xFF]);
+        assert!(Message::decode(&buf).is_err());
+    }
+}

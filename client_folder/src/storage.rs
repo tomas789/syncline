@@ -86,4 +86,25 @@ mod tests {
             assert_eq!(final_text_ref.get_string(&txn), "Modified content!");
         }
     }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("nonexistent.bin");
+
+        let result = load_doc(&file_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_invalid_yrs_data() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("invalid.bin");
+
+        // Write invalid data
+        fs::write(&file_path, b"not a yrs document").unwrap();
+
+        let result = load_doc(&file_path);
+        assert!(result.is_err());
+    }
 }
