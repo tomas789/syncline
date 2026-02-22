@@ -186,3 +186,70 @@ let full_update = doc.transact().encode_state_as_update_v1(&StateVector::default
 Comparing relative to `&StateVector::default()` packages the _entire exact keystroke log_ comprising uncompacted historic inserts instead of formulating a precise diff spanning across from the baseline `.syncline` backup to the state modified currently inside the CRDT. This results in wasting considerable `O(N)` bandwidth scaling linearly per file size.
 
 **Proposed Fix**: Construct the string representation delta explicitly relative to the historical backup baseline (`&previous_sv`) to yield incremental binary sizes.
+
+---
+
+## Newly Identified Issues
+
+### 13. BUG: File Deletion Propagates as Empty File Creation, Not Actual Deletion
+
+**Location**: `client_folder/src/main.rs`, lines 328–337 (remote update application)
+
+**Issue**: When a file is deleted locally, the client broadcasts an empty-content CRDT update. On the receiving side:
+
+```rust
+let text_val = ""; // after applying empty-content update
+let file_exists = fs::metadata(&phys_path).is_ok(); // false
+
+if !file_exists || current_disk_content != text_val {
+    fs::write(&phys_path, &text_val)?; // creates an empty file!
+}
+```
+
+A deleted file becomes an **empty file** on other clients rather than being deleted. This is confirmed by the E2E test expectation in `client_folder/tests/e2e.rs:410`:
+
+```rust
+assert!(fs::read_to_string(env.client_path(1).join("base.md")).unwrap() == "");
+```
+
+The `__index__`-based deletion path (`main.rs:231–250`) could propagate actual deletions, but the CLI client never calls anything equivalent to the WASM client's `index_remove()`. So actual file removal is not propagated between CLI clients.
+
+**Impact**: Deleted files are resurrected as empty files on remote peers. This is data-model-incorrect behavior and likely unexpected by users.
+
+**Proposed Fix**: Either (a) remove empty-content files from disk when a CRDT update results in an empty string, or (b) implement `__index__` entry removal in the CLI client and handle the removal event to delete the physical file.
+
+### 14. BUG: Task Leak in Network Client on Reconnection
+
+**Location**: `client_folder/src/network.rs`, lines 35–46
+
+**Issue**: `connect()` spawns two tasks (`_write_task`, `_read_task`) but immediately drops the returned `JoinHandle`s, detaching them:
+
+```rust
+let _write_task = tokio::spawn(async move { … });
+let _read_task  = tokio::spawn(async move { … });
+// JoinHandles dropped here — tasks run indefinitely
+```
+
+On every reconnection a new pair of tasks is spawned while the previous pair may still be alive (until the underlying TCP connection finally closes and the old WebSocket write fails). Under aggressive reconnection patterns this accumulates detached tasks.
+
+**Impact**: Minor memory and task handle leak. Old tasks do eventually terminate once the broken TCP connection flushes, but there is no explicit upper bound on how many can be in-flight simultaneously.
+
+**Proposed Fix**: Store the `JoinHandle`s in `SynclineClient` and call `.abort()` on them at the start of each `connect()` call, before spawning new tasks.
+
+### 15. BUG: `get_doc_id` Silently Drops Deletion Events on macOS with Symlinked Paths
+
+**Location**: `client_folder/src/state.rs`, lines 31–39
+
+**Issue**: When a file is deleted, `canonicalize()` fails (the file no longer exists) and the fallback returns the raw watcher-reported path:
+
+```rust
+let canonical = physical_path.canonicalize()
+    .unwrap_or_else(|_| physical_path.to_path_buf()); // fallback on deletion
+let rel = canonical.strip_prefix(&self.root_dir)?;
+```
+
+On macOS, FSEvents reports the canonical `/private/var/…` path, while `root_dir` is also canonicalized to `/private/var/…` in `LocalState::new`. However, if the raw fallback path uses the symlink alias (`/var/…`), `strip_prefix` will fail with an error and the event handler silently continues — the deletion is never processed.
+
+**Impact**: File deletion events may be silently dropped on macOS in environments where the watched directory lives under a symlinked path prefix. The deleted file is not propagated as an empty-content update to the server.
+
+**Proposed Fix**: When `strip_prefix` fails in `get_doc_id`, try stripping with the non-canonicalized `root_dir` as a fallback before returning an error.
