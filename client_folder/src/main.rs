@@ -325,7 +325,15 @@ async fn main() -> anyhow::Result<()> {
                                 let current_disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
                                 let file_exists = fs::metadata(&phys_path).is_ok();
 
-                                if !file_exists || current_disk_content != text_val {
+                                if text_val.is_empty() {
+                                    if file_exists {
+                                        if let Err(e) = fs::remove_file(&phys_path) {
+                                            error!("Failed to delete physical file {}: {:?}", phys_path.display(), e);
+                                        } else {
+                                            info!("Applied remote deletion to file {}", phys_path.display());
+                                        }
+                                    }
+                                } else if !file_exists || current_disk_content != text_val {
                                     if let Some(parent) = phys_path.parent() {
                                         let _ = fs::create_dir_all(parent);
                                     }
