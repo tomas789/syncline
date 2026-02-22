@@ -407,4 +407,17 @@ impl SynclineClient {
     pub fn doc_count(&self) -> usize {
         self.docs.borrow().len()
     }
+
+    pub fn disconnect(&mut self) {
+        if let Some(ws) = self.ws.take() {
+            ws.set_onopen(None);
+            ws.set_onmessage(None);
+            ws.set_onerror(None);
+            ws.set_onclose(None);
+            let _ = ws.close();
+        }
+        self.closures.borrow_mut().clear();
+        self.docs.borrow_mut().clear();
+        *self.is_connected.borrow_mut() = false;
+    }
 }

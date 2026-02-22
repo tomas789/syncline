@@ -61,7 +61,7 @@ if let Some(tx) = channels.get(doc_id) {   // None for new docs!
 1. **Client**: Before sending `MSG_UPDATE` for a document that hasn't been synced yet, send `MSG_SYNC_STEP_1` with the document's current state vector. This creates the broadcast channel on the server and subscribes the client to it.
 2. **Server**: Auto-create the broadcast channel when receiving `MSG_UPDATE` for an unknown `doc_id`, so that late-subscribing clients don't miss updates due to ordering races.
 
-### 4. PERFORMANCE SMELL: `O(N)` Blocking Database Calls during Connection Events
+### 4. PERFORMANCE SMELL: `O(N)` Blocking Database Calls during Connection Events (FIXED)
 
 **Location**: `server/src/db.rs` (`get_all_updates_since`) and `server/src/server.rs` (`recv_task`).
 
@@ -119,7 +119,7 @@ If just a highly constrained user-permission blocks a hidden `.md` file, the `?`
 
 **Proposed Fix**: Handle isolated read paths using nested `match` scopes locally (logging an error) inside the `for` loop and executing a smooth `continue;` statement.
 
-### 7. CODE SMELL: Overly Aggressive Filtering
+### 7. CODE SMELL: Overly Aggressive Filtering (FIXED)
 
 **Location**: `client_folder/src/state.rs`, `bootstrap_offline_changes`.
 
@@ -133,7 +133,7 @@ While this stops recursing into the `.git/` folder, it will actively drop syncin
 
 **Proposed Fix**: Instead of generic string prefixes, evaluate against strictly `name == ".git"` and `name == ".syncline"` string matches for directory paths.
 
-### 8. CODE SMELL: FSEvents/inotify OS Dispatch Block
+### 8. CODE SMELL: FSEvents/inotify OS Dispatch Block (FIXED)
 
 **Location**: `client_folder/src/watcher.rs`, `tx.blocking_send(event)`.
 
@@ -149,7 +149,7 @@ While this stops recursing into the `.git/` folder, it will actively drop syncin
 
 **Proposed Fix**: `bootstrap_offline_changes` should iteratively diff the directory traversal bounds with the complete list of known `doc_id` inside `.syncline/data/`. `notify` handlers need to intercept delete events and explicitly encode an empty string push upon deletion.
 
-### 10. BUG / DATA LOSS: Unhandled Read Errors Formulate Wipeout Commits
+### 10. BUG / DATA LOSS: Unhandled Read Errors Formulate Wipeout Commits (FIXED)
 
 **Location**: `client_folder/src/main.rs`, inside remote update diffing section.
 
@@ -173,7 +173,7 @@ Furthermore, the server's `db.get_all_updates_since()` inherently broadcasts a 2
 
 **Proposed Fix**: Only invoke `fs::write` on physical files if `text_val != disk_content`.
 
-### 12. PERFORMANCE SMELL: Heavy Offline Initial Updates Broadcast Complete Network Histories
+### 12. PERFORMANCE SMELL: Heavy Offline Initial Updates Broadcast Complete Network Histories (FIXED)
 
 **Location**: `client_folder/src/main.rs`, `bootstrap_offline_changes` reporting
 

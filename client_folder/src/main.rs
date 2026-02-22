@@ -137,6 +137,14 @@ async fn main() -> anyhow::Result<()> {
         // subscribe on-the-fly when the watcher discovers a new file.
         let mut subscribed_docs: HashSet<String> = HashSet::new();
 
+        let offline_changes = match local_state.bootstrap_offline_changes() {
+            Ok(changes) => changes,
+            Err(e) => {
+                error!("Error bootstrapping offline changes: {:?}", e);
+                Vec::new()
+            }
+        };
+
         // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
         if let Ok(docs) = local_state.list_doc_ids() {
             for doc_id in docs {
@@ -166,6 +174,18 @@ async fn main() -> anyhow::Result<()> {
             error!("Failed to send SyncStep1 for __index__: {:?}", e);
         }
         subscribed_docs.insert("__index__".to_string());
+
+        // Now broadcast all offline changes
+        for (doc_id, update) in offline_changes {
+            if let Err(e) = ws_tx
+                .send(Message::new(MsgType::Update, doc_id.clone(), update))
+                .await
+            {
+                error!("Failed to broadcast offline update for {}: {:?}", doc_id, e);
+            } else {
+                info!("Broadcasted offline changes for {}", doc_id);
+            }
+        }
 
         loop {
             tokio::select! {
@@ -263,15 +283,25 @@ async fn main() -> anyhow::Result<()> {
                             let text_ref = doc.get_or_insert_text("content");
                             let yjs_content_before = text_ref.get_string(&doc.transact());
                             let has_file = fs::metadata(&phys_path).is_ok();
-                            let disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
+                            let disk_content = if has_file {
+                                match fs::read_to_string(&phys_path) {
+                                    Ok(content) => content,
+                                    Err(e) => {
+                                        error!("Failed to read physical file {}: {:?}", phys_path.display(), e);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                String::new()
+                            };
 
                             if has_file && yjs_content_before != disk_content {
                                 info!("Unsynced local changes in {}! Diffing before applying remote update.", doc_id);
+                                let previous_sv = doc.transact().state_vector();
                                 apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
 
                                 // Broadcast the local edits so the other remote peers get them too
-                                let state_vector = StateVector::default(); // Note: could be optimized later instead of full state transmit
-                                let local_update = doc.transact().encode_state_as_update_v1(&state_vector);
+                                let local_update = doc.transact().encode_state_as_update_v1(&previous_sv);
                                 if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id.clone(), local_update)).await {
                                     error!("Failed to send unsynced local update: {:?}", e);
                                 }
@@ -387,13 +417,14 @@ async fn main() -> anyhow::Result<()> {
                                 let yjs_content = text_ref.get_string(&doc.transact());
                                 if newly_discovered || disk_content != yjs_content {
                                     info!("Local file {} modified or newly discovered, diffing and broadcasting...", path.display());
+                                    let previous_sv = doc.transact().state_vector();
                                     apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
                                     if let Err(e) = save_doc(&doc, &state_path) {
                                         error!("Failed to save doc locally: {:?}", e);
                                         continue;
                                     }
 
-                                    let update = doc.transact().encode_state_as_update_v1(&StateVector::default());
+                                    let update = doc.transact().encode_state_as_update_v1(&previous_sv);
                                     if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id, update)).await {
                                         error!("Failed to send update: {:?}", e);
                                     }

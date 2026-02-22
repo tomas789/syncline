@@ -21,7 +21,9 @@ impl SynclineWatcher {
                             event.kind, event.paths, event.attrs
                         );
                         // Send over channel (non-blocking)
-                        let _ = tx.blocking_send(event);
+                        if let Err(e) = tx.try_send(event) {
+                            error!("Channel full or closed, dropped raw file event: {}", e);
+                        }
                     }
                     Err(e) => {
                         error!("Raw watcher error: {:?}", e);
@@ -69,7 +71,12 @@ impl DebouncedWatcher {
                         Err(notify::Error::generic(&errstr))
                     }
                 };
-                let _ = tx.blocking_send(mapped_res);
+                if let Err(e) = tx.try_send(mapped_res) {
+                    error!(
+                        "Channel full or closed, dropped debounced file event: {:?}",
+                        e
+                    );
+                }
             },
         )?;
 

@@ -1,3 +1,3 @@
 fn main() {
-    let dummy: notify_debouncer_mini::DebouncedEvent;
+    let _dummy: notify_debouncer_mini::DebouncedEvent;
 }

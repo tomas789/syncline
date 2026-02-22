@@ -74,14 +74,14 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
 
     let load_yrs = |dir: &PathBuf, doc_id: &str| -> String {
         let bin_path = dir.join(".syncline/data").join(format!("{}.bin", doc_id));
-        if let Ok(content) = fs::read(&bin_path) {
-            if let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&content) {
-                let doc = yrs::Doc::new();
-                let t = doc.get_or_insert_text("content");
-                let mut txn = doc.transact_mut();
-                txn.apply_update(update).unwrap();
-                return yrs::GetString::get_string(&t, &txn);
-            }
+        if let Ok(content) = fs::read(&bin_path)
+            && let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&content)
+        {
+            let doc = yrs::Doc::new();
+            let t = doc.get_or_insert_text("content");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update).unwrap();
+            return yrs::GetString::get_string(&t, &txn);
         }
         "".to_string()
     };
@@ -140,26 +140,26 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
         }
 
         for (name, content) in &actual_files {
-            if let Some(expected_content) = expected_files.get(name) {
-                if content != expected_content {
-                    error!(
-                        "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                        name, idx, expected_content, idx, content
-                    );
-                    converged = false;
-                }
+            if let Some(expected_content) = expected_files.get(name)
+                && content != expected_content
+            {
+                error!(
+                    "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
+                    name, idx, expected_content, idx, content
+                );
+                converged = false;
             }
         }
 
         for (name, content) in &actual_yrs {
-            if let Some(expected_content) = expected_yrs.get(name) {
-                if content != expected_content {
-                    error!(
-                        "YRS File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                        name, idx, expected_content, idx, content
-                    );
-                    converged = false;
-                }
+            if let Some(expected_content) = expected_yrs.get(name)
+                && content != expected_content
+            {
+                error!(
+                    "YRS File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
+                    name, idx, expected_content, idx, content
+                );
+                converged = false;
             }
         }
     }
@@ -375,4 +375,37 @@ async fn test_filter_ignored_files() {
     // Neither should appear in client 1
     assert!(!env.client_path(1).join("ignored.png").exists());
     assert!(!env.client_path(1).join(".hidden.md").exists());
+}
+
+#[tokio::test]
+async fn test_offline_creation_and_deletion() {
+    let mut env = TestEnv::new(2).await;
+
+    // Start synced state with one file
+    let path0 = env.client_path(0).join("base.md");
+    fs::write(&path0, "base content").unwrap();
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(5)).await);
+
+    // Disconnect client 0
+    env.clients[0].kill().await.unwrap();
+
+    // Offline create and delete
+    let new_path = env.client_path(0).join("offline_new.md");
+    fs::write(&new_path, "offline creation").unwrap();
+    fs::remove_file(&path0).unwrap();
+
+    // Restart client 0
+    let dir0 = env.client_dirs[0].path().to_path_buf();
+    env.clients[0] = spawn_client(&dir0, env.port).await;
+
+    // Reconnect and wait for convergence
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await);
+
+    // Check that Client 1 got the new file and deleted the old one
+    assert!(env.client_path(1).join("offline_new.md").exists());
+    assert_eq!(
+        fs::read_to_string(env.client_path(1).join("offline_new.md")).unwrap(),
+        "offline creation"
+    );
+    assert!(fs::read_to_string(env.client_path(1).join("base.md")).unwrap() == "");
 }

@@ -1,11 +1,10 @@
+use crate::diff::apply_diff_to_yrs;
+use crate::storage::{load_doc, save_doc};
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use yrs::{Doc, GetString, Text, Transact};
-
-use crate::diff::apply_diff_to_yrs;
-use crate::storage::{load_doc, save_doc};
+use yrs::{Doc, GetString, ReadTxn, Text, Transact};
 
 pub struct LocalState {
     pub root_dir: PathBuf,
@@ -46,9 +45,9 @@ impl LocalState {
 
     /// Scans the directory on startup. Compares physical files with `.syncline` state.
     /// Creates documents for missing states, applies diffs for modified files.
-    /// Returns a list of `doc_id`s that were modified offline and need to be synced.
-    pub fn bootstrap_offline_changes(&self) -> Result<Vec<String>> {
-        let mut modified_docs = Vec::new();
+    /// Returns a list of `(doc_id, update)` tuples that were modified offline and need to be synced.
+    pub fn bootstrap_offline_changes(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut offline_changes = Vec::new();
         let mut physical_docs = std::collections::HashSet::new();
 
         // Recursively walk the directory
@@ -61,7 +60,7 @@ impl LocalState {
                 }
                 // Exclude hidden files and directories (names starting with '.').
                 let name = e.file_name().to_string_lossy();
-                !name.starts_with('.')
+                name != ".git" && name != ".syncline"
             })
             .filter_map(|e| e.ok())
         {
@@ -107,18 +106,21 @@ impl LocalState {
                 // Compare the raw text string from Yjs with the physical file string
                 if disk_content != yjs_content {
                     // We found an offline edit!
+                    let previous_sv = doc.transact().state_vector();
                     apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
                     if let Err(e) = save_doc(&doc, &state_path) {
                         tracing::error!("Failed to save offline edits for {}: {}", doc_id, e);
                         continue;
                     }
-                    modified_docs.push(doc_id.clone());
+                    let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                    offline_changes.push((doc_id.clone(), update));
                 }
                 physical_docs.insert(doc_id);
             } else {
                 // New file was added offline
                 let doc = Doc::new();
                 let text_ref = doc.get_or_insert_text("content");
+                let previous_sv = doc.transact().state_vector();
                 {
                     let mut txn = doc.transact_mut();
                     text_ref.insert(&mut txn, 0, &disk_content);
@@ -127,7 +129,8 @@ impl LocalState {
                     tracing::error!("Failed to save new doc {}: {}", doc_id, e);
                     continue;
                 }
-                modified_docs.push(doc_id.clone());
+                let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                offline_changes.push((doc_id.clone(), update));
                 physical_docs.insert(doc_id);
             }
         }
@@ -135,6 +138,9 @@ impl LocalState {
         // Check for offline deletions
         if let Ok(known_docs) = self.list_doc_ids() {
             for doc_id in known_docs {
+                if doc_id == "__index__" {
+                    continue;
+                }
                 if !physical_docs.contains(&doc_id) {
                     let state_path = self.get_state_path(&doc_id);
                     if let Ok(doc) = load_doc(&state_path) {
@@ -142,6 +148,7 @@ impl LocalState {
                         let yjs_content = text_ref.get_string(&doc.transact());
                         if !yjs_content.is_empty() {
                             tracing::info!("Found offline deletion for {}", doc_id);
+                            let previous_sv = doc.transact().state_vector();
                             apply_diff_to_yrs(&doc, &text_ref, &yjs_content, "");
                             if let Err(e) = save_doc(&doc, &state_path) {
                                 tracing::error!(
@@ -149,16 +156,17 @@ impl LocalState {
                                     doc_id,
                                     e
                                 );
-                                continue;
+                                continue; // Added this continue back for correctness though not needed logically
                             }
-                            modified_docs.push(doc_id);
+                            let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                            offline_changes.push((doc_id, update));
                         }
                     }
                 }
             }
         }
 
-        Ok(modified_docs)
+        Ok(offline_changes)
     }
 
     /// List all known doc_ids from the local .syncline storage
@@ -172,14 +180,13 @@ impl LocalState {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                if let Ok(rel) = path.strip_prefix(&self.syncline_dir) {
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin")
+                && let Ok(rel) = path.strip_prefix(&self.syncline_dir) {
                     let rel_str = rel.to_string_lossy();
                     if let Some(doc_id) = rel_str.strip_suffix(".bin") {
                         docs.push(doc_id.to_string());
                     }
                 }
-            }
         }
         Ok(docs)
     }
@@ -201,7 +208,7 @@ mod tests {
         // 1. First run, file is new
         let changed = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0], "file1.md");
+        assert_eq!(changed[0].0, "file1.md");
 
         // 2. Second run, no changes
         let changed_none = state.bootstrap_offline_changes().unwrap();
@@ -211,7 +218,7 @@ mod tests {
         fs::write(&file1, "Hello CRDT World!").unwrap();
         let changed_mod = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed_mod.len(), 1);
-        assert_eq!(changed_mod[0], "file1.md");
+        assert_eq!(changed_mod[0].0, "file1.md");
 
         // Verify underlying storage represents the change
         let doc_id = state.get_doc_id(&file1).unwrap();
@@ -265,7 +272,7 @@ mod tests {
         );
         let docs = changed.unwrap();
         assert!(
-            docs.contains(&"b/file2.md".to_string()),
+            docs.iter().any(|(id, _)| id == "b/file2.md"),
             "file2.md wasn't processed due to loop abort!"
         );
     }
