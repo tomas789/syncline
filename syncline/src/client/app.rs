@@ -1,83 +1,20 @@
-use clap::Parser;
-use clap::builder::styling::{AnsiColor, Effects, Styles};
-use client_folder::diff::apply_diff_to_yrs;
-use client_folder::network::SynclineClient;
-use client_folder::protocol::{Message, MsgType};
-use client_folder::state::LocalState;
-use client_folder::storage::{load_doc, save_doc};
-use client_folder::watcher::DebouncedWatcher;
+use crate::client::diff::apply_diff_to_yrs;
+use crate::client::network::SynclineClient;
+use crate::client::protocol::{Message, MsgType};
+use crate::client::state::LocalState;
+use crate::client::storage::{load_doc, save_doc};
+use crate::client::watcher::DebouncedWatcher;
 use colored::Colorize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
 
-fn cli_styles() -> Styles {
-    Styles::styled()
-        .header(AnsiColor::Green.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "🌟 Syncline Client: A modern synchronization workspace.",
-    long_about = None,
-    styles = cli_styles()
-)]
-struct Args {
-    /// Folder to watch and sync
-    #[arg(short, long, default_value = ".")]
-    folder: PathBuf,
-
-    /// URL of the Syncline server
-    #[arg(
-        short,
-        long,
-        default_value = "ws://127.0.0.1:3030/sync",
-        env = "SYNCLINE_URL"
-    )]
-    url: String,
-
-    /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "info")]
-    log_level: String,
-
-    /// Optional file to redirect logs to
-    #[arg(long)]
-    log_file: Option<PathBuf>,
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-
-    let fmt_layer = fmt::layer().with_target(false).without_time();
-    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
-
-    if let Some(log_file) = &args.log_file {
-        let file_appender = tracing_appender::rolling::never(
-            log_file
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("")),
-            log_file.file_name().unwrap(),
-        );
-        let file_layer = fmt::layer().with_writer(file_appender).with_ansi(false);
-        subscriber.with(file_layer).init();
-    } else {
-        subscriber.init();
-    }
-
+pub async fn run_client(folder: PathBuf, url: String) -> anyhow::Result<()> {
     println!(
         "{}",
         r#"
@@ -94,17 +31,14 @@ async fn main() -> anyhow::Result<()> {
     println!("  {}\n", "🌟 A modern synchronization workspace".green());
 
     info!("{} Starting Syncline Client...", "🚀".green());
-    info!("{} Folder: {}", "📂".blue(), args.folder.display());
-    info!("{} Server URL: {}", "🌐".cyan(), args.url);
-    if let Some(f) = &args.log_file {
-        info!("{} Log file: {}", "📝".yellow(), f.display());
-    }
+    info!("{} Folder: {}", "📂".blue(), folder.display());
+    info!("{} Server URL: {}", "🌐".cyan(), url);
 
-    let dir_to_watch = args.folder;
+    let dir_to_watch = folder;
     let local_state = LocalState::new(&dir_to_watch);
 
     // Setup network
-    let server_url = args.url;
+    let server_url = url;
     let mut client = SynclineClient::new(&server_url)?;
 
     // Phase 1 + 5: Setup debounced watcher (created outside reconnect loop)
@@ -211,10 +145,7 @@ async fn main() -> anyhow::Result<()> {
                                     Ok(update) => {
                                         let text_ref = doc.get_or_insert_text("content");
                                         let mut txn = doc.transact_mut();
-                                        if let Err(e) = txn.apply_update(update) {
-                                            error!("Failed to apply update for {}: {:?}", doc_id, e);
-                                            continue;
-                                        }
+                                        txn.apply_update(update);
 
                                         let index_content = text_ref.get_string(&txn);
                                         drop(txn);
@@ -310,10 +241,7 @@ async fn main() -> anyhow::Result<()> {
                             // 2. NOW apply the remote update
                             if let Ok(update) = Update::decode_v1(&msg.payload) {
                                 let mut txn = doc.transact_mut();
-                                if let Err(e) = txn.apply_update(update) {
-                                    error!("Failed to apply update for {}: {:?}", doc_id, e);
-                                    continue;
-                                }
+                                txn.apply_update(update);
 
                                 let text_val = text_ref.get_string(&txn);
                                 drop(txn);

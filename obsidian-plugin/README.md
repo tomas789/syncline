@@ -57,7 +57,7 @@ npm run build
 
    ```bash
    cd syncline
-   cargo run --bin server -- --port 3030
+   cargo run -- server --port 3030
    ```
 
 2. Note your server's IP address:

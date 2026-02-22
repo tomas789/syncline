@@ -47,22 +47,16 @@ jobs:
             ${{ runner.os }}-target-
 
       - name: Build native binaries
-        run: cargo build --release -p client_folder -p server
+        run: cargo build --release -p syncline
 
       - name: Build WASM library
         run: wasm-pack build syncline --release --target web --out-dir pkg
 
-      - name: Upload client artifact
+      - name: Upload syncline artifact
         uses: actions/upload-artifact@v4
         with:
-          name: client
-          path: target/release/client_folder
-
-      - name: Upload server artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: server
-          path: target/release/server
+          name: syncline
+          path: target/release/syncline
 
       - name: Upload WASM library artifact
         uses: actions/upload-artifact@v4

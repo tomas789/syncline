@@ -1,5 +1,5 @@
-use crate::diff::apply_diff_to_yrs;
-use crate::storage::{load_doc, save_doc};
+use crate::client::diff::apply_diff_to_yrs;
+use crate::client::storage::{load_doc, save_doc};
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -344,7 +344,7 @@ mod tests {
         let mut docs = state.list_doc_ids().unwrap();
         docs.sort();
 
-        let mut expected = vec![
+        let expected = vec![
             "test1.md".to_string(),
             "test2.md".to_string(),
             "nested/test3.md".to_string(),

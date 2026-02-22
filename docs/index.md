@@ -43,7 +43,7 @@ git clone https://github.com/tomas789/syncline
 cd syncline
 
 # Build and start the server
-cargo run -p server
+cargo run -- server
 ```
 
 The server starts on port `3030` by default. Data is stored in `syncline.db` in the current directory.
@@ -51,7 +51,7 @@ The server starts on port `3030` by default. Data is stored in `syncline.db` in 
 **Options:**
 
 ```bash
-cargo run -p server -- --port 4000 --db-path /data/my-vault.db --log-level debug
+cargo run -- server --port 4000 --db-path /data/my-vault.db --log-level debug
 ```
 
 **Run the CLI Client:**
@@ -59,7 +59,7 @@ If you prefer to run the standalone headless CLI client rather than using the Ob
 
 ```bash
 # Point the client to your vault folder and the server URL
-cargo run -p client_folder --bin client_folder -- -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
+cargo run -- sync -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
 ```
 
 Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
