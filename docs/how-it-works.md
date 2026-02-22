@@ -1,0 +1,23 @@
+# 🧠 How It Works Under the Hood
+
+Syncline isn't just a file copier—it has a deep understanding of text changes. It does this through **CRDTs (Conflict-free Replicated Data Types)**, specifically by using the fantastic `yrs` (Yjs for Rust) library.
+
+## The Problem with Sync
+
+Usually, syncing systems like Dropbox or Nextcloud work on the _file level_. If I change `line 1` on my phone, and you change `line 10` on your PC, and we both sync... the system throws its hands up. "Conflict! Choose which file to keep!" This happens because it just sees two different files, and it doesn't know what you actually meant.
+
+## The CRDT Solution
+
+Instead of syncing the whole file, Syncline syncs _intent_.
+Every time you take an action—like pressing "A" or deleting "B" at index 5—that action is given a locally unique ID.
+When the server and client connect, they don't say "Here's my version of the file." They say, "Here's a mathematical vector of exactly which keystrokes I know about."
+
+1. **State Vectors**: The server and client compare notes, realizing that the server knows about your friend's edits, and the client knows about your offline edits.
+2. **Missing Updates**: They trade only the exact modifications each is missing.
+3. **Deterministic Merge**: Due to the math of CRDTs, both the server and the client can take those independent edits, toss them into a blender, and end up with the _exact same document_ every time, guaranteed.
+
+No merge conflicts, no weird duplicated `_Conflict_Copy` files, just seamless syncing magic.
+
+## Real-Time & WebSockets
+
+When you're online, all of this happens basically instantly over WebSockets. The second you tap a letter on your phone, an incredibly tiny binary update is shot to the server, and the server broadcasts that letter out to your desktop where it magically pops up right within Obsidian.
