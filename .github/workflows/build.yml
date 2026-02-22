@@ -23,6 +23,13 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
+      - name: Install macOS/Linux Desktop Dependencies
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          fi
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
