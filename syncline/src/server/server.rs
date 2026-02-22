@@ -1,12 +1,12 @@
-use crate::db::Db;
+use crate::server::db::Db;
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket},
         State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -14,11 +14,11 @@ use std::{
     net::SocketAddr,
     sync::Arc,
 };
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, RwLock};
-use yrs::{updates::decoder::Decode, Doc, GetString, StateVector, Text, Transact, Update};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
+use yrs::{Doc, GetString, StateVector, Text, Transact, Update, updates::decoder::Decode};
 
-use syncline::protocol::{
-    decode_message, encode_message, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
+use crate::protocol::{
+    MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, decode_message, encode_message,
 };
 
 type ChannelMap = Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>;
@@ -304,11 +304,8 @@ mod tests {
         let doc_id = "test_doc";
         let sv = StateVector::default();
         let payload = sv.encode_v1();
-        let msg = syncline::protocol::encode_message(
-            syncline::protocol::MSG_SYNC_STEP_1,
-            doc_id,
-            &payload,
-        );
+        let msg =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &payload);
 
         ws_stream
             .send(TungsteniteMessage::Binary(msg.into()))
@@ -352,11 +349,8 @@ mod tests {
         let doc_id = "test_doc_echo";
         let sv = StateVector::default();
         let payload = sv.encode_v1();
-        let msg = syncline::protocol::encode_message(
-            syncline::protocol::MSG_SYNC_STEP_1,
-            doc_id,
-            &payload,
-        );
+        let msg =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &payload);
 
         ws_stream
             .send(TungsteniteMessage::Binary(msg.into()))
@@ -381,7 +375,7 @@ mod tests {
         };
 
         let update_msg =
-            syncline::protocol::encode_message(syncline::protocol::MSG_UPDATE, doc_id, &update);
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &update);
         ws_stream
             .send(TungsteniteMessage::Binary(update_msg.into()))
             .await
@@ -422,11 +416,8 @@ mod tests {
 
         // Both clients subscribe to __index__ only on startup (no .bin files yet).
         let sv = StateVector::default().encode_v1();
-        let idx_msg = syncline::protocol::encode_message(
-            syncline::protocol::MSG_SYNC_STEP_1,
-            "__index__",
-            &sv,
-        );
+        let idx_msg =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, "__index__", &sv);
         ws_a.send(TungsteniteMessage::Binary(idx_msg.clone().into()))
             .await
             .unwrap();
@@ -437,21 +428,15 @@ mod tests {
 
         // --- Fixed client behavior: subscribe before publishing ---
         // Client A discovers "new_doc.md" via watcher, sends SyncStep1 first.
-        let sync_a = syncline::protocol::encode_message(
-            syncline::protocol::MSG_SYNC_STEP_1,
-            "new_doc.md",
-            &sv,
-        );
+        let sync_a =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, "new_doc.md", &sv);
         ws_a.send(TungsteniteMessage::Binary(sync_a.into()))
             .await
             .unwrap();
 
         // Client B also discovers "new_doc.md" and subscribes.
-        let sync_b = syncline::protocol::encode_message(
-            syncline::protocol::MSG_SYNC_STEP_1,
-            "new_doc.md",
-            &sv,
-        );
+        let sync_b =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, "new_doc.md", &sv);
         ws_b.send(TungsteniteMessage::Binary(sync_b.into()))
             .await
             .unwrap();
@@ -465,11 +450,8 @@ mod tests {
             text_a.insert(&mut txn, 0, "Hello from A");
             txn.encode_update_v1()
         };
-        let msg_a = syncline::protocol::encode_message(
-            syncline::protocol::MSG_UPDATE,
-            "new_doc.md",
-            &update_a,
-        );
+        let msg_a =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, "new_doc.md", &update_a);
         ws_a.send(TungsteniteMessage::Binary(msg_a.into()))
             .await
             .unwrap();
@@ -490,11 +472,8 @@ mod tests {
             text_b.insert(&mut txn, 0, "Hello from B");
             txn.encode_update_v1()
         };
-        let msg_b = syncline::protocol::encode_message(
-            syncline::protocol::MSG_UPDATE,
-            "new_doc.md",
-            &update_b,
-        );
+        let msg_b =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, "new_doc.md", &update_b);
         ws_b.send(TungsteniteMessage::Binary(msg_b.into()))
             .await
             .unwrap();

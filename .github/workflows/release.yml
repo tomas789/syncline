@@ -27,7 +27,7 @@ jobs:
           node-version: 20
 
       - name: Build Rust Binaries (Linux amd64)
-        run: cargo build --release -p client_folder -p server
+        run: cargo build --release -p syncline
 
       - name: Build Obsidian Plugin
         run: |
@@ -38,8 +38,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir artifacts
-          cp target/release/server artifacts/syncline-server-linux-amd64
-          cp target/release/client_folder artifacts/syncline-client-linux-amd64
+          cp target/release/syncline artifacts/syncline-linux-amd64
           cp obsidian-plugin/main.js artifacts/main.js
           cp manifest.json artifacts/manifest.json
           cp obsidian-plugin/styles.css artifacts/styles.css
@@ -48,8 +47,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/syncline-server-linux-amd64
-            artifacts/syncline-client-linux-amd64
+            artifacts/syncline-linux-amd64
             artifacts/main.js
             artifacts/manifest.json
             artifacts/styles.css

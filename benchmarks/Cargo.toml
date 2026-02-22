@@ -4,12 +4,11 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-server = { path = "../server" }
-client_folder = { path = "../client_folder" }
+syncline = { path = "../syncline" }
 tokio = { version = "1.0", features = ["full", "rt-multi-thread", "macros"] }
 futures = "0.3"
 tempfile = "3.25.0"
-yrs = "0.25"
+yrs = "0.19"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

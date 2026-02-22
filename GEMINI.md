@@ -32,13 +32,13 @@ The project is structured as a Rust workspace with multiple components:
 #### 1. Start the Server
 
 ```bash
-cargo run -p server -- --port 3030 --db-path syncline.db
+cargo run -- server --port 3030 --db-path syncline.db
 ```
 
 #### 2. Run the CLI Client
 
 ```bash
-cargo run -p client_folder -- -f /path/to/vault -u ws://localhost:3030/sync
+cargo run -- sync -f /path/to/vault -u ws://localhost:3030/sync
 ```
 
 #### 3. Build the Obsidian Plugin
