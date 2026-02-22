@@ -407,5 +407,5 @@ async fn test_offline_creation_and_deletion() {
         fs::read_to_string(env.client_path(1).join("offline_new.md")).unwrap(),
         "offline creation"
     );
-    assert!(fs::read_to_string(env.client_path(1).join("base.md")).unwrap() == "");
+    assert!(!env.client_path(1).join("base.md").exists());
 }

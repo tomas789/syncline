@@ -191,7 +191,7 @@ Comparing relative to `&StateVector::default()` packages the _entire exact keyst
 
 ## Newly Identified Issues
 
-### 13. BUG: File Deletion Propagates as Empty File Creation, Not Actual Deletion
+### 13. BUG: File Deletion Propagates as Empty File Creation, Not Actual Deletion (FIXED)
 
 **Location**: `client_folder/src/main.rs`, lines 328–337 (remote update application)
 
