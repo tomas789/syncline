@@ -236,7 +236,7 @@ On every reconnection a new pair of tasks is spawned while the previous pair may
 
 **Proposed Fix**: Store the `JoinHandle`s in `SynclineClient` and call `.abort()` on them at the start of each `connect()` call, before spawning new tasks.
 
-### 15. BUG: `get_doc_id` Silently Drops Deletion Events on macOS with Symlinked Paths
+### 15. BUG: `get_doc_id` Silently Drops Deletion Events on macOS with Symlinked Paths (FIXED)
 
 **Location**: `client_folder/src/state.rs`, lines 31–39
 
