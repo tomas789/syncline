@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::{sqlite::SqlitePool, Executor, Pool, Row, Sqlite};
+use sqlx::{Executor, Pool, Row, Sqlite, sqlite::SqlitePool};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
@@ -50,6 +50,15 @@ impl Db {
         }
 
         Ok(updates)
+    }
+
+    pub async fn count_docs(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT doc_id) FROM updates WHERE doc_id != '__index__'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
     }
 
     pub async fn get_all_updates_since(

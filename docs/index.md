@@ -33,25 +33,23 @@ Most sync solutions for Obsidian ask you to trust a third party with your notes.
 
 ### Step 1: Run the Syncline Server
 
-The server is a small, self-contained binary you run on any machine accessible from your devices.
+The easiest way to run the server on your PC or Mac is to use the native **Syncline Desktop App**. It runs silently in your system tray, manages the database for you, and securely provides the connection URLs you need.
 
-**Download and run the server from the [tomas789/syncline](https://github.com/tomas789/syncline) repository:**
+**Download the latest installer from the [Releases Page](https://github.com/tomas789/syncline/releases):**
 
-```bash
-# Clone the repository
-git clone https://github.com/tomas789/syncline
-cd syncline
+- **Mac:** Download the `.dmg`
+- **Windows:** Download the `.msi` or `.nsis.zip`
 
-# Build and start the server
-cargo run -- server
-```
+Once installed, it will automatically start with your computer. Just click the Syncline menu bar icon and select **Start Server**!
 
-The server starts on port `3030` by default. Data is stored in `syncline.db` in the current directory.
+---
 
-**Options:**
+**Advanced/CLI Users:**
+If you prefer to run the standalone headless CLI (e.g., on a headless Linux VPS or Raspberry Pi):
 
 ```bash
-cargo run -- server --port 4000 --db-path /data/my-vault.db --log-level debug
+# Download the unified CLI binary from Releases, or build from source:
+syncline server --port 3030 --db-path ./syncline.db
 ```
 
 **Run the CLI Client:**
@@ -59,7 +57,7 @@ If you prefer to run the standalone headless CLI client rather than using the Ob
 
 ```bash
 # Point the client to your vault folder and the server URL
-cargo run -- sync -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
+syncline sync -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
 ```
 
 Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
