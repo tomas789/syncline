@@ -1,0 +1,33 @@
+site_name: Syncline
+site_description: Privacy-first, self-hosted synchronization system for Obsidian vaults.
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.top
+
+nav:
+  - Introduction & Usage: index.md
+  - Architecture & How It Works: how-it-works.md
+  - Protocol: PROTOCOL.md
+  - Operations:
+      - Backups: backups.md
+      - Encryption: encryption.md
+      - Nginx Reverse Proxy: nginx.md
+  - Future Work: future-work.md
