@@ -12,17 +12,93 @@ name: release-please
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
-          # this assumes that you have created a personal access token
-          # (PAT) and configured it as a GitHub action secret named
-          # `MY_RELEASE_PLEASE_TOKEN` (this secret name is not honored by
-          # default, so you must explicitly provide it if using a custom
-          # token).
           # default is github.token but that doesn't trigger other CI workflows on PR creation/merge
           token: ${{ secrets.GITHUB_TOKEN }}
           # The configuration is defined in release-please-config.json
           # but we need to explicitly tell the action we are using standard JSON config
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  build-and-release:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Rust Binaries (Linux amd64)
+        run: cargo build --release -p syncline
+
+      - name: Build Obsidian Plugin
+        run: |
+          cd obsidian-plugin
+          npm install
+          npm run build
+
+      - name: Prepare artifacts
+        run: |
+          mkdir artifacts
+          cp target/release/syncline artifacts/syncline-linux-amd64
+          cp obsidian-plugin/main.js artifacts/main.js
+          cp manifest.json artifacts/manifest.json
+          cp obsidian-plugin/styles.css artifacts/styles.css
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: |
+            artifacts/syncline-linux-amd64
+            artifacts/main.js
+            artifacts/manifest.json
+            artifacts/styles.css
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  tauri-release:
+    needs: [release-please, build-and-release]
+    if: ${{ needs.release-please.outputs.release_created }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: build tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
