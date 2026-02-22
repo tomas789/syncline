@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/tomas789/syncline/compare/v0.4.0...v0.4.1) (2026-02-22)
+
+
+### Bug Fixes
+
+* trigger release workflow to verify artifacts ([a585855](https://github.com/tomas789/syncline/commit/a5858556052ac1f21e0e1666916a31fb0e524545))
+
 ## [0.4.0](https://github.com/tomas789/syncline/compare/v0.3.0...v0.4.0) (2026-02-22)
 
 
