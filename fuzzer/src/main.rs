@@ -3,7 +3,7 @@ use clap::Parser;
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -270,7 +270,10 @@ async fn main() -> Result<()> {
     for (i, c_dir) in client_dirs.iter().enumerate() {
         info!("Starting Client {} watching {:?}", i, c_dir.path());
         let child = Command::new(&client_bin)
+            .arg("--folder")
             .arg(c_dir.path())
+            .arg("--url")
+            .arg(format!("ws://127.0.0.1:{}/sync", args.port))
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)

@@ -66,7 +66,9 @@ impl Db {
 
         let all_updates = self.load_doc_updates(doc_id).await?;
         if all_updates.is_empty() {
-            return Ok(Vec::new());
+            let doc = Doc::new();
+            let txn = doc.transact();
+            return Ok(txn.encode_state_as_update_v1(since_sv));
         }
 
         let doc = Doc::new();

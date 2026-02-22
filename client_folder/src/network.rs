@@ -1,14 +1,11 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 use tracing::{error, info};
 use url::Url;
 
-use crate::protocol::{Message, MsgType};
+use crate::protocol::Message;
 
 pub struct SynclineClient {
     pub url: Url,
@@ -35,12 +32,9 @@ impl SynclineClient {
 
         self.ws_tx = Some(tx.clone());
 
-        let write_task = tokio::spawn(async move {
+        let _write_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                let encoded = match msg {
-                    // WsMessage::Binary takes Bytes in tokio-tungstenite 0.28
-                    msg => msg.encode(),
-                };
+                let encoded = msg.encode();
                 if let Err(e) = write
                     .send(WsMessage::Binary(bytes::Bytes::from(encoded)))
                     .await
@@ -51,20 +45,24 @@ impl SynclineClient {
             }
         });
 
-        let read_task = tokio::spawn(async move {
+        let _read_task = tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
-                    Ok(WsMessage::Binary(bin)) => match Message::decode(&bin) {
-                        Ok(parsed_msg) => {
-                            if let Err(e) = app_tx.send(parsed_msg).await {
-                                error!("Failed to route message to app: {:?}", e);
-                                break;
+                    Ok(WsMessage::Binary(bin)) => {
+                        tracing::debug!("Received WS Binary of len: {}", bin.len());
+                        match Message::decode(&bin) {
+                            Ok(parsed_msg) => {
+                                tracing::debug!("Decoded msg of type: {:?}", parsed_msg.msg_type);
+                                if let Err(e) = app_tx.send(parsed_msg).await {
+                                    error!("Failed to route message to app: {:?}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to decode incoming binary message: {:?}", e);
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to decode incoming binary message: {:?}", e);
-                        }
-                    },
+                    }
                     Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => {
                         // handled automatically usually, but could be logged
                     }

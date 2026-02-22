@@ -9,9 +9,13 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tokio::sync::{broadcast, mpsc, RwLock};
-use yrs::{updates::decoder::Decode, StateVector};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, RwLock};
+use yrs::{updates::decoder::Decode, Doc, GetString, StateVector, Text, Transact, Update};
 
 use syncline::protocol::{
     decode_message, encode_message, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
@@ -21,12 +25,79 @@ use syncline::protocol::{
 struct AppState {
     db: Db,
     channels: Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>,
+    /// Tracks which doc_ids have been registered so we can update __index__ exactly once per doc.
+    known_doc_ids: Arc<RwLock<HashSet<String>>>,
+    /// The __index__ Yrs document, shared across all connection handlers.
+    index_doc: Arc<AsyncMutex<Doc>>,
+}
+
+/// Insert `doc_id` into the shared `__index__` document if it is new, then
+/// persist the delta to the DB and broadcast it to all `__index__` subscribers.
+async fn update_index_for_new_doc(state: &AppState, doc_id: &str) {
+    // Guard: only proceed for a truly new doc_id.
+    let is_new = {
+        let mut known = state.known_doc_ids.write().await;
+        known.insert(doc_id.to_string())
+    };
+    if !is_new {
+        return;
+    }
+
+    // Append the new doc_id (newline-terminated) to the index text and capture the delta.
+    let delta = {
+        let index_doc = state.index_doc.lock().await;
+        let index_text = index_doc.get_or_insert_text("content");
+        let mut txn = index_doc.transact_mut();
+        let current = index_text.get_string(&txn);
+        let len = current.len() as u32;
+        index_text.insert(&mut txn, len, &format!("{}\n", doc_id));
+        txn.encode_update_v1()
+    };
+
+    // Persist to DB so newly-connecting clients get it via SyncStep2.
+    if let Err(e) = state.db.save_update("__index__", &delta).await {
+        tracing::error!("Failed to save __index__ update for {}: {}", doc_id, e);
+        return;
+    }
+
+    // Broadcast delta to currently-connected clients subscribed to __index__.
+    let channels = state.channels.read().await;
+    if let Some(tx) = channels.get("__index__") {
+        // uuid::Uuid::nil() means "no sender", so every subscriber receives this.
+        let _ = tx.send((delta, uuid::Uuid::nil()));
+    }
 }
 
 pub async fn run_server(db: Db, port: u16) -> anyhow::Result<()> {
+    // Rebuild the in-memory __index__ document from any updates already in the DB,
+    // and extract the set of known doc_ids from its text content.
+    let index_doc = Doc::new();
+    let all_index_updates = db.load_doc_updates("__index__").await.unwrap_or_default();
+    {
+        let mut txn = index_doc.transact_mut();
+        for update_data in all_index_updates {
+            if let Ok(u) = Update::decode_v1(&update_data) {
+                txn.apply_update(u);
+            }
+        }
+    }
+    let known_doc_ids: HashSet<String> = {
+        let index_text = index_doc.get_or_insert_text("content");
+        let txn = index_doc.transact();
+        let content = index_text.get_string(&txn);
+        drop(txn);
+        content
+            .lines()
+            .filter(|s: &&str| !s.is_empty())
+            .map(|s: &str| s.to_string())
+            .collect()
+    };
+
     let state = AppState {
         db,
         channels: Arc::new(RwLock::new(HashMap::new())),
+        known_doc_ids: Arc::new(RwLock::new(known_doc_ids)),
+        index_doc: Arc::new(AsyncMutex::new(index_doc)),
     };
 
     let app = Router::new()
@@ -73,7 +144,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if let Some((msg_type, doc_id, payload)) = decode_message(&data) {
                     match msg_type {
                         MSG_SYNC_STEP_1 => {
-                            log::info!("Received SYNC_STEP_1 for doc: {}", doc_id);
+                            tracing::info!("Received SYNC_STEP_1 for doc: {}", doc_id);
 
                             // Subscribe to (or create) the broadcast channel for this doc.
                             let rx = {
@@ -85,6 +156,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 });
                                 tx.subscribe()
                             };
+
+                            // Register the doc in __index__ so other clients can discover it.
+                            if doc_id != "__index__" {
+                                update_index_for_new_doc(&state_clone, doc_id).await;
+                            }
 
                             // Spawn an event-driven forwarding task for this doc.
                             // It exits automatically when the outgoing sender is closed
@@ -102,6 +178,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                     if sender_id == connection_id {
                                                         continue;
                                                     }
+                                                    tracing::debug!("Forwarding broadcast update for doc: {} with payload len: {}", doc_id_str, payload.len());
                                                     let msg =
                                                         encode_message(MSG_UPDATE, &doc_id_str, &payload);
                                                     if tx_fwd.send(msg).is_err() {
@@ -115,7 +192,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                     // extreme load.  Log it; the receiver is
                                                     // automatically advanced to the oldest available
                                                     // message, so no explicit action is needed.
-                                                    log::warn!(
+                                                    tracing::warn!(
                                                         "Broadcast receiver lagged by {} messages for doc {}",
                                                         n, doc_id_str
                                                     );
@@ -130,7 +207,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             if let Ok(sv) = StateVector::decode_v1(payload) {
                                 match state_clone.db.get_all_updates_since(doc_id, &sv).await {
                                     Ok(update) if !update.is_empty() => {
-                                        log::info!(
+                                        tracing::info!(
                                             "Sending SYNC_STEP_2 for doc {} with {} bytes",
                                             doc_id,
                                             update.len()
@@ -139,22 +216,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         let _ = tx_socket_clone.send(resp);
                                     }
                                     Ok(_) => {
-                                        log::info!("No updates to send for doc {}", doc_id);
+                                        tracing::info!("No updates to send for doc {}", doc_id);
                                     }
-                                    Err(e) => log::error!("DB Error: {}", e),
+                                    Err(e) => tracing::error!("DB Error: {}", e),
                                 }
                             }
                         }
                         MSG_UPDATE => {
-                            let db = state_clone.db.clone();
-                            let payload_clone = payload.to_vec();
-                            let doc_id_clone = doc_id.to_string();
-                            tokio::spawn(async move {
-                                if let Err(e) = db.save_update(&doc_id_clone, &payload_clone).await
-                                {
-                                    log::error!("DB Save Error: {}", e);
-                                }
-                            });
+                            // Register the doc in __index__ so other clients can discover it.
+                            if doc_id != "__index__" {
+                                update_index_for_new_doc(&state_clone, doc_id).await;
+                            }
+
+                            // Persist the update synchronously BEFORE broadcasting so that any
+                            // concurrent SyncStep2 responses (triggered by a subscriber that just
+                            // joined) always include the latest content.
+                            if let Err(e) = state_clone.db.save_update(doc_id, payload).await {
+                                tracing::error!("DB Save Error: {}", e);
+                            }
 
                             // Auto-create the channel if it doesn't exist yet. This handles
                             // the race where a client sends MSG_UPDATE before any SyncStep1
@@ -196,6 +275,8 @@ mod tests {
         let state = AppState {
             db,
             channels: Arc::new(RwLock::new(HashMap::new())),
+            known_doc_ids: Arc::new(RwLock::new(HashSet::new())),
+            index_doc: Arc::new(AsyncMutex::new(Doc::new())),
         };
 
         let app = Router::new()
@@ -278,6 +359,14 @@ mod tests {
         ws_stream
             .send(TungsteniteMessage::Binary(msg.into()))
             .await
+            .unwrap();
+
+        // Consume the SYNC_STEP_2 response that the server now reliably
+        // sends for every SYNC_STEP_1 (even for empty newly discovered files).
+        let _sync_response = tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+            .await
+            .expect("Should receive a SYNC_STEP_2 response!")
+            .unwrap()
             .unwrap();
 
         // Let's send an update
@@ -413,6 +502,31 @@ mod tests {
         assert!(
             result_a.is_ok(),
             "Client A should receive Client B's update for 'new_doc.md'."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_5_unicode_index_skew() {
+        let (_port, state) = setup_test_server().await;
+
+        let emoji_doc = "🚀_test.md";
+        let ascii_doc = "ascii.md";
+
+        // Call the function directly to register both docs
+        update_index_for_new_doc(&state, emoji_doc).await;
+        update_index_for_new_doc(&state, ascii_doc).await;
+
+        // Verify that the inner index document wasn't corrupted
+        let index_doc = state.index_doc.lock().await;
+        let index_text = index_doc.get_or_insert_text("content");
+        let txn = index_doc.transact();
+        let content = index_text.get_string(&txn);
+
+        // Expect both doc_id's separated by newline: "🚀_test.md\nascii.md\n"
+        let expected = format!("{}\n{}\n", emoji_doc, ascii_doc);
+        assert_eq!(
+            content, expected,
+            "Index content should correctly reflect both unicode and ascii document insertion!"
         );
     }
 }

@@ -1,10 +1,40 @@
-# Syncline — Vault Sync You Actually Own
+<p align="center">
+  <img src="./assets/banner.png" alt="SYNCLINE Banner" width="80%">
+</p>
 
-**Syncline** is an Obsidian plugin that keeps your vault in sync across all your devices — without subscriptions, without cloud lock-in, and without ever handing your notes to someone else's server.
+<p align="center">
+  <strong>Vault Sync You Actually Own.</strong>
+</p>
 
-You run the server. You own the data. It just works.
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dca282.svg?logo=rust" alt="Rust"></a>
+  <a href="https://obsidian.md/"><img src="https://img.shields.io/badge/plugin-Obsidian-blueviolet.svg?logo=obsidian" alt="Obsidian Plugin"></a>
+  <img src="https://img.shields.io/badge/sync-CRDTs-success.svg" alt="CRDTs">
+</p>
 
----
+<br/>
+
+<p align="center">
+  <b>Keep your vault in sync across all devices.</b><br>
+  No subscriptions • No cloud lock-in • No third-party servers
+</p>
+
+<p align="center">
+  <i>You run the server. You own the data. It <b>just works</b>.</i>
+</p>
+
+<br/>
+
+<p align="center">
+  <a href="#installation">Installation</a> •
+  <a href="#key-features">Features</a> •
+  <a href="#how-it-works">How It Works</a> •
+  <a href="#frequently-asked-questions">FAQ</a>
+</p>
+
+<hr/>
 
 ## Why Syncline?
 
@@ -86,19 +116,26 @@ git clone https://github.com/tomas789/syncline
 cd syncline
 
 # Build and start the server
-cargo run --bin server
-
-# The server starts on port 3030 by default
-# Data is stored in syncline.db in the current directory
+cargo run -p server
 ```
+
+The server starts on port `3030` by default. Data is stored in `syncline.db` in the current directory.
 
 **Options:**
 
 ```bash
-cargo run --bin server -- --port 4000 --db-path /data/my-vault.db
+cargo run -p server -- --port 4000 --db-path /data/my-vault.db --log-level debug
 ```
 
-The server runs on any Linux, macOS, or Windows machine. For always-on sync, run it on a home server or VPS using a systemd service or Docker.
+**Run the CLI Client:**
+If you prefer to run the standalone headless CLI client rather than using the Obsidian plugin:
+
+```bash
+# Point the client to your vault folder and the server URL
+cargo run -p client_folder --bin client_folder -- -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
+```
+
+Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
 
 ### Step 2: Install the Plugin
 
