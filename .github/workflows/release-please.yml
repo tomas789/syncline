@@ -1,0 +1,28 @@
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+name: release-please
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          # this assumes that you have created a personal access token
+          # (PAT) and configured it as a GitHub action secret named
+          # `MY_RELEASE_PLEASE_TOKEN` (this secret name is not honored by
+          # default, so you must explicitly provide it if using a custom
+          # token).
+          # default is github.token but that doesn't trigger other CI workflows on PR creation/merge
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # The configuration is defined in release-please-config.json
+          # but we need to explicitly tell the action we are using standard JSON config
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
