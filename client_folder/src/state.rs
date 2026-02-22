@@ -315,4 +315,74 @@ mod tests {
             "file2.md wasn't processed due to loop abort!"
         );
     }
+
+    #[test]
+    fn test_list_doc_ids() {
+        let dir = tempdir().unwrap();
+        let state = LocalState::new(dir.path());
+
+        // Empty dir, should return empty list
+        let docs = state.list_doc_ids().unwrap();
+        assert!(docs.is_empty());
+
+        // Create syncline data with some bin files
+        fs::create_dir_all(&state.syncline_dir).unwrap();
+        let doc1 = state.syncline_dir.join("test1.md.bin");
+        let doc2 = state.syncline_dir.join("test2.md.bin");
+        let dir_in_state = state.syncline_dir.join("nested");
+        fs::create_dir_all(&dir_in_state).unwrap();
+        let doc3 = dir_in_state.join("test3.md.bin");
+
+        // Also create a non-bin file that should be ignored
+        let ignored = state.syncline_dir.join("ignored.txt");
+
+        fs::write(&doc1, vec![]).unwrap();
+        fs::write(&doc2, vec![]).unwrap();
+        fs::write(&doc3, vec![]).unwrap();
+        fs::write(&ignored, vec![]).unwrap();
+
+        let mut docs = state.list_doc_ids().unwrap();
+        docs.sort();
+
+        let mut expected = vec![
+            "test1.md".to_string(),
+            "test2.md".to_string(),
+            "nested/test3.md".to_string(),
+        ];
+        // Note: depending on the OS, path separator could be \ or /
+        // Let's normalize it to just check contains instead of exact vector matching
+        assert_eq!(docs.len(), 3);
+        assert!(docs.iter().any(|s| s.contains("test1.md")));
+        assert!(docs.iter().any(|s| s.contains("test2.md")));
+        assert!(docs.iter().any(|s| s.contains("test3.md")));
+    }
+
+    #[test]
+    fn test_offline_deletion() {
+        let dir = tempdir().unwrap();
+        let state = LocalState::new(dir.path());
+
+        let file1 = dir.path().join("file1.md");
+        fs::write(&file1, "Hello World").unwrap();
+
+        // 1. First run, file is new
+        state.bootstrap_offline_changes().unwrap();
+
+        // 2. Delete the physical file directly
+        fs::remove_file(&file1).unwrap();
+
+        // 3. Run bootstrap again, it should detect the offline deletion
+        let changed = state.bootstrap_offline_changes().unwrap();
+
+        // Should have one change corresponding to the empty string
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, "file1.md");
+
+        // Verify underlying storage represents the deletion (empty string)
+        let state_path = state.get_state_path("file1.md");
+        let doc = load_doc(&state_path).unwrap();
+        let text_ref = doc.get_or_insert_text("content");
+        let txn = doc.transact();
+        assert_eq!(text_ref.get_string(&txn), "");
+    }
 }

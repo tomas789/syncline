@@ -176,4 +176,46 @@ mod tests {
             active_connections.load(Ordering::SeqCst)
         );
     }
+
+    #[tokio::test]
+    async fn test_drop_disconnects() {
+        let (port, active_connections) = spawn_test_server().await;
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        let client = {
+            let mut client = SynclineClient::new(&url).unwrap();
+            let (app_tx, _) = mpsc::channel(10);
+            client.connect(app_tx).await.unwrap();
+
+            // Wait for connection to establish
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(active_connections.load(Ordering::SeqCst), 1);
+            client
+        };
+
+        // Client is dropped here
+        drop(client);
+
+        // Wait for connection to drop
+        let mut converged = false;
+        for _ in 0..25 {
+            if active_connections.load(Ordering::SeqCst) == 0 {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            converged,
+            "Should have 0 active connections after drop, but found {}",
+            active_connections.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn test_invalid_url() {
+        let result = SynclineClient::new("invalid_url");
+        assert!(result.is_err());
+    }
 }
