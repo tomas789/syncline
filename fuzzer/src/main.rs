@@ -130,7 +130,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> Result<bool> {
             let doc = yrs::Doc::new();
             let t = doc.get_or_insert_text("content");
             let mut txn = doc.transact_mut();
-            txn.apply_update(update).unwrap();
+            txn.apply_update(update);
             return yrs::GetString::get_string(&t, &txn);
         }
         "".to_string()
@@ -235,8 +235,7 @@ async fn main() -> Result<()> {
     build_binaries().await.context("Failed to build binaries")?;
 
     let binary_dir = std::env::current_dir()?.join("target/debug");
-    let server_bin = binary_dir.join("server");
-    let client_bin = binary_dir.join("client_folder");
+    let syncline_bin = binary_dir.join("syncline");
 
     // Setup working directories
     let server_dir = TempDir::new()?;
@@ -251,7 +250,8 @@ async fn main() -> Result<()> {
         server_dir.path().join("fuzz.db").display()
     );
     info!("Starting Server on port {}", args.port);
-    let mut server_child = Command::new(&server_bin)
+    let mut server_child = Command::new(&syncline_bin)
+        .arg("server")
         .arg("--port")
         .arg(args.port.to_string())
         .arg("--db-path")
@@ -269,7 +269,8 @@ async fn main() -> Result<()> {
     let mut client_children = Vec::new();
     for (i, c_dir) in client_dirs.iter().enumerate() {
         info!("Starting Client {} watching {:?}", i, c_dir.path());
-        let child = Command::new(&client_bin)
+        let child = Command::new(&syncline_bin)
+            .arg("sync")
             .arg("--folder")
             .arg(c_dir.path())
             .arg("--url")

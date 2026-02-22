@@ -25,24 +25,17 @@ pub async fn build_workspace() {
     assert!(status.success(), "cargo build must succeed");
 }
 
-pub fn server_bin() -> PathBuf {
+pub fn syncline_bin() -> PathBuf {
     std::env::current_dir()
         .unwrap()
         .parent()
         .unwrap()
-        .join("target/debug/server")
-}
-
-pub fn client_bin() -> PathBuf {
-    std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target/debug/client_folder")
+        .join("target/debug/syncline")
 }
 
 pub async fn spawn_server(port: u16, db_path: &Path) -> Child {
-    Command::new(server_bin())
+    Command::new(syncline_bin())
+        .arg("server")
         .arg("--port")
         .arg(port.to_string())
         .arg("--db-path")
@@ -55,7 +48,8 @@ pub async fn spawn_server(port: u16, db_path: &Path) -> Child {
 }
 
 pub async fn spawn_client(dir: &Path, port: u16) -> Child {
-    Command::new(client_bin())
+    Command::new(syncline_bin())
+        .arg("sync")
         .arg("--folder")
         .arg(dir)
         .env("SYNCLINE_URL", format!("ws://127.0.0.1:{}/sync", port))
@@ -80,7 +74,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
             let doc = yrs::Doc::new();
             let t = doc.get_or_insert_text("content");
             let mut txn = doc.transact_mut();
-            txn.apply_update(update).unwrap();
+            txn.apply_update(update);
             return yrs::GetString::get_string(&t, &txn);
         }
         "".to_string()

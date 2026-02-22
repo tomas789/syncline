@@ -1,11 +1,11 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 // Client dependencies
-use client_folder::diff::apply_diff_to_yrs;
+use syncline::client::diff::apply_diff_to_yrs;
 use yrs::{Doc, Text, Transact};
 
 // Server dependencies
-use server::db::Db;
+use syncline::server::db::Db;
 
 fn bench_apply_diff(c: &mut Criterion) {
     let mut group = c.benchmark_group("Client Apply Diff");

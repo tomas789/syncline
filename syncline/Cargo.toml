@@ -1,7 +1,7 @@
 [package]
 name = "syncline"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -11,6 +11,7 @@ yrs = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1.0"
+dissimilar = "1.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -24,4 +25,31 @@ web-sys = { version = "0.3", features = [
     "console",
 ] }
 console_error_panic_hook = "0.1"
-dissimilar = "1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.28"
+axum = { version = "0.7", features = ["ws"] }
+headers = "0.4"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
+futures = "0.3"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+bytes = "1.11"
+colored = "3.1"
+imara-diff = "0.2"
+notify = "8.2"
+notify-debouncer-mini = "0.7"
+url = "2.5"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.2"
+tokio-tungstenite = "0.28"
+url = "2.5"

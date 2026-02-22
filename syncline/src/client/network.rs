@@ -5,7 +5,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 use tracing::{error, info};
 use url::Url;
 
-use crate::protocol::Message;
+use crate::client::protocol::Message;
 
 pub struct SynclineClient {
     pub url: Url,

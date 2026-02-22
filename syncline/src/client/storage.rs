@@ -28,8 +28,7 @@ pub fn load_doc(path: &Path) -> Result<Doc> {
     let doc = Doc::new();
     {
         let mut txn = doc.transact_mut();
-        txn.apply_update(update)
-            .map_err(|e| anyhow::anyhow!("Failed to apply update: {:?}", e))?;
+        txn.apply_update(update);
     }
 
     Ok(doc)
@@ -38,7 +37,7 @@ pub fn load_doc(path: &Path) -> Result<Doc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::apply_diff_to_yrs;
+    use crate::client::diff::apply_diff_to_yrs;
     use tempfile::tempdir;
     use yrs::{GetString, Text};
 
