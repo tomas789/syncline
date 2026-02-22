@@ -1,5 +1,4 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use tempfile::NamedTempFile;
 
 // Client dependencies
 use client_folder::diff::apply_diff_to_yrs;

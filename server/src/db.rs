@@ -65,23 +65,29 @@ impl Db {
         // 2. Compute the difference update based on `since_sv`.
 
         let all_updates = self.load_doc_updates(doc_id).await?;
-        if all_updates.is_empty() {
-            let doc = Doc::new();
-            let txn = doc.transact();
-            return Ok(txn.encode_state_as_update_v1(since_sv));
-        }
+        let since_sv = since_sv.clone();
 
-        let doc = Doc::new();
-        {
-            let mut txn = doc.transact_mut();
-            for update_data in all_updates {
-                if let Ok(u) = Update::decode_v1(&update_data) {
-                    txn.apply_update(u);
-                }
+        tokio::task::spawn_blocking(move || {
+            if all_updates.is_empty() {
+                let doc = Doc::new();
+                let txn = doc.transact();
+                return Ok(txn.encode_state_as_update_v1(&since_sv));
             }
 
-            let update_to_sync = txn.encode_state_as_update_v1(since_sv);
-            Ok(update_to_sync)
-        }
+            let doc = Doc::new();
+            {
+                let mut txn = doc.transact_mut();
+                for update_data in all_updates {
+                    if let Ok(u) = Update::decode_v1(&update_data) {
+                        txn.apply_update(u);
+                    }
+                }
+
+                let update_to_sync = txn.encode_state_as_update_v1(&since_sv);
+                Ok(update_to_sync)
+            }
+        })
+        .await
+        .unwrap()
     }
 }

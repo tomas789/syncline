@@ -21,10 +21,12 @@ use syncline::protocol::{
     decode_message, encode_message, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
 };
 
+type ChannelMap = Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>;
+
 #[derive(Clone)]
 struct AppState {
     db: Db,
-    channels: Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>,
+    channels: ChannelMap,
     /// Tracks which doc_ids have been registered so we can update __index__ exactly once per doc.
     known_doc_ids: Arc<RwLock<HashSet<String>>>,
     /// The __index__ Yrs document, shared across all connection handlers.

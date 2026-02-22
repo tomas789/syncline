@@ -84,7 +84,7 @@ async fn runner_loop(
 ) -> Result<()> {
     // We deterministicly seed based on client_id and global seed
     let mut rng = StdRng::seed_from_u64(seed + client_id as u64);
-    let files = vec!["fileA.md", "fileB.md", "fileC.md"];
+    let files = ["fileA.md", "fileB.md", "fileC.md"];
 
     info!("Client {} started fuzzing loop", client_id);
 
@@ -124,14 +124,14 @@ fn compare_directories(client_dirs: &[PathBuf]) -> Result<bool> {
 
     let load_yrs = |dir: &PathBuf, doc_id: &str| -> String {
         let bin_path = dir.join(".syncline/data").join(format!("{}.bin", doc_id));
-        if let Ok(content) = fs::read(&bin_path) {
-            if let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&content) {
-                let doc = yrs::Doc::new();
-                let t = doc.get_or_insert_text("content");
-                let mut txn = doc.transact_mut();
-                txn.apply_update(update).unwrap();
-                return yrs::GetString::get_string(&t, &txn);
-            }
+        if let Ok(content) = fs::read(&bin_path)
+            && let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&content)
+        {
+            let doc = yrs::Doc::new();
+            let t = doc.get_or_insert_text("content");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update).unwrap();
+            return yrs::GetString::get_string(&t, &txn);
         }
         "".to_string()
     };
@@ -193,26 +193,26 @@ fn compare_directories(client_dirs: &[PathBuf]) -> Result<bool> {
         }
 
         for (name, content) in &actual_files {
-            if let Some(expected_content) = expected_files.get(name) {
-                if content != expected_content {
-                    error!(
-                        "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                        name, idx, expected_content, idx, content
-                    );
-                    converged = false;
-                }
+            if let Some(expected_content) = expected_files.get(name)
+                && content != expected_content
+            {
+                error!(
+                    "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
+                    name, idx, expected_content, idx, content
+                );
+                converged = false;
             }
         }
 
         for (name, content) in &actual_yrs {
-            if let Some(expected_content) = expected_yrs.get(name) {
-                if content != expected_content {
-                    error!(
-                        "YRS File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                        name, idx, expected_content, idx, content
-                    );
-                    converged = false;
-                }
+            if let Some(expected_content) = expected_yrs.get(name)
+                && content != expected_content
+            {
+                error!(
+                    "YRS File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
+                    name, idx, expected_content, idx, content
+                );
+                converged = false;
             }
         }
     }
@@ -288,8 +288,8 @@ async fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
 
     let mut tasks = Vec::new();
-    for i in 0..args.clients {
-        let path = client_dirs[i].path().to_path_buf();
+    for (i, c_dir) in client_dirs.iter().enumerate().take(args.clients) {
+        let path = c_dir.path().to_path_buf();
         let running_clone = running.clone();
         let t = tokio::spawn(runner_loop(i, path, args.seed, running_clone));
         tasks.push(t);
