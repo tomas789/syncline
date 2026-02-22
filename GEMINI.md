@@ -30,21 +30,25 @@ The project is structured as a Rust workspace with multiple components:
 ### Building and Running
 
 #### 1. Start the Server
+
 ```bash
 cargo run -p server -- --port 3030 --db-path syncline.db
 ```
 
 #### 2. Run the CLI Client
+
 ```bash
 cargo run -p client_folder -- -f /path/to/vault -u ws://localhost:3030/sync
 ```
 
 #### 3. Build the Obsidian Plugin
+
 ```bash
 cd obsidian-plugin
 npm install
 npm run build
 ```
+
 The build process includes compiling the Rust core to Wasm via `wasm-pack`.
 
 ## Development Conventions
@@ -57,6 +61,10 @@ The build process includes compiling the Rust core to Wasm via `wasm-pack`.
   - Integration tests: See `tests/` and `client_folder/tests/`
   - Fuzzing: Use the `fuzzer` crate to test CRDT edge cases.
 - **Logging**: Use `tracing` in Rust components. The log level can be controlled via `RUST_LOG` or CLI flags.
+- **Releases and Versioning**:
+  - The project uses `release-please` for automated version bumps and changelog generation.
+  - You MUST write commit messages following the **Conventional Commits** format (e.g., `feat: added feature`, `fix: resolving bug`, `docs: update readme`, `build: setup action`).
+  - When conventional commits are pushed to the `main` branch, a Release PR is automatically created/updated. Merging that PR publishes the GitHub release and syncs versions across the `syncline`, `server`, `client_folder`, and `obsidian-plugin` components.
 
 ## Key Files
 
