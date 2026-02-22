@@ -231,7 +231,7 @@ impl SynclineClient {
 
     pub fn create_index(&self, callback: Option<Function>) -> Result<(), JsValue> {
         let doc = Doc::new();
-        let map = doc.get_or_insert_map("files");
+        doc.get_or_insert_text("content");
         let is_receiving = Rc::new(RefCell::new(false));
 
         if let Some(cb) = callback {
@@ -268,7 +268,7 @@ impl SynclineClient {
                 callback: dummy_callback,
                 _sub: sub,
                 is_receiving,
-                doc_type: DocType::Map,
+                doc_type: DocType::Text,
             },
         );
 
@@ -290,9 +290,14 @@ impl SynclineClient {
     pub fn index_insert(&self, key: String) -> Result<(), JsValue> {
         let docs = self.docs.borrow();
         if let Some(state) = docs.get("__index__") {
-            let map = state.doc.get_or_insert_map("files");
+            let text = state.doc.get_or_insert_text("content");
             let mut txn = state.doc.transact_mut();
-            map.insert(&mut txn, key, "1");
+            let current = text.get_string(&txn);
+            let target = format!("{}\n", key);
+            if !current.contains(&target) {
+                let len = current.len() as u32;
+                text.insert(&mut txn, len, &target);
+            }
         }
         Ok(())
     }
@@ -300,9 +305,13 @@ impl SynclineClient {
     pub fn index_remove(&self, key: &str) -> Result<(), JsValue> {
         let docs = self.docs.borrow();
         if let Some(state) = docs.get("__index__") {
-            let map = state.doc.get_or_insert_map("files");
+            let text = state.doc.get_or_insert_text("content");
             let mut txn = state.doc.transact_mut();
-            map.remove(&mut txn, key);
+            let current = text.get_string(&txn);
+            let target = format!("{}\n", key);
+            if let Some(idx) = current.find(&target) {
+                text.remove_range(&mut txn, idx as u32, target.len() as u32);
+            }
         }
         Ok(())
     }
@@ -310,9 +319,14 @@ impl SynclineClient {
     pub fn index_keys(&self) -> Vec<String> {
         let docs = self.docs.borrow();
         if let Some(state) = docs.get("__index__") {
-            let map = state.doc.get_or_insert_map("files");
+            let text = state.doc.get_or_insert_text("content");
             let txn = state.doc.transact();
-            map.keys(&txn).map(|k| k.to_string()).collect()
+            let content = text.get_string(&txn);
+            content
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
         } else {
             Vec::new()
         }
@@ -342,21 +356,31 @@ impl SynclineClient {
                 return;
             }
 
-            let diffs = diff::chars(&current, &new_content);
-            let mut index = 0u32;
+            if current.is_empty() {
+                text.insert(&mut txn, 0, &new_content);
+                return;
+            }
 
-            for d in diffs {
-                match d {
-                    diff::Result::Left(c) => {
-                        text.remove_range(&mut txn, index, c.len_utf16() as u32);
+            if new_content.is_empty() {
+                text.remove_range(&mut txn, 0, current.len() as u32);
+                return;
+            }
+
+            let diff = dissimilar::diff(&current, &new_content);
+
+            let mut cursor = 0;
+
+            for chunk in diff {
+                match chunk {
+                    dissimilar::Chunk::Equal(val) => {
+                        cursor += val.len() as u32;
                     }
-                    diff::Result::Right(r) => {
-                        let s = r.to_string();
-                        text.insert(&mut txn, index, &s);
-                        index += r.len_utf16() as u32;
+                    dissimilar::Chunk::Delete(val) => {
+                        text.remove_range(&mut txn, cursor, val.len() as u32);
                     }
-                    diff::Result::Both(c, _) => {
-                        index += c.len_utf16() as u32;
+                    dissimilar::Chunk::Insert(val) => {
+                        text.insert(&mut txn, cursor, val);
+                        cursor += val.len() as u32;
                     }
                 }
             }

@@ -1,209 +1,407 @@
+use clap::Parser;
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use client_folder::diff::apply_diff_to_yrs;
 use client_folder::network::SynclineClient;
 use client_folder::protocol::{Message, MsgType};
 use client_folder::state::LocalState;
 use client_folder::storage::{load_doc, save_doc};
 use client_folder::watcher::DebouncedWatcher;
+use colored::Colorize;
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{Level, error, info};
+use tracing::{error, info};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
+
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    version,
+    about = "🌟 Syncline Client: A modern synchronization workspace.",
+    long_about = None,
+    styles = cli_styles()
+)]
+struct Args {
+    /// Folder to watch and sync
+    #[arg(short, long, default_value = ".")]
+    folder: PathBuf,
+
+    /// URL of the Syncline server
+    #[arg(
+        short,
+        long,
+        default_value = "ws://127.0.0.1:3030/sync",
+        env = "SYNCLINE_URL"
+    )]
+    url: String,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
+    /// Optional file to redirect logs to
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
-        .init();
-    info!("Starting Syncline Client (Phase 4 & 5)");
+    let args = Args::parse();
 
-    let args: Vec<String> = env::args().collect();
-    let dir_to_watch = if args.len() > 1 {
-        PathBuf::from(&args[1])
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+
+    let fmt_layer = fmt::layer().with_target(false).without_time();
+    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    if let Some(log_file) = &args.log_file {
+        let file_appender = tracing_appender::rolling::never(
+            log_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("")),
+            log_file.file_name().unwrap(),
+        );
+        let file_layer = fmt::layer().with_writer(file_appender).with_ansi(false);
+        subscriber.with(file_layer).init();
     } else {
-        PathBuf::from(".")
-    };
-
-    let local_state = LocalState::new(&dir_to_watch);
-
-    // Phase 5 part: Loop protection via expected hashes or checksums.
-    // (We removed the simple hashset approach)
-
-    // Setup network
-    let server_url = "ws://127.0.0.1:3000/sync"; // Hardcoded default based on common dev usage
-    let mut client = SynclineClient::new(server_url)?;
-
-    let (app_tx, mut app_rx) = mpsc::channel(100);
-    let ws_tx = client.connect(app_tx).await?;
-
-    // Track which doc_ids we have subscribed to via SyncStep1 so we can
-    // subscribe on-the-fly when the watcher discovers a new file.
-    let mut subscribed_docs: HashSet<String> = HashSet::new();
-
-    // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
-    if let Ok(docs) = local_state.list_doc_ids() {
-        for doc_id in docs {
-            let state_path = local_state.get_state_path(&doc_id);
-            if let Ok(doc) = load_doc(&state_path) {
-                let sv = doc.transact().state_vector().encode_v1();
-                ws_tx
-                    .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
-                    .await?;
-                subscribed_docs.insert(doc_id);
-            }
-        }
+        subscriber.init();
     }
 
-    // Request sync for __index__
-    ws_tx
-        .send(Message::new(
-            MsgType::SyncStep1,
-            "__index__".to_string(),
-            StateVector::default().encode_v1(),
-        ))
-        .await?;
-    subscribed_docs.insert("__index__".to_string());
+    println!(
+        "{}",
+        r#"
+   _____                  ___         
+  / ___/__  ______  _____/ (_)___  ___ 
+  \__ \/ / / / __ \/ ___/ / / __ \/ _ \
+ ___/ / /_/ / / / / /__/ / / / / /  __/
+/____/\__, /_/ /_/\___/_/_/_/ /_/\___/ 
+     /____/                            
+"#
+        .cyan()
+        .bold()
+    );
+    println!("  {}\n", "🌟 A modern synchronization workspace".green());
 
-    // Phase 1 + 5: Setup debounced watcher
+    info!("{} Starting Syncline Client...", "🚀".green());
+    info!("{} Folder: {}", "📂".blue(), args.folder.display());
+    info!("{} Server URL: {}", "🌐".cyan(), args.url);
+    if let Some(f) = &args.log_file {
+        info!("{} Log file: {}", "📝".yellow(), f.display());
+    }
+
+    let dir_to_watch = args.folder;
+    let local_state = LocalState::new(&dir_to_watch);
+
+    // Setup network
+    let server_url = args.url;
+    let mut client = SynclineClient::new(&server_url)?;
+
+    // Phase 1 + 5: Setup debounced watcher (created outside reconnect loop)
     let (watcher_tx, mut watcher_rx) = mpsc::channel(100);
     let mut watcher = DebouncedWatcher::new(watcher_tx, std::time::Duration::from_millis(300))?;
     watcher.watch(&dir_to_watch)?;
 
     info!("Listening for file events. Press Ctrl+C to stop.");
 
+    let mut reconnect_attempts = 0;
+
+    // Outer loop for reconnecting
     loop {
-        tokio::select! {
-            Some(msg) = app_rx.recv() => {
-                match msg.msg_type {
-                    MsgType::SyncStep2 | MsgType::Update => {
-                        let doc_id = msg.doc_id;
-                        if doc_id == "__index__" {
-                            continue;
-                        }
+        let (app_tx, mut app_rx) = mpsc::channel(100);
+        let ws_tx = match client.connect(app_tx).await {
+            Ok(tx) => {
+                reconnect_attempts = 0;
+                tx
+            }
+            Err(e) => {
+                let delay = std::cmp::min(1000 * 2u64.pow(reconnect_attempts), 30000);
+                error!("Connection failed: {:?}. Retrying in {}ms", e, delay);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                reconnect_attempts += 1;
+                continue;
+            }
+        };
 
-                        let state_path = local_state.get_state_path(&doc_id);
-                        let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+        // Track which doc_ids we have subscribed to via SyncStep1 so we can
+        // subscribe on-the-fly when the watcher discovers a new file.
+        let mut subscribed_docs: HashSet<String> = HashSet::new();
 
-                        let phys_path = local_state.root_dir.join(&doc_id);
+        // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
+        if let Ok(docs) = local_state.list_doc_ids() {
+            for doc_id in docs {
+                let state_path = local_state.get_state_path(&doc_id);
+                if let Ok(doc) = load_doc(&state_path) {
+                    let sv = doc.transact().state_vector().encode_v1();
+                    if let Err(e) = ws_tx
+                        .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
+                        .await
+                    {
+                        error!("Failed to send SyncStep1 for doc {}: {:?}", doc_id, e);
+                    }
+                    subscribed_docs.insert(doc_id);
+                }
+            }
+        }
 
-                        // 1. Check for unsynced local disk changes before we overwrite the disk
-                        let text_ref = doc.get_or_insert_text("content");
-                        let yjs_content_before = text_ref.get_string(&doc.transact());
-                        let has_file = fs::metadata(&phys_path).is_ok();
-                        let disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
+        // Request sync for __index__
+        if let Err(e) = ws_tx
+            .send(Message::new(
+                MsgType::SyncStep1,
+                "__index__".to_string(),
+                StateVector::default().encode_v1(),
+            ))
+            .await
+        {
+            error!("Failed to send SyncStep1 for __index__: {:?}", e);
+        }
+        subscribed_docs.insert("__index__".to_string());
 
-                        if has_file && yjs_content_before != disk_content {
-                            info!("Unsynced local changes in {}! Diffing before applying remote update.", doc_id);
-                            apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
-
-                            // Broadcast the local edits so the other remote peers get them too
-                            let state_vector = StateVector::default(); // Note: could be optimized later instead of full state transmit
-                            let local_update = doc.transact().encode_state_as_update_v1(&state_vector);
-                            if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id.clone(), local_update)).await {
-                                error!("Failed to send unsynced local update: {:?}", e);
+        loop {
+            tokio::select! {
+                    app_msg = app_rx.recv() => {
+                        let msg = match app_msg {
+                            Some(m) => m,
+                            None => {
+                                error!("Connection to server lost. Reconnecting...");
+                                break; // break the inner loop to trigger reconnect
                             }
-                        }
+                        };
+                        match msg.msg_type {
+                        MsgType::SyncStep2 | MsgType::Update => {
+                            let doc_id = msg.doc_id;
+                            let is_index = doc_id == "__index__";
 
-                        // 2. NOW apply the remote update
-                        if let Ok(update) = Update::decode_v1(&msg.payload) {
-                            let mut txn = doc.transact_mut();
-                            if let Err(e) = txn.apply_update(update) {
-                                error!("Failed to apply update for {}: {:?}", doc_id, e);
+                            let state_path = local_state.get_state_path(&doc_id);
+                            let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+
+                            if is_index {
+                                info!("Received update for __index__, msg payload len: {}", msg.payload.len());
+                                match Update::decode_v1(&msg.payload) {
+                                    Ok(update) => {
+                                        let text_ref = doc.get_or_insert_text("content");
+                                        let mut txn = doc.transact_mut();
+                                        if let Err(e) = txn.apply_update(update) {
+                                            error!("Failed to apply update for {}: {:?}", doc_id, e);
+                                            continue;
+                                        }
+
+                                        let index_content = text_ref.get_string(&txn);
+                                        drop(txn);
+
+                                        info!("__index__ content is now: {:?}", index_content);
+
+                                        if let Err(e) = save_doc(&doc, &state_path) {
+                                            error!("Failed to save doc state {}: {:?}", doc_id, e);
+                                        }
+
+                                        let new_index_docs: HashSet<&str> = index_content.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+                                        // Detect deletions: docs that are in subscribed_docs but no longer in __index__
+                                        let mut to_remove = Vec::new();
+                                        for sub_doc in &subscribed_docs {
+                                            if sub_doc == "__index__" { continue; }
+                                            if !new_index_docs.contains(sub_doc.as_str()) {
+                                                to_remove.push(sub_doc.clone());
+                                            }
+                                        }
+
+                                        for removed_doc in to_remove {
+                                            info!("Document {} removed from __index__, deleting locally", removed_doc);
+                                            let phys_path = local_state.root_dir.join(&removed_doc);
+                                            if fs::metadata(&phys_path).is_ok() {
+                                                if let Err(e) = fs::remove_file(&phys_path) {
+                                                    error!("Failed to delete physical file {}: {:?}", phys_path.display(), e);
+                                                } else {
+                                                    info!("Deleted physical file {}", phys_path.display());
+                                                }
+                                            }
+                                            subscribed_docs.remove(&removed_doc);
+                                        }
+
+                                        for discovered_doc_id in new_index_docs {
+                                            if !subscribed_docs.contains(discovered_doc_id) {
+                                                info!("Discovered new document from __index__: {}", discovered_doc_id);
+                                                let discovered_state_path = local_state.get_state_path(discovered_doc_id);
+                                                info!("Sending SyncStep1 for newly discovered doc: {}", discovered_doc_id);
+                                                let discovered_doc = load_doc(&discovered_state_path).unwrap_or_else(|_| Doc::new());
+                                                let sv = discovered_doc.transact().state_vector().encode_v1();
+
+                                                if let Err(e) = ws_tx.send(Message::new(
+                                                    MsgType::SyncStep1,
+                                                    discovered_doc_id.to_string(),
+                                                    sv,
+                                                )).await {
+                                                    error!("Failed to send SyncStep1 for discovered doc {}: {:?}", discovered_doc_id, e);
+                                                } else {
+                                                    info!("Successfully sent SyncStep1 for {}!", discovered_doc_id);
+                                                    subscribed_docs.insert(discovered_doc_id.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to decode __index__ update: {:?}", e);
+                                    }
+                                }
                                 continue;
                             }
 
-                            let text_val = text_ref.get_string(&txn);
-                            drop(txn);
+                            let phys_path = local_state.root_dir.join(&doc_id);
 
-                            if let Err(e) = save_doc(&doc, &state_path) {
-                                error!("Failed to save doc state {}: {:?}", doc_id, e);
-                            }
-
-                            // expected_writes removed
-
-
-                            if let Some(parent) = phys_path.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-
-                            if let Err(e) = fs::write(&phys_path, text_val) {
-                                error!("Failed to write physical file {}: {:?}", phys_path.display(), e);
-                            } else {
-                                info!("Applied remote update to file {}", phys_path.display());
-                            }
-                        }
-                    },
-                    MsgType::SyncStep1 => { }
-                }
-            }
-            Some(res) = watcher_rx.recv() => {
-                match res {
-                    Ok(events) => {
-                        for ev in events {
-                            let path = ev.path;
-
-                            // try matching on canonicalized path just in case
-                            /*
-                            if let Ok(canon) = std::fs::canonicalize(&path) {
-                                // we removed expected_writes entirely
-                            }
-                            */
-
-                            if !path.is_file() { continue; }
-                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                            if ext != "md" && ext != "txt" { continue; }
-                            if path.to_string_lossy().contains(".syncline") || path.to_string_lossy().contains(".git") { continue; }
-
-                            let doc_id = match local_state.get_doc_id(&path) {
-                                Ok(d) => d,
-                                Err(_) => continue,
-                            };
-                            let state_path = local_state.get_state_path(&doc_id);
-
-                            let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+                            // 1. Check for unsynced local disk changes before we overwrite the disk
                             let text_ref = doc.get_or_insert_text("content");
+                            let yjs_content_before = text_ref.get_string(&doc.transact());
+                            let has_file = fs::metadata(&phys_path).is_ok();
+                            let disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
 
-                            // If this document has never been subscribed to, send SyncStep1
-                            // first so the server creates a broadcast channel for it and we
-                            // receive updates from other clients.
-                            if !subscribed_docs.contains(&doc_id) {
-                                let sv = doc.transact().state_vector().encode_v1();
-                                if let Err(e) = ws_tx
-                                    .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
-                                    .await
-                                {
-                                    error!("Failed to subscribe to new doc {}: {:?}", doc_id, e);
-                                } else {
-                                    subscribed_docs.insert(doc_id.clone());
+                            if has_file && yjs_content_before != disk_content {
+                                info!("Unsynced local changes in {}! Diffing before applying remote update.", doc_id);
+                                apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
+
+                                // Broadcast the local edits so the other remote peers get them too
+                                let state_vector = StateVector::default(); // Note: could be optimized later instead of full state transmit
+                                let local_update = doc.transact().encode_state_as_update_v1(&state_vector);
+                                if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id.clone(), local_update)).await {
+                                    error!("Failed to send unsynced local update: {:?}", e);
                                 }
                             }
 
-                            let disk_content = match fs::read_to_string(&path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
-                            };
-
-                            let yjs_content = text_ref.get_string(&doc.transact());
-                            if disk_content != yjs_content {
-                                info!("Local file {} modified, diffing and broadcasting...", path.display());
-                                apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
-                                if let Err(e) = save_doc(&doc, &state_path) {
-                                    error!("Failed to save doc locally: {:?}", e);
+                            // 2. NOW apply the remote update
+                            if let Ok(update) = Update::decode_v1(&msg.payload) {
+                                let mut txn = doc.transact_mut();
+                                if let Err(e) = txn.apply_update(update) {
+                                    error!("Failed to apply update for {}: {:?}", doc_id, e);
                                     continue;
                                 }
 
-                                let update = doc.transact().encode_state_as_update_v1(&StateVector::default());
-                                if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id, update)).await {
-                                    error!("Failed to send update: {:?}", e);
+                                let text_val = text_ref.get_string(&txn);
+                                drop(txn);
+
+                                if let Err(e) = save_doc(&doc, &state_path) {
+                                    error!("Failed to save doc state {}: {:?}", doc_id, e);
+                                }
+
+                                let current_disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
+                                let file_exists = fs::metadata(&phys_path).is_ok();
+
+                                if !file_exists || current_disk_content != text_val {
+                                    if let Some(parent) = phys_path.parent() {
+                                        let _ = fs::create_dir_all(parent);
+                                    }
+
+                                    if let Err(e) = fs::write(&phys_path, &text_val) {
+                                        error!("Failed to write physical file {}: {:?}", phys_path.display(), e);
+                                    } else {
+                                        info!("Applied remote update to file {}", phys_path.display());
+                                    }
+                                }
+                            }
+                        },
+                        MsgType::SyncStep1 => { }
+                    }
+                }
+                Some(res) = watcher_rx.recv() => {
+                    match res {
+                        Ok(events) => {
+                            for ev in events {
+                                let path = ev.path;
+
+                                // try matching on canonicalized path just in case
+                                /*
+                                if let Ok(canon) = std::fs::canonicalize(&path) {
+                                    // we removed expected_writes entirely
+                                }
+                                */
+
+                                let is_deleted = !path.exists();
+                                if is_deleted {
+                                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                                    if ext != "md" && ext != "txt" { continue; }
+
+                                    let doc_id = match local_state.get_doc_id(&path) {
+                                        Ok(d) => d,
+                                        Err(_) => continue,
+                                    };
+
+                                    let state_path = local_state.get_state_path(&doc_id);
+                                    if !state_path.exists() {
+                                        continue; // Never tracked, ignore deletion
+                                    }
+                                } else if !path.is_file() {
+                                    continue;
+                                } else {
+                                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                                    if ext != "md" && ext != "txt" { continue; }
+                                }
+
+                                let doc_id = match local_state.get_doc_id(&path) {
+                                    Ok(d) => d,
+                                    Err(_) => continue,
+                                };
+
+                                // Check if any part of the relative path is hidden (starts with .)
+                                if doc_id.split('/').any(|comp| comp.starts_with('.')) {
+                                    continue;
+                                }
+                                let state_path = local_state.get_state_path(&doc_id);
+
+                                let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+                                let text_ref = doc.get_or_insert_text("content");
+
+                                let newly_discovered = !subscribed_docs.contains(&doc_id);
+                                // If this document has never been subscribed to, send SyncStep1
+                                // first so the server creates a broadcast channel for it and we
+                                // receive updates from other clients.
+                                if newly_discovered {
+                                    let sv = doc.transact().state_vector().encode_v1();
+                                    if let Err(e) = ws_tx
+                                        .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
+                                        .await
+                                    {
+                                        error!("Failed to subscribe to new doc {}: {:?}", doc_id, e);
+                                    } else {
+                                        subscribed_docs.insert(doc_id.clone());
+                                    }
+                                }
+
+                                let disk_content = if is_deleted {
+                                    "".to_string()
+                                } else {
+                                    match fs::read_to_string(&path) {
+                                        Ok(c) => c,
+                                        Err(_) => continue,
+                                    }
+                                };
+
+                                let yjs_content = text_ref.get_string(&doc.transact());
+                                if newly_discovered || disk_content != yjs_content {
+                                    info!("Local file {} modified or newly discovered, diffing and broadcasting...", path.display());
+                                    apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
+                                    if let Err(e) = save_doc(&doc, &state_path) {
+                                        error!("Failed to save doc locally: {:?}", e);
+                                        continue;
+                                    }
+
+                                    let update = doc.transact().encode_state_as_update_v1(&StateVector::default());
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id, update)).await {
+                                        error!("Failed to send update: {:?}", e);
+                                    }
                                 }
                             }
                         }
+                        Err(e) => error!("Watcher error: {:?}", e),
                     }
-                    Err(e) => error!("Watcher error: {:?}", e),
                 }
             }
         }
