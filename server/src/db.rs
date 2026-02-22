@@ -91,3 +91,82 @@ impl Db {
         .unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yrs::{GetString, Text};
+
+    #[tokio::test]
+    async fn test_db_operations() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+
+        let doc_id = "test_doc";
+        let fake_update1 = vec![1, 2, 3];
+        let fake_update2 = vec![4, 5, 6];
+
+        // Ensure table is empty
+        let initial_updates = db.load_doc_updates(doc_id).await.unwrap();
+        assert!(initial_updates.is_empty());
+
+        // Test save_update
+        db.save_update(doc_id, &fake_update1).await.unwrap();
+        db.save_update(doc_id, &fake_update2).await.unwrap();
+
+        // Test load_doc_updates
+        let updates = db.load_doc_updates(doc_id).await.unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0], fake_update1);
+        assert_eq!(updates[1], fake_update2);
+
+        // Test empty doc load
+        let empty_updates = db.load_doc_updates("nonexistent_doc").await.unwrap();
+        assert!(empty_updates.is_empty());
+
+        // Test get_all_updates_since with an empty history
+        let sv = StateVector::default();
+        let update = db
+            .get_all_updates_since("nonexistent_doc", &sv)
+            .await
+            .unwrap();
+        assert!(!update.is_empty()); // empty doc creates an empty update representation
+    }
+
+    #[tokio::test]
+    async fn test_db_get_all_updates_since() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+        let doc_id = "yrs_doc";
+
+        // Create a real Yrs doc, transact, and get updates
+        let doc1 = Doc::new();
+        let txt = doc1.get_or_insert_text("test");
+
+        let update1 = {
+            let mut txn = doc1.transact_mut();
+            txt.insert(&mut txn, 0, "Hello!");
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+
+        let update2 = {
+            let mut txn = doc1.transact_mut();
+            txt.insert(&mut txn, 6, " World.");
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+
+        // Save valid yrs updates
+        db.save_update(doc_id, &update1).await.unwrap();
+        db.save_update(doc_id, &update2).await.unwrap();
+
+        // Load sync update
+        let empty_sv = StateVector::default();
+        let sync_update = db.get_all_updates_since(doc_id, &empty_sv).await.unwrap();
+
+        // Ensure the sync update yields a doc with the same final string
+        let doc2 = Doc::new();
+        let txt2 = doc2.get_or_insert_text("test");
+        let mut txn2 = doc2.transact_mut();
+        txn2.apply_update(Update::decode_v1(&sync_update).unwrap());
+
+        assert_eq!(txt2.get_string(&txn2), "Hello! World.");
+    }
+}

@@ -10,7 +10,7 @@ use yrs::Transact;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(8000);
+static NEXT_PORT: AtomicU16 = AtomicU16::new(18000);
 
 pub fn get_available_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::Relaxed)

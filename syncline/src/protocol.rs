@@ -25,3 +25,45 @@ pub fn decode_message(data: &[u8]) -> Option<(u8, &str, &[u8])> {
     let payload = &data[3 + doc_id_len..];
     Some((msg_type, doc_id, payload))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_decode() {
+        let payload = vec![0x01, 0x02, 0x03];
+        let encoded = encode_message(MSG_SYNC_STEP_1, "test_doc", &payload);
+
+        // 1 byte msg_type + 2 bytes len + 8 bytes doc_id + 3 bytes payload = 14 bytes
+        assert_eq!(encoded.len(), 14);
+
+        let decoded = decode_message(&encoded);
+        assert!(decoded.is_some());
+
+        let (msg_type, doc_id, decoded_payload) = decoded.unwrap();
+        assert_eq!(msg_type, MSG_SYNC_STEP_1);
+        assert_eq!(doc_id, "test_doc");
+        assert_eq!(decoded_payload, payload.as_slice());
+    }
+
+    #[test]
+    fn test_decode_invalid_length() {
+        assert!(decode_message(&[0, 0]).is_none());
+    }
+
+    #[test]
+    fn test_decode_invalid_doc_id_length() {
+        // payload size too short based on doc_id_len
+        let encoded = vec![MSG_UPDATE, 0, 10, b'a']; // doc_id length 10, but only 1 byte available
+        assert!(decode_message(&encoded).is_none());
+    }
+
+    #[test]
+    fn test_decode_invalid_utf8() {
+        // valid length, but invalid UTF-8 for doc_id
+        let mut encoded = vec![MSG_UPDATE, 0, 1];
+        encoded.push(0xff); // invalid UTF-8 byte
+        assert!(decode_message(&encoded).is_none());
+    }
+}
