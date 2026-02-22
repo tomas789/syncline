@@ -4,6 +4,20 @@ Hey there! Built a cool vault in Obsidian and want to keep it synced everywhere 
 
 Syncline is a privacy-first, self-hosted synchronization system that magically keeps your Obsidian notes in perfect harmony across all your devices, even if you've been offline for weeks taking a digital detox. No merge conflicts, no lost data, just your thoughts living rent-free across your entire ecosystem.
 
+## ⚖️ Why Syncline?
+
+Most sync solutions for Obsidian ask you to trust a third party with your notes. Syncline is different:
+
+|                           | Syncline | Obsidian Sync | iCloud / Dropbox |
+| ------------------------- | -------- | ------------- | ---------------- |
+| **You own the data**      | ✅       | ❌            | ❌               |
+| **Self-hosted**           | ✅       | ❌            | ❌               |
+| **Works offline**         | ✅       | ✅            | Partial          |
+| **No conflict dialogs**   | ✅       | ❌            | ❌               |
+| **Binary file sync**      | ✅       | ✅            | ✅               |
+| **Single-file database**  | ✅       | ❌            | ❌               |
+| **Subscription required** | ❌       | ✅            | ✅               |
+
 ## ✨ Key Benefits
 
 - **🔒 Privacy-First**: Your notes never leave your infrastructure. The Syncline server runs on hardware you control. No telemetry, no analytics, no third-party access.
