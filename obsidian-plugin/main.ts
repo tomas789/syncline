@@ -15,11 +15,13 @@ import * as wasmModule from "./wasm/syncline.js";
 interface SynclineSettings {
   serverUrl: string;
   autoSync: boolean;
+  knownFiles: string[];
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
+  knownFiles: [],
 };
 
 type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
@@ -44,6 +46,8 @@ interface SynclineClient {
   index_insert(key: string): void;
   index_remove(key: string): void;
   index_keys(): string[];
+  disconnect(): void;
+  free(): void;
 }
 
 async function initWasm(): Promise<WasmModule> {
@@ -188,12 +192,11 @@ export default class SynclinePlugin extends Plugin {
       });
 
       // Add all files to index BEFORE connecting
-      const files = this.app.vault.getMarkdownFiles();
+      const files = this.app.vault.getFiles().filter(f => ["md", "txt"].includes(f.extension ?? ""));
       console.debug("[Syncline] Adding", files.length, "files to index");
 
       for (const file of files) {
         const docId = file.path;
-        this.client.index_insert(docId);
         this.knownFiles.add(docId);
       }
 
@@ -235,7 +238,11 @@ export default class SynclinePlugin extends Plugin {
       this.reconnectTimeout = null;
     }
     this.reconnectAttempts = 0;
-    this.client = null;
+    if (this.client) {
+      this.client.disconnect();
+      this.client.free();
+      this.client = null;
+    }
     this.ignoreChanges.clear();
     this.knownFiles.clear();
     this.updateStatus("disconnected");
@@ -299,12 +306,17 @@ export default class SynclinePlugin extends Plugin {
 
     for (const key of keys) {
       if (!this.knownFiles.has(key)) {
-        this.knownFiles.add(key);
-        const file = this.app.vault.getAbstractFileByPath(key);
-        if (file instanceof TFile) {
-          this.addDocOnly(file);
+        if (this.settings.knownFiles.includes(key)) {
+          console.debug("[Syncline] Detected offline deletion from index sync:", key);
+          this.client.index_remove(key);
         } else {
-          void this.createFileFromRemote(key);
+          this.knownFiles.add(key);
+          const file = this.app.vault.getAbstractFileByPath(key);
+          if (file instanceof TFile) {
+            this.addDocOnly(file);
+          } else {
+            void this.createFileFromRemote(key);
+          }
         }
       }
     }
@@ -315,6 +327,9 @@ export default class SynclinePlugin extends Plugin {
         this.deleteLocalFile(known);
       }
     }
+
+    this.settings.knownFiles = Array.from(this.knownFiles);
+    void this.saveSettings();
   }
 
   addDocOnly(file: TFile) {
@@ -322,10 +337,12 @@ export default class SynclinePlugin extends Plugin {
     
     const docId = file.path;
     let initialSyncDone = false;
+    let isMerging = false;
     
     this.client.add_doc(docId, () => {
       if (!initialSyncDone) {
         initialSyncDone = true;
+        isMerging = true;
         this.app.vault.read(file).then(content => {
           const remoteContent = this.client?.get_text(docId) || "";
 
@@ -354,9 +371,15 @@ export default class SynclinePlugin extends Plugin {
           }
         }).catch(error => {
           console.error(`[Syncline] Error reading file ${docId}:`, error);
+        }).finally(() => {
+          isMerging = false;
+          // Synchronize any remote updates that arrived while we were processing this step
+          void this.onRemoteUpdate(docId);
         });
       } else {
-        void this.onRemoteUpdate(docId);
+        if (!isMerging) {
+          void this.onRemoteUpdate(docId);
+        }
       }
     });
   }
@@ -365,7 +388,6 @@ export default class SynclinePlugin extends Plugin {
     if (!this.client) return;
 
     const docId = file.path;
-    this.client.index_insert(docId);
     this.knownFiles.add(docId);
     this.addDocOnly(file);
   }
@@ -394,35 +416,22 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  async createFileFromRemote(docId: string) {
+  createFileFromRemote(docId: string) {
     if (!this.client) return;
 
     this.client.add_doc(docId, () => {
       this.onRemoteUpdate(docId);
     });
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    const content = this.client.get_text(docId);
-    if (content) {
-      const file = this.app.vault.getAbstractFileByPath(docId);
-      if (!(file instanceof TFile)) {
-        try {
-          await this.ensureParentFolders(docId);
-          await this.app.vault.create(docId, content);
-          this.knownFiles.add(docId);
-        } catch (error) {
-          console.error(`[Syncline] Failed to create file ${docId}:`, error);
-        }
-      }
-    }
   }
 
   deleteLocalFile(path: string) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
+      this.ignoreChanges.add(path);
       this.app.fileManager.trashFile(file).catch((error) => {
         console.error(`[Syncline] Error deleting file ${path}:`, error);
+      }).finally(() => {
+        setTimeout(() => this.ignoreChanges.delete(path), 100);
       });
     }
     this.client?.remove_doc(path);
@@ -450,6 +459,17 @@ export default class SynclinePlugin extends Plugin {
       } finally {
         setTimeout(() => this.ignoreChanges.delete(docId), 100);
       }
+    } else if (!file) {
+      try {
+        await this.ensureParentFolders(docId);
+        this.ignoreChanges.add(docId);
+        await this.app.vault.create(docId, content);
+        this.knownFiles.add(docId);
+      } catch (error) {
+        console.error(`[Syncline] Failed to create file ${docId} on remote update:`, error);
+      } finally {
+        setTimeout(() => this.ignoreChanges.delete(docId), 100);
+      }
     }
   }
 
@@ -470,16 +490,22 @@ export default class SynclinePlugin extends Plugin {
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (!["md", "txt"].includes(file.extension ?? "")) return;
+    if (this.ignoreChanges.has(file.path)) return;
     this.addFile(file);
+    this.settings.knownFiles = Array.from(this.knownFiles);
+    void this.saveSettings();
   };
 
   onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     const docId = file.path;
+    if (this.ignoreChanges.has(docId)) return;
 
     this.client?.index_remove(docId);
     this.client?.remove_doc(docId);
     this.knownFiles.delete(docId);
+    this.settings.knownFiles = Array.from(this.knownFiles);
+    void this.saveSettings();
   };
 
   onFileRename = (file: TAbstractFile, oldPath: string) => {
@@ -488,8 +514,12 @@ export default class SynclinePlugin extends Plugin {
     this.knownFiles.delete(oldPath);
 
     if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
+      if (this.ignoreChanges.has(file.path)) return;
       this.addFile(file);
     }
+    
+    this.settings.knownFiles = Array.from(this.knownFiles);
+    void this.saveSettings();
   };
 }
 
