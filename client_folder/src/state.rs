@@ -49,14 +49,19 @@ impl LocalState {
     /// Returns a list of `doc_id`s that were modified offline and need to be synced.
     pub fn bootstrap_offline_changes(&self) -> Result<Vec<String>> {
         let mut modified_docs = Vec::new();
+        let mut physical_docs = std::collections::HashSet::new();
 
         // Recursively walk the directory
         for entry in WalkDir::new(&self.root_dir)
             .into_iter()
             .filter_entry(|e| {
+                // Always allow the root directory itself.
+                if e.depth() == 0 {
+                    return true;
+                }
+                // Exclude hidden files and directories (names starting with '.').
                 let name = e.file_name().to_string_lossy();
-                // Exclude hidden folders like .git and .syncline
-                !name.starts_with(".git") && !name.starts_with(".syncline")
+                !name.starts_with('.')
             })
             .filter_map(|e| e.ok())
         {
@@ -107,8 +112,9 @@ impl LocalState {
                         tracing::error!("Failed to save offline edits for {}: {}", doc_id, e);
                         continue;
                     }
-                    modified_docs.push(doc_id);
+                    modified_docs.push(doc_id.clone());
                 }
+                physical_docs.insert(doc_id);
             } else {
                 // New file was added offline
                 let doc = Doc::new();
@@ -121,7 +127,34 @@ impl LocalState {
                     tracing::error!("Failed to save new doc {}: {}", doc_id, e);
                     continue;
                 }
-                modified_docs.push(doc_id);
+                modified_docs.push(doc_id.clone());
+                physical_docs.insert(doc_id);
+            }
+        }
+
+        // Check for offline deletions
+        if let Ok(known_docs) = self.list_doc_ids() {
+            for doc_id in known_docs {
+                if !physical_docs.contains(&doc_id) {
+                    let state_path = self.get_state_path(&doc_id);
+                    if let Ok(doc) = load_doc(&state_path) {
+                        let text_ref = doc.get_or_insert_text("content");
+                        let yjs_content = text_ref.get_string(&doc.transact());
+                        if !yjs_content.is_empty() {
+                            tracing::info!("Found offline deletion for {}", doc_id);
+                            apply_diff_to_yrs(&doc, &text_ref, &yjs_content, "");
+                            if let Err(e) = save_doc(&doc, &state_path) {
+                                tracing::error!(
+                                    "Failed to save offline deletion for {}: {}",
+                                    doc_id,
+                                    e
+                                );
+                                continue;
+                            }
+                            modified_docs.push(doc_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -134,12 +167,17 @@ impl LocalState {
         if !self.syncline_dir.exists() {
             return Ok(docs);
         }
-        for entry in std::fs::read_dir(&self.syncline_dir)? {
-            let entry = entry?;
+        for entry in WalkDir::new(&self.syncline_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                if let Some(stem) = path.file_stem() {
-                    docs.push(stem.to_string_lossy().into_owned());
+                if let Ok(rel) = path.strip_prefix(&self.syncline_dir) {
+                    let rel_str = rel.to_string_lossy();
+                    if let Some(doc_id) = rel_str.strip_suffix(".bin") {
+                        docs.push(doc_id.to_string());
+                    }
                 }
             }
         }

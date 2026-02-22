@@ -2,7 +2,7 @@
 
 This document outlines the known bugs, performance bottlenecks, and code smells in the Syncline codebase (excluding the Obsidian plugin logic).
 
-**Note**: Unit tests for issues 1, 2, 5, and 6 have been created to verify these bugs and prevent regressions. These bugs are now fixed. Issue 3 has a failing regression test (`test_updates_for_new_docs_are_relayed_between_clients`).
+**Note**: Unit tests for issues 1, 2, 3, 5, 6, 11 have been created or fixed to verify these bugs and prevent regressions. These bugs are now fixed.
 
 ## Server (`server/src/*`)
 
@@ -38,7 +38,7 @@ loop {
 
 **Impact**: `yjs` handles duplicate CRDT updates fine, but re-echoing massive documents wastes immediate bandwidth and server overhead on duplicate transmissions.
 
-### 3. CRITICAL BUG: Updates for New Documents Silently Dropped — Clients Never Converge
+### 3. CRITICAL BUG: Updates for New Documents Silently Dropped — Clients Never Converge (FIXED)
 
 **Location**: `client_folder/src/main.rs` (watcher handler, lines 137–187) and `server/src/server.rs` (`MSG_UPDATE` handler, lines 148–163).
 
@@ -70,6 +70,22 @@ if let Some(tx) = channels.get(doc_id) {   // None for new docs!
 **Impact**: Because it happens directly in the sequential payload loop, clients with 50 notes updating concurrently will severely choke the initial WebSocket loading step.
 
 **Proposed Fix**: Consider wrapping heavy `db.get_all_updates_since` instances in `tokio::task::spawn_blocking` to preserve executor threads, or ideally, add database-level compaction (`yjs` snapshots) long term so the server isn't rebuilding a CRDT struct from epoch 0.
+
+### 5. BUG: Unicode Corruption & Encoding Index Skew on New Documents in `__index__` (FIXED)
+
+**Location**: `server/src/server.rs`, `update_index_for_new_doc`.
+
+**Issue**: The code appending a new `doc_id` to the global `__index__` uses `.chars().count()` for the Yjs index map:
+
+```rust
+let current = index_text.get_string(&txn);
+let len = current.chars().count() as u32;
+index_text.insert(&mut txn, len, &format!("{}\n", doc_id));
+```
+
+Since `yrs` 0.17+ structurally evaluates insertion indices via UTF-8 byte lengths, counting scalar Unicode characters will completely de-sync the CRDT map the moment a filename with multi-byte unicode characters (e.g. Emoji, non-ascii characters) is successfully registered. This mirrors the previously fixed issue #5 in the client diffing utility.
+
+**Proposed Fix**: Switch `.chars().count()` to `.len()` for raw byte lengths.
 
 ## Client Native Folder (`client_folder/src/*`)
 
@@ -124,3 +140,49 @@ While this stops recursing into the `.git/` folder, it will actively drop syncin
 **Issue**: Pushing new events utilizes a `blocking_send` to the `tokio` bounded buffer inside the unmanaged system-level OS native thread that `notify` allocates. If an operating system creates thousands of file change event cascades (like installing a local package inside the tree structure), it blocks the callback thread.
 
 **Proposed Fix**: Change channels towards unbounded capacities or use asynchronous `try_send` logic allowing dropping and reporting if the system falls too far behind the executor loop.
+
+### 9. CRITICAL BUG / DATA LOSS: Ignored Local Deletions & Renamed Files Leaking (FIXED)
+
+**Location**: `client_folder/src/main.rs` & `client_folder/src/state.rs`
+
+**Issue**: The client completely ignores all file deletion side-effects. Within `main.rs`, the `notify` loop drops file events that no longer resolve to an active physical file. Within `state.rs`, `bootstrap_offline_changes` traverses only physical files through `WalkDir`, skipping any orphaned `.bin` states. Resultingly, if a user deletes or renames a file (a Rename is practically a Delete + Create) locally, the server isn't notified and `.syncline/` silently retains the original document context. Any subsequent server restart, connection refresh, or remote peer update to this file instantly resurrects the deleted file back onto the physical disk.
+
+**Proposed Fix**: `bootstrap_offline_changes` should iteratively diff the directory traversal bounds with the complete list of known `doc_id` inside `.syncline/data/`. `notify` handlers need to intercept delete events and explicitly encode an empty string push upon deletion.
+
+### 10. BUG / DATA LOSS: Unhandled Read Errors Formulate Wipeout Commits
+
+**Location**: `client_folder/src/main.rs`, inside remote update diffing section.
+
+**Issue**: Prior to merging remote commits, the client reads the disk file to ascertain any interrupted local edits:
+
+```rust
+let has_file = fs::metadata(&phys_path).is_ok();
+let disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
+```
+
+If a file exists (`metadata().is_ok()`) but an OS transient lock or permission restriction returns a read error, `unwrap_or_default()` supplies an empty string `""`. The application subsequently computes a diff from the complete CRDT string traversing to this empty string, deleting the entire document contents, and propagates the permanent text wipeout globally back to the server.
+
+**Proposed Fix**: Remove `.unwrap_or_default()` and propagate or correctly pattern-match local filesystem `io::Error`s, purposefully skipping the synchronization step if the local disk read operation aborts.
+
+### 11. PERFORMANCE BUG: Remote Sync Requests Cascade Unconditional `fs::write` Overwrites (FIXED)
+
+**Location**: `client_folder/src/main.rs`, `MSG_UPDATE` handling block.
+
+**Issue**: Upon receiving `SyncStep2` or `MSG_UPDATE`, decoding the CRDT blindly results in a raw `fs::write(&phys_path, text_val)`, with zero logic verifying if the local physical contents actually changed contextually.
+Furthermore, the server's `db.get_all_updates_since()` inherently broadcasts a 2-byte default SV payload (`[0,0]`) for an up-to-date document instead of an empty vector. Upon connection startup, this executes an update for _every_ individual file! The client overrides every single file across the workspace verbatim with the same text, triggering aggressive filesystem `mtime` updates and thousands of redundant destructive `fsevents` looping the filesystem watchers.
+
+**Proposed Fix**: Only invoke `fs::write` on physical files if `text_val != disk_content`.
+
+### 12. PERFORMANCE SMELL: Heavy Offline Initial Updates Broadcast Complete Network Histories
+
+**Location**: `client_folder/src/main.rs`, `bootstrap_offline_changes` reporting
+
+**Issue**: For any file modified while offline, the local client broadcasts local changes utilizing:
+
+```rust
+let full_update = doc.transact().encode_state_as_update_v1(&StateVector::default());
+```
+
+Comparing relative to `&StateVector::default()` packages the _entire exact keystroke log_ comprising uncompacted historic inserts instead of formulating a precise diff spanning across from the baseline `.syncline` backup to the state modified currently inside the CRDT. This results in wasting considerable `O(N)` bandwidth scaling linearly per file size.
+
+**Proposed Fix**: Construct the string representation delta explicitly relative to the historical backup baseline (`&previous_sv`) to yield incremental binary sizes.

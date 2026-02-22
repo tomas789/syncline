@@ -1,31 +1,38 @@
-use similar::{ChangeTag, TextDiff};
+use dissimilar::Chunk;
 use yrs::{Doc, Text, TextRef, Transact};
 
 pub fn apply_diff_to_yrs(doc: &Doc, text_ref: &TextRef, old_str: &str, new_str: &str) {
-    let diff = TextDiff::from_chars(old_str, new_str);
+    if old_str == new_str {
+        return;
+    }
+
     let mut txn = doc.transact_mut();
 
-    // We need to apply changes to the TextRef taking into account its index.
-    // The easiest way to apply differences from start to end without modifying offsets
-    // incorrectly is to process changes while tracking the current cursor in the Yjs string.
+    if old_str.is_empty() {
+        text_ref.insert(&mut txn, 0, new_str);
+        return;
+    }
+
+    if new_str.is_empty() {
+        text_ref.remove_range(&mut txn, 0, old_str.len() as u32);
+        return;
+    }
+
+    let diff = dissimilar::diff(old_str, new_str);
 
     let mut cursor = 0;
 
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Equal => {
-                let len = change.value().len();
-                cursor += len as u32;
+    for chunk in diff {
+        match chunk {
+            Chunk::Equal(val) => {
+                cursor += val.len() as u32;
             }
-            ChangeTag::Delete => {
-                let len = change.value().len();
-                text_ref.remove_range(&mut txn, cursor, len as u32);
+            Chunk::Delete(val) => {
+                text_ref.remove_range(&mut txn, cursor, val.len() as u32);
             }
-            ChangeTag::Insert => {
-                let val = change.value();
-                let len = val.len();
+            Chunk::Insert(val) => {
                 text_ref.insert(&mut txn, cursor, val);
-                cursor += len as u32;
+                cursor += val.len() as u32;
             }
         }
     }
