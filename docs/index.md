@@ -31,35 +31,60 @@ Most sync solutions for Obsidian ask you to trust a third party with your notes.
 
 # 🚀 Getting Started
 
-Syncline has two main ways to sync: directly hitting the server from inside your Obsidian app, or running a background client that watches a regular folder.
+## Step 1: Run the Syncline Server
 
-## 🔮 General usage of server with Obsidian
+The server is a small, self-contained binary you run on any machine accessible from your devices.
 
-Want to sync your mobile phone or tablet? The Obsidian plugin is what you need.
+**Download and run the server from the [tomas789/syncline](https://github.com/tomas789/syncline) repository:**
 
-1. **Fire up the Server**:
-   Grab the server binary or compile it, and run it on a machine that's always on (like a Raspberry Pi, a VPS, or your home server).
-   ```bash
-   cargo run -p server -- --port 3030 --db-path syncline.db
-   ```
-2. **Install the Plugin**:
-   Install the Syncline Obsidian plugin on your devices. You can install it straight out of the community plugins list, or compile it manually.
-3. **Connect**:
-   In the plugin settings, enter your server's WebSocket address (e.g., `ws://your-server-ip:3030/sync`). If you are running over the public internet, definitely make sure to use `wss://`!
-4. **Boom**: Watch your notes sync up instantly. It really is that easy.
+```bash
+# Clone the repository
+git clone https://github.com/tomas789/syncline
+cd syncline
 
----
+# Build and start the server
+cargo run -p server
+```
 
-## 🗂️ Usage of the `client_folder`
+The server starts on port `3030` by default. Data is stored in `syncline.db` in the current directory.
 
-If you are on a desktop or laptop and prefer to just use a regular folder (or want a non-Obsidian headless sync client), use `client_folder`. It runs in the background, watches your files for changes, and beams them directly to the server.
+**Options:**
 
-1. **Run the watcher**:
-   Just point it at your local directory and tell it where the server lives:
-   ```bash
-   cargo run -p client_folder -- -f /path/to/your/notes -u ws://localhost:3030/sync
-   ```
-2. **Edit away**: Use Vim, Emacs, VS Code, or whatever text editor you prefer. The client will automatically pick up your saves and sync them via the core CRDT mechanism seamlessly with the server and any other connected devices.
+```bash
+cargo run -p server -- --port 4000 --db-path /data/my-vault.db --log-level debug
+```
+
+**Run the CLI Client:**
+If you prefer to run the standalone headless CLI client rather than using the Obsidian plugin:
+
+```bash
+# Point the client to your vault folder and the server URL
+cargo run -p client_folder --bin client_folder -- -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
+```
+
+Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
+
+## Step 2: Install the Plugin
+
+**Option A — Community Plugins (recommended)**
+
+1. Open Obsidian → Settings → Community Plugins
+2. Search for **Syncline**
+3. Click Install, then Enable
+
+**Option B — Manual Installation**
+
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/tomas789/syncline/releases)
+2. Copy them to `<your-vault>/.obsidian/plugins/syncline-obsidian/`
+3. Reload Obsidian and enable the plugin in Settings → Community Plugins
+
+## Step 3: Connect
+
+1. Open Settings → Syncline
+2. Enter your server URL (e.g. `ws://192.168.1.100:3030/sync` or `wss://sync.yourdomain.com/sync`)
+3. Click **Connect**
+
+Your vault will begin syncing immediately. Install the plugin on your other devices and point them to the same server.
 
 ---
 
