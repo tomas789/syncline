@@ -21,7 +21,7 @@ Set that up on a cron job, ship the backup to an S3 bucket or another drive, and
 Another awesome way to back up? Just run an instance of `client_folder` on a separate, secure machine (like a NAS). Let it sync the vault automatically in the background.
 
 ```bash
-cargo run -- sync -f /path/to/my/backup/folder -u ws://my-server:3030/sync
+syncline sync -f /path/to/my/backup/folder -u ws://my-server:3030/sync
 ```
 
 Whenever anyone edits anything in Obsidian, `client_folder` quietly pulls down the update and syncs it straight into plain text Markdown right there. Presto, you have a constantly updated plain-text, human-readable backup of all your Markdown files!
