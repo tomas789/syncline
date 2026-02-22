@@ -218,7 +218,7 @@ The `__index__`-based deletion path (`main.rs:231–250`) could propagate actual
 
 **Proposed Fix**: Either (a) remove empty-content files from disk when a CRDT update results in an empty string, or (b) implement `__index__` entry removal in the CLI client and handle the removal event to delete the physical file.
 
-### 14. BUG: Task Leak in Network Client on Reconnection
+### 14. BUG: Task Leak in Network Client on Reconnection (FIXED)
 
 **Location**: `client_folder/src/network.rs`, lines 35–46
 
