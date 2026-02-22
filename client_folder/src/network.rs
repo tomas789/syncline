@@ -131,7 +131,7 @@ mod tests {
                     if let Ok(mut ws) = accept_async(stream).await {
                         counter.fetch_add(1, Ordering::SeqCst);
                         // Keep connection alive until closed by client
-                        while let Some(_) = ws.next().await {}
+                        while ws.next().await.is_some() {}
                         counter.fetch_sub(1, Ordering::SeqCst);
                     }
                 });

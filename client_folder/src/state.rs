@@ -8,11 +8,13 @@ use yrs::{Doc, GetString, ReadTxn, Text, Transact};
 
 pub struct LocalState {
     pub root_dir: PathBuf,
+    pub raw_root_dir: PathBuf,
     pub syncline_dir: PathBuf,
 }
 
 impl LocalState {
     pub fn new(root_dir: impl AsRef<Path>) -> Self {
+        let raw_root_dir = root_dir.as_ref().to_path_buf();
         // Canonicalize so that path comparisons with FSEvents-reported paths
         // work correctly on macOS, where /var is a symlink to /private/var and
         // FSEvents always returns the real (canonical) path.
@@ -23,6 +25,7 @@ impl LocalState {
         let syncline_dir = root_dir.join(".syncline").join("data");
         Self {
             root_dir,
+            raw_root_dir,
             syncline_dir,
         }
     }
@@ -34,7 +37,10 @@ impl LocalState {
         let canonical = physical_path
             .canonicalize()
             .unwrap_or_else(|_| physical_path.to_path_buf());
-        let rel = canonical.strip_prefix(&self.root_dir)?;
+        let rel = canonical.strip_prefix(&self.root_dir).or_else(|e| {
+            // Fallback: try stripping the non-canonicalized root dir
+            canonical.strip_prefix(&self.raw_root_dir).map_err(|_| e)
+        })?;
         Ok(rel.to_string_lossy().to_string())
     }
 
@@ -180,13 +186,15 @@ impl LocalState {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin")
-                && let Ok(rel) = path.strip_prefix(&self.syncline_dir) {
-                    let rel_str = rel.to_string_lossy();
-                    if let Some(doc_id) = rel_str.strip_suffix(".bin") {
-                        docs.push(doc_id.to_string());
-                    }
+            if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("bin")
+                && let Ok(rel) = path.strip_prefix(&self.syncline_dir)
+            {
+                let rel_str = rel.to_string_lossy();
+                if let Some(doc_id) = rel_str.strip_suffix(".bin") {
+                    docs.push(doc_id.to_string());
                 }
+            }
         }
         Ok(docs)
     }
@@ -196,6 +204,37 @@ impl LocalState {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_issue_15_symlinked_path_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempdir().unwrap();
+        // create a real dir inside root_dir
+        let real_dir = root_dir.path().join("real_dir");
+        fs::create_dir(&real_dir).unwrap();
+
+        // create a symlink pointing to real_dir
+        let symlink_dir = root_dir.path().join("symlink_dir");
+        symlink(&real_dir, &symlink_dir).unwrap();
+
+        // create LocalState using the symlink directory
+        let state = LocalState::new(&symlink_dir);
+
+        // Assert that root_dir was canonicalized (pointing to real_dir)
+        assert_eq!(state.root_dir, real_dir.canonicalize().unwrap());
+        assert_eq!(state.raw_root_dir, symlink_dir);
+
+        // create a file using the symlink path
+        let deleted_file = symlink_dir.join("deleted_file.md");
+
+        // get_doc_id for deleted_file should work because of the raw_root_dir fallback
+        let doc_id = state
+            .get_doc_id(&deleted_file)
+            .expect("get_doc_id should succeed for a deleted file under a symlink");
+        assert_eq!(doc_id, "deleted_file.md");
+    }
 
     #[test]
     fn test_bootstrap_offline_changes() {
