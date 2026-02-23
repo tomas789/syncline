@@ -1,0 +1,23 @@
+{
+  "name": "e2e",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "PATH=/usr/bin:$PATH wdio run wdio.conf.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.3.0",
+    "@wdio/cli": "^9.24.0",
+    "@wdio/mocha-framework": "^9.24.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "wdio-obsidian-reporter": "^2.3.1",
+    "wdio-obsidian-service": "^2.3.1",
+    "webdriverio": "^9.24.0"
+  }
+}
