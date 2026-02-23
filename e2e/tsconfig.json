@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "es2019",
+    "types": ["node", "@wdio/globals/types", "@wdio/mocha-framework", "wdio-obsidian-service", "expect-webdriverio"],
+    "esModuleInterop": true
+  }
+}
