@@ -1,0 +1,19 @@
+# Node modules
+node_modules/
+
+# WebdriverIO and Obsidian cache
+.obsidian-cache/
+.tmp_test/
+*.dmg
+*.AppImage
+*.exe
+*.zip
+
+# Test runtime
+test-vault/.obsidian/plugins/syncline/
+test-sync-folder/
+test-syncline-e2e.db
+test-syncline-e2e.db-shm
+test-syncline-e2e.db-wal
+test-vault/*
+!test-vault/.gitkeep
