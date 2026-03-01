@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execSync, ChildProcess } from 'child_process';
 import { join } from 'path';
 import * as fs from 'fs';
 import { expect, browser } from '@wdio/globals';
@@ -9,9 +9,20 @@ describe('Syncline E2E Configuration', () => {
     const dbPath = join(__dirname, '../../test-syncline-e2e.db');
     const folderPath = join(__dirname, '../../test-sync-folder');
 
-    before(async () => {
+    before(async function () {
+        // Allow up to 2 minutes for initial cargo build on cold starts
+        this.timeout(120000); 
+
         console.log("Setting up E2E environment...");
         
+        // Pre-build the binary synchronously to avoid file-lock errors when both the 
+        // CLI client and the server simultaneously try to compile 'syncline'.
+        console.log("Building Syncline binary...");
+        execSync('cargo build --bin syncline', {
+            cwd: join(__dirname, '../../../'),
+            stdio: 'inherit'
+        });
+
         // Clean up from previous run
         if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
         if (fs.existsSync(folderPath)) fs.rmSync(folderPath, { recursive: true, force: true });
