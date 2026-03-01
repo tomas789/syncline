@@ -5225,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "syncline"
-version = "0.3.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5236,6 +5236,7 @@ dependencies = [
  "dissimilar",
  "futures",
  "futures-util",
+ "gethostname",
  "headers",
  "imara-diff",
  "js-sys",
