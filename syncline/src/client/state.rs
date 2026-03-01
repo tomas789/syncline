@@ -1,6 +1,7 @@
 use crate::client::diff::apply_diff_to_yrs;
 use crate::client::storage::{load_doc, save_doc};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -10,10 +11,13 @@ pub struct LocalState {
     pub root_dir: PathBuf,
     pub raw_root_dir: PathBuf,
     pub syncline_dir: PathBuf,
+    /// Stable unique identifier for this vault, used in conflict filenames.
+    /// Persisted in `.syncline/client_id` so it survives restarts.
+    pub client_name: String,
 }
 
 impl LocalState {
-    pub fn new(root_dir: impl AsRef<Path>) -> Self {
+    pub fn new(root_dir: impl AsRef<Path>, name_override: Option<String>) -> Self {
         let raw_root_dir = root_dir.as_ref().to_path_buf();
         // Canonicalize so that path comparisons with FSEvents-reported paths
         // work correctly on macOS, where /var is a symlink to /private/var and
@@ -23,11 +27,44 @@ impl LocalState {
             .canonicalize()
             .unwrap_or_else(|_| root_dir.as_ref().to_path_buf());
         let syncline_dir = root_dir.join(".syncline").join("data");
+        let client_id_path = root_dir.join(".syncline").join("client_id");
+
+        // Resolve the client name, persisting it for future runs:
+        // 1. If --name was provided, use it and save it.
+        // 2. If a saved client_id exists, use that.
+        // 3. Otherwise, generate "hostname-<short_uuid>" and save it.
+        let client_name = if let Some(name) = name_override {
+            let _ = fs::create_dir_all(client_id_path.parent().unwrap_or(Path::new("")));
+            let _ = fs::write(&client_id_path, &name);
+            name
+        } else if let Ok(stored) = fs::read_to_string(&client_id_path) {
+            let trimmed = stored.trim().to_string();
+            if trimmed.is_empty() {
+                Self::generate_and_save_client_name(&client_id_path)
+            } else {
+                trimmed
+            }
+        } else {
+            Self::generate_and_save_client_name(&client_id_path)
+        };
+
         Self {
             root_dir,
             raw_root_dir,
             syncline_dir,
+            client_name,
         }
+    }
+
+    fn generate_and_save_client_name(client_id_path: &Path) -> String {
+        let hostname = gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "unknown".to_string());
+        let short_id = &uuid::Uuid::new_v4().to_string()[..6];
+        let generated = format!("{}-{}", hostname, short_id);
+        let _ = fs::create_dir_all(client_id_path.parent().unwrap_or(Path::new("")));
+        let _ = fs::write(client_id_path, &generated);
+        generated
     }
 
     /// Converts a physical path to a relative doc_id (e.g., "notes/idea.md")
@@ -51,9 +88,14 @@ impl LocalState {
 
     /// Scans the directory on startup. Compares physical files with `.syncline` state.
     /// Creates documents for missing states, applies diffs for modified files.
-    /// Returns a list of `(doc_id, update)` tuples that were modified offline and need to be synced.
-    pub fn bootstrap_offline_changes(&self) -> Result<Vec<(String, Vec<u8>)>> {
+    ///
+    /// Returns:
+    /// - A list of `(doc_id, update)` tuples that were modified offline and need to be synced.
+    /// - A set of doc_ids that were **freshly created** (had no `.bin` state before this call).
+    ///   This set is used by the sync client to detect same-name file conflicts.
+    pub fn bootstrap_offline_changes(&self) -> Result<(Vec<(String, Vec<u8>)>, HashSet<String>)> {
         let mut offline_changes = Vec::new();
+        let mut freshly_created: HashSet<String> = HashSet::new();
         let mut physical_docs = std::collections::HashSet::new();
 
         // Recursively walk the directory
@@ -100,7 +142,7 @@ impl LocalState {
                 // File existed before, check if it was modified offline
                 let doc = match load_doc(&state_path) {
                     Ok(doc) => doc,
-                    Err(_) => continue, // Corrupted state -> we should probably recover gracefully, but skip for now
+                    Err(_) => continue, // Corrupted state -> skip for now
                 };
 
                 let text_ref = doc.get_or_insert_text("content");
@@ -123,7 +165,7 @@ impl LocalState {
                 }
                 physical_docs.insert(doc_id);
             } else {
-                // New file was added offline
+                // New file was added offline — track it as freshly created
                 let doc = Doc::new();
                 let text_ref = doc.get_or_insert_text("content");
                 let previous_sv = doc.transact().state_vector();
@@ -137,6 +179,7 @@ impl LocalState {
                 }
                 let update = doc.transact().encode_state_as_update_v1(&previous_sv);
                 offline_changes.push((doc_id.clone(), update));
+                freshly_created.insert(doc_id.clone());
                 physical_docs.insert(doc_id);
             }
         }
@@ -162,7 +205,7 @@ impl LocalState {
                                     doc_id,
                                     e
                                 );
-                                continue; // Added this continue back for correctness though not needed logically
+                                continue;
                             }
                             let update = doc.transact().encode_state_as_update_v1(&previous_sv);
                             offline_changes.push((doc_id, update));
@@ -172,7 +215,7 @@ impl LocalState {
             }
         }
 
-        Ok(offline_changes)
+        Ok((offline_changes, freshly_created))
     }
 
     /// List all known doc_ids from the local .syncline storage
@@ -220,7 +263,7 @@ mod tests {
         symlink(&real_dir, &symlink_dir).unwrap();
 
         // create LocalState using the symlink directory
-        let state = LocalState::new(&symlink_dir);
+        let state = LocalState::new(&symlink_dir, Some("test-client".to_string()));
 
         // Assert that root_dir was canonicalized (pointing to real_dir)
         assert_eq!(state.root_dir, real_dir.canonicalize().unwrap());
@@ -239,25 +282,31 @@ mod tests {
     #[test]
     fn test_bootstrap_offline_changes() {
         let dir = tempdir().unwrap();
-        let state = LocalState::new(dir.path());
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
 
         let file1 = dir.path().join("file1.md");
         fs::write(&file1, "Hello World").unwrap();
 
         // 1. First run, file is new
-        let changed = state.bootstrap_offline_changes().unwrap();
+        let (changed, freshly) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0, "file1.md");
+        assert!(freshly.contains("file1.md"), "New file should be in freshly_created");
 
         // 2. Second run, no changes
-        let changed_none = state.bootstrap_offline_changes().unwrap();
+        let (changed_none, freshly_none) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed_none.len(), 0);
+        assert!(freshly_none.is_empty(), "No new files, freshly_created should be empty");
 
         // 3. Third run, offline modification
         fs::write(&file1, "Hello CRDT World!").unwrap();
-        let changed_mod = state.bootstrap_offline_changes().unwrap();
+        let (changed_mod, freshly_mod) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed_mod.len(), 1);
         assert_eq!(changed_mod[0].0, "file1.md");
+        assert!(
+            freshly_mod.is_empty(),
+            "Modified existing file should NOT be in freshly_created"
+        );
 
         // Verify underlying storage represents the change
         let doc_id = state.get_doc_id(&file1).unwrap();
@@ -271,7 +320,7 @@ mod tests {
     #[test]
     fn test_issue_5_premature_loop_interruptions() {
         let dir = tempdir().unwrap();
-        let state = LocalState::new(dir.path());
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
 
         fs::create_dir_all(&state.syncline_dir).unwrap();
 
@@ -309,7 +358,7 @@ mod tests {
             changed.is_ok(),
             "Issue 5: Loop aborted early and returned Err!"
         );
-        let docs = changed.unwrap();
+        let (docs, _) = changed.unwrap();
         assert!(
             docs.iter().any(|(id, _)| id == "b/file2.md"),
             "file2.md wasn't processed due to loop abort!"
@@ -319,7 +368,7 @@ mod tests {
     #[test]
     fn test_list_doc_ids() {
         let dir = tempdir().unwrap();
-        let state = LocalState::new(dir.path());
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
 
         // Empty dir, should return empty list
         let docs = state.list_doc_ids().unwrap();
@@ -344,7 +393,7 @@ mod tests {
         let mut docs = state.list_doc_ids().unwrap();
         docs.sort();
 
-        let expected = vec![
+        let _expected = vec![
             "test1.md".to_string(),
             "test2.md".to_string(),
             "nested/test3.md".to_string(),
@@ -360,7 +409,7 @@ mod tests {
     #[test]
     fn test_offline_deletion() {
         let dir = tempdir().unwrap();
-        let state = LocalState::new(dir.path());
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
 
         let file1 = dir.path().join("file1.md");
         fs::write(&file1, "Hello World").unwrap();
@@ -372,11 +421,12 @@ mod tests {
         fs::remove_file(&file1).unwrap();
 
         // 3. Run bootstrap again, it should detect the offline deletion
-        let changed = state.bootstrap_offline_changes().unwrap();
+        let (changed, freshly) = state.bootstrap_offline_changes().unwrap();
 
         // Should have one change corresponding to the empty string
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0, "file1.md");
+        assert!(freshly.is_empty(), "Deleted file should not be in freshly_created");
 
         // Verify underlying storage represents the deletion (empty string)
         let state_path = state.get_state_path("file1.md");
@@ -384,5 +434,27 @@ mod tests {
         let text_ref = doc.get_or_insert_text("content");
         let txn = doc.transact();
         assert_eq!(text_ref.get_string(&txn), "");
+    }
+
+    #[test]
+    fn test_client_name_persistence() {
+        let dir = tempdir().unwrap();
+
+        // First instantiation without override: generates a name
+        let state1 = LocalState::new(dir.path(), None);
+        let name1 = state1.client_name.clone();
+        assert!(!name1.is_empty());
+
+        // Second instantiation without override: reuses the saved name
+        let state2 = LocalState::new(dir.path(), None);
+        assert_eq!(state2.client_name, name1, "Client name should be stable across restarts");
+
+        // Third instantiation with explicit override: uses that name
+        let state3 = LocalState::new(dir.path(), Some("my-laptop".to_string()));
+        assert_eq!(state3.client_name, "my-laptop");
+
+        // Fourth instantiation without override: now uses the saved override
+        let state4 = LocalState::new(dir.path(), None);
+        assert_eq!(state4.client_name, "my-laptop");
     }
 }
