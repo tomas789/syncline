@@ -61,6 +61,22 @@ pub async fn spawn_client(dir: &Path, port: u16) -> Child {
         .expect("Failed to spawn client")
 }
 
+pub async fn spawn_client_with_name(dir: &Path, port: u16, name: &str) -> Child {
+    Command::new(syncline_bin())
+        .arg("sync")
+        .arg("--folder")
+        .arg(dir)
+        .arg("--name")
+        .arg(name)
+        .env("SYNCLINE_URL", format!("ws://127.0.0.1:{}/sync", port))
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("Failed to spawn client")
+}
+
 fn compare_directories(client_dirs: &[PathBuf]) -> bool {
     if client_dirs.is_empty() {
         return true;
@@ -402,4 +418,182 @@ async fn test_offline_creation_and_deletion() {
         "offline creation"
     );
     assert!(!env.client_path(1).join("base.md").exists());
+}
+
+/// Client A syncs a file to the server, then Client B (a fresh directory with its own
+/// pre-existing file of the same name) connects. The conflict is resolved by keeping the
+/// server content as the canonical file and renaming B's local content.
+#[tokio::test]
+async fn test_pre_existing_directory_conflict() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client A: starts fresh, creates note.md and syncs it to the server
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await; // let A connect
+
+    fs::write(dir_a.path().join("note.md"), "content from A").unwrap();
+    tokio::time::sleep(Duration::from_millis(3000)).await; // let A sync
+
+    // Kill client A so its watcher doesn't interfere
+    client_a.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client B: pre-existing directory with its own note.md (no .syncline/ dir)
+    let dir_b = TempDir::new().unwrap();
+    fs::write(dir_b.path().join("note.md"), "content from B").unwrap();
+
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "client-b").await;
+    tokio::time::sleep(Duration::from_millis(5000)).await; // let B connect, bootstrap, resolve
+
+    // note.md on B should contain A's content (server wins)
+    let note_b_content = fs::read_to_string(dir_b.path().join("note.md")).unwrap();
+    assert_eq!(
+        note_b_content, "content from A",
+        "note.md should have server content (A's content)"
+    );
+
+    // "note (client-b).md" should exist on B with B's original content
+    let conflict_path_b = dir_b.path().join("note (client-b).md");
+    assert!(
+        conflict_path_b.exists(),
+        "Conflict file 'note (client-b).md' should exist in dir_b"
+    );
+    assert_eq!(
+        fs::read_to_string(&conflict_path_b).unwrap(),
+        "content from B",
+        "Conflict file should have B's original content"
+    );
+
+    // Restart client A and verify it receives the conflict file from the server
+    let mut client_a2 = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    let conflict_path_a = dir_a.path().join("note (client-b).md");
+    assert!(
+        conflict_path_a.exists(),
+        "Client A should receive the conflict file 'note (client-b).md'"
+    );
+    assert_eq!(
+        fs::read_to_string(&conflict_path_a).unwrap(),
+        "content from B"
+    );
+
+    client_a2.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server.kill().await.unwrap();
+}
+
+/// Both clients are offline when they each independently create a file with the same name.
+/// The first to reconnect establishes server truth; the second detects the conflict.
+#[tokio::test]
+async fn test_both_offline_same_name_conflict() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    // Both clients connect briefly so they register with the server, then get killed
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "client-b").await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Both independently create shared.md while offline
+    fs::write(dir_a.path().join("shared.md"), "A's offline content").unwrap();
+    fs::write(dir_b.path().join("shared.md"), "B's offline content").unwrap();
+
+    // A reconnects first — its content becomes server truth
+    let mut client_a2 = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // B reconnects — detects conflict, renames its content
+    let mut client_b2 = spawn_client_with_name(dir_b.path(), port, "client-b").await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+
+    // B's shared.md should now have A's content
+    let shared_b = fs::read_to_string(dir_b.path().join("shared.md")).unwrap();
+    assert_eq!(
+        shared_b, "A's offline content",
+        "shared.md on B should be replaced with A's (server) content"
+    );
+
+    // B's conflict file should contain B's original content
+    let conflict_b = dir_b.path().join("shared (client-b).md");
+    assert!(
+        conflict_b.exists(),
+        "Conflict file 'shared (client-b).md' should exist on B"
+    );
+    assert_eq!(fs::read_to_string(&conflict_b).unwrap(), "B's offline content");
+
+    // A should eventually receive the conflict file
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let conflict_a = dir_a.path().join("shared (client-b).md");
+    assert!(
+        conflict_a.exists(),
+        "Client A should receive the conflict file 'shared (client-b).md'"
+    );
+    assert_eq!(fs::read_to_string(&conflict_a).unwrap(), "B's offline content");
+
+    client_a2.kill().await.unwrap();
+    client_b2.kill().await.unwrap();
+    server.kill().await.unwrap();
+}
+
+/// A client starts with pre-existing files on a server that has no data.
+/// No conflict should occur — all files should sync normally without being renamed.
+#[tokio::test]
+async fn test_pre_existing_no_conflict_empty_server() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client A: pre-existing files, server is empty
+    let dir_a = TempDir::new().unwrap();
+    fs::write(dir_a.path().join("file1.md"), "content 1").unwrap();
+    fs::write(dir_a.path().join("file2.md"), "content 2").unwrap();
+
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    // No conflict files should be created
+    assert!(
+        !dir_a.path().join("file1 (client-a).md").exists(),
+        "No conflict file should be created for file1.md when server is empty"
+    );
+    assert!(
+        !dir_a.path().join("file2 (client-a).md").exists(),
+        "No conflict file should be created for file2.md when server is empty"
+    );
+
+    // Original files should be unchanged
+    assert_eq!(fs::read_to_string(dir_a.path().join("file1.md")).unwrap(), "content 1");
+    assert_eq!(fs::read_to_string(dir_a.path().join("file2.md")).unwrap(), "content 2");
+
+    // Client B joins and receives all files
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "client-b").await;
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    assert_eq!(fs::read_to_string(dir_b.path().join("file1.md")).unwrap(), "content 1");
+    assert_eq!(fs::read_to_string(dir_b.path().join("file2.md")).unwrap(), "content 2");
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server.kill().await.unwrap();
 }

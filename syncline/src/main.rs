@@ -58,6 +58,11 @@ enum Commands {
         )]
         url: String,
 
+        /// Client name used in conflict filenames (e.g. "laptop", "work-mac").
+        /// Defaults to hostname + short unique ID, persisted in .syncline/client_id.
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+
         /// Log level (error, warn, info, debug, trace)
         #[arg(long, default_value = "info")]
         log_level: String,
@@ -127,8 +132,8 @@ async fn main() -> anyhow::Result<()> {
             let db = syncline::server::db::Db::new(&connection_string).await?;
             syncline::server::server::run_server(db, port).await?;
         }
-        Commands::Sync { folder, url, .. } => {
-            syncline::client::app::run_client(folder, url).await?;
+        Commands::Sync { folder, url, name, .. } => {
+            syncline::client::app::run_client(folder, url, name).await?;
         }
     }
 

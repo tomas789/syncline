@@ -48,6 +48,7 @@ notify = "8.2"
 notify-debouncer-mini = "0.7"
 url = "2.5"
 walkdir = "2.5"
+gethostname = "1"
 
 [dev-dependencies]
 tempfile = "3.2"
