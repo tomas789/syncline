@@ -7,7 +7,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, Map, ReadTxn, StateVector, Subscription, Text, Transact, Update};
+use yrs::{Any, Doc, GetString, Map, Out, ReadTxn, StateVector, Subscription, Text, Transact, Update};
 
 use crate::protocol::{
     decode_message, encode_message, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
@@ -406,6 +406,31 @@ impl SynclineClient {
 
     pub fn doc_count(&self) -> usize {
         self.docs.borrow().len()
+    }
+
+    /// Read the `meta.path` value from a doc's Y.Map, returning the file path
+    /// that this UUID corresponds to (e.g. `"notes/idea.md"`).
+    pub fn get_meta_path(&self, doc_id: &str) -> Option<String> {
+        let docs = self.docs.borrow();
+        docs.get(doc_id).and_then(|state| {
+            let meta = state.doc.get_or_insert_map("meta");
+            let txn = state.doc.transact();
+            match meta.get(&txn, "path") {
+                Some(Out::Any(Any::String(arc))) => Some(arc.to_string()),
+                _ => None,
+            }
+        })
+    }
+
+    /// Write a new `meta.path` value into the doc's Y.Map.
+    /// The doc's `observe_update_v1` subscription auto-broadcasts the change.
+    pub fn set_meta_path(&self, doc_id: &str, path: String) {
+        let docs = self.docs.borrow();
+        if let Some(state) = docs.get(doc_id) {
+            let meta = state.doc.get_or_insert_map("meta");
+            let mut txn = state.doc.transact_mut();
+            meta.insert(&mut txn, "path", path.as_str());
+        }
     }
 
     pub fn disconnect(&mut self) {
