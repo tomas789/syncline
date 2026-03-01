@@ -6,7 +6,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tracing::error;
-use yrs::Transact;
+use yrs::{Any, GetString, Map, Out, Transact};
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -82,22 +82,52 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
         return true;
     }
 
-    let load_yrs = |dir: &PathBuf, doc_id: &str| -> String {
-        let bin_path = dir.join(".syncline/data").join(format!("{}.bin", doc_id));
-        if let Ok(content) = fs::read(&bin_path)
-            && let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&content)
+    // Build a path→content map from UUID-named .bin files by reading meta.path
+    // from each doc's Y.Map.
+    let load_yrs_map = |dir: &PathBuf| -> HashMap<String, String> {
+        let data_dir = dir.join(".syncline/data");
+        let mut result = HashMap::new();
+        for entry in walkdir::WalkDir::new(&data_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
         {
+            let path = entry.path();
+            if !path.is_file()
+                || path.extension().and_then(|s| s.to_str()) != Some("bin")
+            {
+                continue;
+            }
+            let Ok(raw) = fs::read(path) else { continue };
+            let Ok(update) = yrs::updates::decoder::Decode::decode_v1(&raw) else {
+                continue
+            };
             let doc = yrs::Doc::new();
+            {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update);
+            }
+            // Read meta.path from the Y.Map
+            let meta = doc.get_or_insert_map("meta");
+            let rel_path = {
+                let txn = doc.transact();
+                match meta.get(&txn, "path") {
+                    Some(Out::Any(Any::String(arc))) => arc.to_string(),
+                    _ => continue,
+                }
+            };
+            if rel_path.is_empty() {
+                continue;
+            }
+            // Read content
             let t = doc.get_or_insert_text("content");
-            let mut txn = doc.transact_mut();
-            txn.apply_update(update);
-            return yrs::GetString::get_string(&t, &txn);
+            let txn = doc.transact();
+            result.insert(rel_path, GetString::get_string(&t, &txn));
         }
-        "".to_string()
+        result
     };
 
     let mut expected_files: HashMap<String, String> = HashMap::new();
-    let mut expected_yrs: HashMap<String, String> = HashMap::new();
+    let expected_yrs = load_yrs_map(&client_dirs[0]);
 
     for entry in walkdir::WalkDir::new(&client_dirs[0]).min_depth(1) {
         let entry = entry.unwrap();
@@ -106,13 +136,11 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
         if path_str.contains(".syncline") || path_str.contains(".git") {
             continue;
         }
-
         if path.is_file() {
             let rel = path.strip_prefix(&client_dirs[0]).unwrap();
             let name = rel.to_string_lossy().into_owned();
             let content = fs::read_to_string(path).unwrap();
-            expected_files.insert(name.clone(), content);
-            expected_yrs.insert(name.clone(), load_yrs(&client_dirs[0], &name));
+            expected_files.insert(name, content);
         }
     }
 
@@ -120,7 +148,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
 
     for (idx, dir) in client_dirs.iter().enumerate().skip(1) {
         let mut actual_files: HashMap<String, String> = HashMap::new();
-        let mut actual_yrs: HashMap<String, String> = HashMap::new();
+        let actual_yrs = load_yrs_map(dir);
 
         for entry in walkdir::WalkDir::new(dir).min_depth(1) {
             let entry = entry.unwrap();
@@ -133,8 +161,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
                 let rel = path.strip_prefix(dir).unwrap();
                 let name = rel.to_string_lossy().into_owned();
                 let content = fs::read_to_string(path).unwrap();
-                actual_files.insert(name.clone(), content);
-                actual_yrs.insert(name.clone(), load_yrs(dir, &name));
+                actual_files.insert(name, content);
             }
         }
 
@@ -161,13 +188,13 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
             }
         }
 
-        for (name, content) in &actual_yrs {
-            if let Some(expected_content) = expected_yrs.get(name)
+        for (rel_path, content) in &actual_yrs {
+            if let Some(expected_content) = expected_yrs.get(rel_path)
                 && content != expected_content
             {
                 error!(
                     "YRS File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                    name, idx, expected_content, idx, content
+                    rel_path, idx, expected_content, idx, content
                 );
                 converged = false;
             }
@@ -257,12 +284,20 @@ async fn test_single_client_flow() {
     fs::write(&path, "hello world").unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Yrs cache should exist
-    assert!(
-        env.client_path(0)
-            .join(".syncline/data/test.md.bin")
-            .exists()
-    );
+    // Yrs cache should exist — with UUID-based naming the .bin filename is a UUID,
+    // so just verify at least one .bin file was created in the data directory.
+    let data_dir = env.client_path(0).join(".syncline/data");
+    let has_bin = fs::read_dir(&data_dir)
+        .into_iter()
+        .flatten()
+        .any(|e| {
+            e.ok()
+                .map(|e| {
+                    e.path().extension().and_then(|s| s.to_str()) == Some("bin")
+                })
+                .unwrap_or(false)
+        });
+    assert!(has_bin, "A .bin file should exist in .syncline/data/ after syncing test.md");
 
     // Update
     fs::write(&path, "hello modified").unwrap();
@@ -596,4 +631,57 @@ async fn test_pre_existing_no_conflict_empty_server() {
     client_a.kill().await.unwrap();
     client_b.kill().await.unwrap();
     server.kill().await.unwrap();
+}
+
+/// Client A creates a file, both clients sync. Client A renames the file while both
+/// are online. Client B should automatically receive the rename: `test.md` disappears
+/// and `renamed.md` appears with the original content.
+///
+/// This test validates live rename detection — the watcher sees the delete+create
+/// events in the same batch, matches them by content, preserves the UUID, and
+/// broadcasts an update that only changes `meta.path`.
+#[tokio::test]
+async fn test_rename_sync() {
+    let env = TestEnv::new(2).await;
+
+    // Client A creates test.md and both clients sync
+    let test_a = env.client_path(0).join("test.md");
+    fs::write(&test_a, "shared content for rename test").unwrap();
+
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await,
+        "Initial sync failed before rename"
+    );
+
+    // Client A renames test.md → renamed.md while both clients are online.
+    // `fs::rename` is atomic on Unix and fires delete+create events in the same
+    // watcher batch, which is needed for content-based rename detection.
+    let renamed_a = env.client_path(0).join("renamed.md");
+    fs::rename(&test_a, &renamed_a).unwrap();
+
+    // Wait for the rename to propagate (watcher debounce is 300 ms, plus network round-trip)
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // renamed.md must be present on client B with the original content
+    assert!(
+        env.client_path(1).join("renamed.md").exists(),
+        "renamed.md should exist on Client B after rename sync"
+    );
+    assert_eq!(
+        fs::read_to_string(env.client_path(1).join("renamed.md")).unwrap(),
+        "shared content for rename test",
+        "renamed.md content should match original"
+    );
+
+    // test.md must be gone on client B
+    assert!(
+        !env.client_path(1).join("test.md").exists(),
+        "test.md should not exist on Client B after rename"
+    );
+
+    // Final convergence check (file sets and YRS state identical across clients)
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(5)).await,
+        "Clients did not converge after rename"
+    );
 }

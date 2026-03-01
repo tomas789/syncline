@@ -15,13 +15,17 @@ import * as wasmModule from "./wasm/syncline.js";
 interface SynclineSettings {
   serverUrl: string;
   autoSync: boolean;
+  /** UUIDs of all files this client has ever seen (used for offline-deletion detection). */
   knownFiles: string[];
+  /** Maps relative file path → permanent UUID. Persisted so renames survive restarts. */
+  uuidMap: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
   knownFiles: [],
+  uuidMap: {},
 };
 
 type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
@@ -46,6 +50,8 @@ interface SynclineClient {
   index_insert(key: string): void;
   index_remove(key: string): void;
   index_keys(): string[];
+  get_meta_path(doc_id: string): string | undefined;
+  set_meta_path(doc_id: string, path: string): void;
   disconnect(): void;
   free(): void;
 }
@@ -76,6 +82,7 @@ export default class SynclinePlugin extends Plugin {
   client: SynclineClient | null = null;
   ignoreChanges: Set<string> = new Set();
   statusCheckInterval: number | null = null;
+  /** Tracks UUID strings (not paths) for all files currently known to be synced. */
   knownFiles: Set<string> = new Set();
   reconnectTimeout: number | null = null;
   reconnectAttempts: number = 0;
@@ -128,11 +135,38 @@ export default class SynclinePlugin extends Plugin {
       DEFAULT_SETTINGS,
       await this.loadData(),
     ) as SynclineSettings;
+    // Ensure uuidMap exists on older saved data
+    if (!this.settings.uuidMap) {
+      this.settings.uuidMap = {};
+    }
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
+
+  // ---------------------------------------------------------------------------
+  // UUID helpers
+  // ---------------------------------------------------------------------------
+
+  /** Returns the stable UUID for a file path, generating one if it doesn't exist yet. */
+  getOrCreateUuid(filePath: string): string {
+    if (!this.settings.uuidMap[filePath]) {
+      this.settings.uuidMap[filePath] = crypto.randomUUID();
+    }
+    return this.settings.uuidMap[filePath];
+  }
+
+  /** Returns a uuid→path lookup derived from the current uuidMap. */
+  reverseUuidMap(): Record<string, string> {
+    return Object.fromEntries(
+      Object.entries(this.settings.uuidMap).map(([path, uuid]) => [uuid, path]),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Status / UI
+  // ---------------------------------------------------------------------------
 
   updateStatus(status: SyncStatus, text?: string) {
     this.syncStatus = status;
@@ -173,6 +207,10 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Connection lifecycle
+  // ---------------------------------------------------------------------------
+
   async connect() {
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
@@ -186,27 +224,36 @@ export default class SynclinePlugin extends Plugin {
       const wasmMod = await initWasm();
       this.client = new wasmMod.SynclineClient(this.settings.serverUrl);
 
-      // Create index document first
+      // Create the __index__ document first
       this.client.create_index(() => {
         this.onIndexUpdate();
       });
 
-      // Add all files to index BEFORE connecting
-      const files = this.app.vault.getFiles().filter(f => ["md", "txt"].includes(f.extension ?? ""));
+      // Register all vault files under their UUIDs BEFORE connecting
+      const files = this.app.vault
+        .getFiles()
+        .filter((f) => ["md", "txt"].includes(f.extension ?? ""));
       console.debug("[Syncline] Adding", files.length, "files to index");
 
       for (const file of files) {
-        const docId = file.path;
-        this.knownFiles.add(docId);
+        const uuid = this.getOrCreateUuid(file.path);
+        this.knownFiles.add(uuid);
+        this.client.index_insert(uuid);
       }
 
-      // Now connect - will send index with all files
+      // Open WebSocket — WASM will send SyncStep1 for all registered docs on open
       this.client.connect();
 
-      // Add docs for syncing content
+      // Subscribe to content for each file
       for (const file of files) {
-        this.addDocOnly(file);
+        const uuid = this.settings.uuidMap[file.path];
+        if (uuid) {
+          this.addDocOnly(file, uuid);
+        }
       }
+
+      // Persist the (possibly expanded) uuidMap
+      await this.saveSettings();
 
       this.startStatusCheck();
     } catch (error) {
@@ -218,12 +265,11 @@ export default class SynclinePlugin extends Plugin {
 
   scheduleReconnect() {
     if (this.reconnectTimeout !== null) return;
-    
-    // Initial retry is fast (e.g., 1000ms), then exponential backoff, max 30000ms
+
     const baseDelay = 1000;
     const delay = Math.min(baseDelay * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
-    
+
     console.debug(`[Syncline] Scheduling reconnect in ${delay}ms (Attempt ${this.reconnectAttempts})`);
     this.reconnectTimeout = window.setTimeout(() => {
       this.reconnectTimeout = null;
@@ -265,21 +311,18 @@ export default class SynclinePlugin extends Plugin {
       if (this.client.is_connected()) {
         wasConnected = true;
         ticksDisconnected = 0;
-        this.reconnectAttempts = 0; // reset attempts on successful connection
+        this.reconnectAttempts = 0;
         const count = this.client.doc_count();
         this.updateStatus("synced", `Syncline: ${count} files`);
       } else {
         if (wasConnected) {
-          // Connection dropped after having been connected
           this.updateStatus("error", "Syncline: Connection lost");
           wasConnected = false;
           ticksDisconnected = 0;
           this.scheduleReconnect();
         } else {
-          // Currently trying to connect, or server is down
           ticksDisconnected++;
           if (ticksDisconnected > 5 && this.reconnectTimeout === null) {
-            // Failed to connect after 5 seconds
             console.warn("[Syncline] Connection timed out after 5s");
             this.updateStatus("error", "Syncline: Connection failed");
             this.scheduleReconnect();
@@ -298,33 +341,45 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Index management
+  // ---------------------------------------------------------------------------
+
   onIndexUpdate() {
     if (!this.client) return;
 
-    const keys = this.client.index_keys();
+    const keys = this.client.index_keys(); // these are UUIDs
     console.debug("[Syncline] Index update, keys:", keys);
 
-    for (const key of keys) {
-      if (!this.knownFiles.has(key)) {
-        if (this.settings.knownFiles.includes(key)) {
-          console.debug("[Syncline] Detected offline deletion from index sync:", key);
-          this.client.index_remove(key);
+    const reverseMap = this.reverseUuidMap();
+
+    for (const uuid of keys) {
+      if (!this.knownFiles.has(uuid)) {
+        if (this.settings.knownFiles.includes(uuid)) {
+          // UUID was known before but is no longer on the server → offline deletion
+          console.debug("[Syncline] Detected offline deletion from index sync:", uuid);
+          this.client.index_remove(uuid);
         } else {
-          this.knownFiles.add(key);
-          const file = this.app.vault.getAbstractFileByPath(key);
+          this.knownFiles.add(uuid);
+          const path = reverseMap[uuid];
+          const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
           if (file instanceof TFile) {
-            this.addDocOnly(file);
+            this.addDocOnly(file, uuid);
           } else {
-            void this.createFileFromRemote(key);
+            void this.createFileFromRemote(uuid);
           }
         }
       }
     }
 
-    for (const known of Array.from(this.knownFiles)) {
-      if (!keys.includes(known)) {
-        this.knownFiles.delete(known);
-        this.deleteLocalFile(known);
+    // UUIDs that disappeared from the index → delete local file
+    for (const uuid of Array.from(this.knownFiles)) {
+      if (!keys.includes(uuid)) {
+        this.knownFiles.delete(uuid);
+        const path = reverseMap[uuid];
+        if (path) {
+          this.deleteLocalFile(path, uuid);
+        }
       }
     }
 
@@ -332,69 +387,86 @@ export default class SynclinePlugin extends Plugin {
     void this.saveSettings();
   }
 
-  addDocOnly(file: TFile) {
+  // ---------------------------------------------------------------------------
+  // Document management
+  // ---------------------------------------------------------------------------
+
+  /** Subscribe to a doc by UUID. On first sync, push local content; thereafter handle remote updates. */
+  addDocOnly(file: TFile, uuid: string) {
     if (!this.client) return;
-    
-    const docId = file.path;
+
     let initialSyncDone = false;
     let isMerging = false;
-    
-    this.client.add_doc(docId, () => {
+
+    this.client.add_doc(uuid, () => {
+      // Ensure meta.path is set so the CLI client (and other WASM clients) know the file's path
+      this.client?.set_meta_path(uuid, file.path);
+
       if (!initialSyncDone) {
         initialSyncDone = true;
         isMerging = true;
-        this.app.vault.read(file).then(content => {
-          const remoteContent = this.client?.get_text(docId) || "";
+        this.app.vault
+          .read(file)
+          .then((content) => {
+            const remoteContent = this.client?.get_text(uuid) || "";
 
-          // If local file is empty (e.g. from iCloud stub or newly created), 
-          // but remote has content, favor the remote content instead of deleting it.
-          if (content === "" && remoteContent !== "") {
-            this.ignoreChanges.add(docId);
-            this.app.vault.modify(file, remoteContent).finally(() => {
-              setTimeout(() => this.ignoreChanges.delete(docId), 100);
-            }).catch(error => {
-              console.error(`[Syncline] Error updating file ${docId} after initial merge:`, error);
-            });
-            return;
-          }
+            // If local file is empty (e.g. iCloud stub) but remote has content, use remote.
+            if (content === "" && remoteContent !== "") {
+              this.ignoreChanges.add(file.path);
+              this.app.vault
+                .modify(file, remoteContent)
+                .finally(() => {
+                  setTimeout(() => this.ignoreChanges.delete(file.path), 100);
+                })
+                .catch((error) => {
+                  console.error(`[Syncline] Error updating ${file.path} after initial merge:`, error);
+                });
+              return;
+            }
 
-          this.client?.update(docId, content);
-          
-          const merged = this.client?.get_text(docId);
-          if (merged && merged !== content) {
-            this.ignoreChanges.add(docId);
-            this.app.vault.modify(file, merged).finally(() => {
-              setTimeout(() => this.ignoreChanges.delete(docId), 100);
-            }).catch(error => {
-              console.error(`[Syncline] Error updating file ${docId} after initial merge:`, error);
-            });
-          }
-        }).catch(error => {
-          console.error(`[Syncline] Error reading file ${docId}:`, error);
-        }).finally(() => {
-          isMerging = false;
-          // Synchronize any remote updates that arrived while we were processing this step
-          void this.onRemoteUpdate(docId);
-        });
+            this.client?.update(uuid, content);
+
+            const merged = this.client?.get_text(uuid);
+            if (merged && merged !== content) {
+              this.ignoreChanges.add(file.path);
+              this.app.vault
+                .modify(file, merged)
+                .finally(() => {
+                  setTimeout(() => this.ignoreChanges.delete(file.path), 100);
+                })
+                .catch((error) => {
+                  console.error(`[Syncline] Error updating ${file.path} after merge:`, error);
+                });
+            }
+          })
+          .catch((error) => {
+            console.error(`[Syncline] Error reading ${file.path}:`, error);
+          })
+          .finally(() => {
+            isMerging = false;
+            void this.onRemoteUpdate(uuid);
+          });
       } else {
         if (!isMerging) {
-          void this.onRemoteUpdate(docId);
+          void this.onRemoteUpdate(uuid);
         }
       }
     });
   }
 
+  /** Register a new file: assign UUID, track it, insert into index, subscribe. */
   addFile(file: TFile) {
     if (!this.client) return;
 
-    const docId = file.path;
-    this.knownFiles.add(docId);
-    this.addDocOnly(file);
+    const uuid = this.getOrCreateUuid(file.path);
+    this.knownFiles.add(uuid);
+    this.client.index_insert(uuid);
+    this.addDocOnly(file, uuid);
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
     const parts = filePath.split("/");
-    parts.pop(); // remove filename, keep only directory parts
+    parts.pop();
     let currentPath = "";
     for (const part of parts) {
       currentPath = currentPath ? `${currentPath}/${part}` : part;
@@ -403,12 +475,8 @@ export default class SynclinePlugin extends Plugin {
         try {
           await this.app.vault.createFolder(currentPath);
         } catch (e) {
-          // createFolder throws if folder already exists (race condition); re-check
           if (!this.app.vault.getAbstractFileByPath(currentPath)) {
-            console.error(
-              `[Syncline] Failed to create folder ${currentPath}:`,
-              e,
-            );
+            console.error(`[Syncline] Failed to create folder ${currentPath}:`, e);
             throw e;
           }
         }
@@ -416,34 +484,74 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  createFileFromRemote(docId: string) {
+  /** Subscribe to a remote-only UUID and create the local file once meta.path is known. */
+  createFileFromRemote(uuid: string) {
     if (!this.client) return;
 
-    this.client.add_doc(docId, () => {
-      this.onRemoteUpdate(docId);
+    this.client.add_doc(uuid, () => {
+      const path = this.client?.get_meta_path(uuid);
+      if (path) {
+        // Record the path→uuid mapping now that we know it
+        this.settings.uuidMap[path] = uuid;
+        void this.saveSettings();
+        void this.onRemoteUpdate(uuid);
+      }
     });
   }
 
-  deleteLocalFile(path: string) {
-    const file = this.app.vault.getAbstractFileByPath(path);
+  deleteLocalFile(filePath: string, uuid: string) {
+    const file = this.app.vault.getAbstractFileByPath(filePath);
     if (file instanceof TFile) {
-      this.ignoreChanges.add(path);
+      this.ignoreChanges.add(filePath);
       this.app.fileManager.trashFile(file).catch((error) => {
-        console.error(`[Syncline] Error deleting file ${path}:`, error);
+        console.error(`[Syncline] Error deleting file ${filePath}:`, error);
       }).finally(() => {
-        setTimeout(() => this.ignoreChanges.delete(path), 100);
+        setTimeout(() => this.ignoreChanges.delete(filePath), 100);
       });
     }
-    this.client?.remove_doc(path);
+    this.client?.remove_doc(uuid);
   }
 
-  async onRemoteUpdate(docId: string) {
+  async onRemoteUpdate(uuid: string) {
     if (!this.client) return;
 
-    const content = this.client.get_text(docId);
+    const content = this.client.get_text(uuid);
     if (content == null) return;
 
-    const file = this.app.vault.getAbstractFileByPath(docId);
+    const metaPath = this.client.get_meta_path(uuid);
+    const reverseMap = this.reverseUuidMap();
+    const currentPath = reverseMap[uuid] ?? metaPath;
+
+    if (!currentPath && !metaPath) {
+      return; // Path not known yet
+    }
+
+    const targetPath = metaPath ?? currentPath;
+
+    // Handle rename propagated from a remote client: meta.path changed
+    if (metaPath && currentPath && metaPath !== currentPath) {
+      const oldFile = this.app.vault.getAbstractFileByPath(currentPath);
+      if (oldFile instanceof TFile) {
+        this.ignoreChanges.add(currentPath);
+        this.ignoreChanges.add(metaPath);
+        try {
+          await this.ensureParentFolders(metaPath);
+          await this.app.fileManager.renameFile(oldFile, metaPath);
+          delete this.settings.uuidMap[currentPath];
+          this.settings.uuidMap[metaPath] = uuid;
+          await this.saveSettings();
+        } catch (error) {
+          console.error(`[Syncline] Error renaming ${currentPath} → ${metaPath}:`, error);
+        } finally {
+          setTimeout(() => {
+            this.ignoreChanges.delete(currentPath);
+            this.ignoreChanges.delete(metaPath);
+          }, 100);
+        }
+      }
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(targetPath);
 
     if (file instanceof TFile) {
       try {
@@ -451,27 +559,34 @@ export default class SynclinePlugin extends Plugin {
         if (currentContent === content) {
           return;
         }
-
-        this.ignoreChanges.add(docId);
+        this.ignoreChanges.add(targetPath);
         await this.app.vault.modify(file, content);
       } catch (error) {
-        console.error(`[Syncline] Error updating file ${docId}:`, error);
+        console.error(`[Syncline] Error updating file ${targetPath}:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(docId), 100);
+        setTimeout(() => this.ignoreChanges.delete(targetPath), 100);
       }
-    } else if (!file) {
+    } else if (!file && targetPath) {
       try {
-        await this.ensureParentFolders(docId);
-        this.ignoreChanges.add(docId);
-        await this.app.vault.create(docId, content);
-        this.knownFiles.add(docId);
+        await this.ensureParentFolders(targetPath);
+        this.ignoreChanges.add(targetPath);
+        await this.app.vault.create(targetPath, content);
+        if (metaPath) {
+          this.settings.uuidMap[metaPath] = uuid;
+          await this.saveSettings();
+        }
+        this.knownFiles.add(uuid);
       } catch (error) {
-        console.error(`[Syncline] Failed to create file ${docId} on remote update:`, error);
+        console.error(`[Syncline] Failed to create file ${targetPath} on remote update:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(docId), 100);
+        setTimeout(() => this.ignoreChanges.delete(targetPath), 100);
       }
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Vault event handlers
+  // ---------------------------------------------------------------------------
 
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
@@ -479,9 +594,12 @@ export default class SynclinePlugin extends Plugin {
     if (this.ignoreChanges.has(file.path)) return;
     if (!this.client) return;
 
+    const uuid = this.settings.uuidMap[file.path];
+    if (!uuid) return;
+
     try {
       const content = await this.app.vault.read(file);
-      this.client.update(file.path, content);
+      this.client.update(uuid, content);
     } catch (error) {
       console.error("[Syncline] Error syncing:", error);
     }
@@ -491,6 +609,7 @@ export default class SynclinePlugin extends Plugin {
     if (!(file instanceof TFile)) return;
     if (!["md", "txt"].includes(file.extension ?? "")) return;
     if (this.ignoreChanges.has(file.path)) return;
+
     this.addFile(file);
     this.settings.knownFiles = Array.from(this.knownFiles);
     void this.saveSettings();
@@ -498,26 +617,42 @@ export default class SynclinePlugin extends Plugin {
 
   onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    const docId = file.path;
-    if (this.ignoreChanges.has(docId)) return;
+    if (this.ignoreChanges.has(file.path)) return;
 
-    this.client?.index_remove(docId);
-    this.client?.remove_doc(docId);
-    this.knownFiles.delete(docId);
+    const uuid = this.settings.uuidMap[file.path];
+    if (uuid) {
+      this.client?.index_remove(uuid);
+      this.client?.remove_doc(uuid);
+      this.knownFiles.delete(uuid);
+      delete this.settings.uuidMap[file.path];
+    }
+
     this.settings.knownFiles = Array.from(this.knownFiles);
     void this.saveSettings();
   };
 
   onFileRename = (file: TAbstractFile, oldPath: string) => {
-    this.client?.index_remove(oldPath);
-    this.client?.remove_doc(oldPath);
-    this.knownFiles.delete(oldPath);
+    if (this.ignoreChanges.has(file instanceof TFile ? file.path : oldPath)) return;
 
-    if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
-      if (this.ignoreChanges.has(file.path)) return;
+    const uuid = this.settings.uuidMap[oldPath];
+    if (uuid) {
+      // Keep the same UUID — only update the path mapping and broadcast via set_meta_path
+      delete this.settings.uuidMap[oldPath];
+      if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
+        this.settings.uuidMap[file.path] = uuid;
+        // This CRDT update broadcasts the new meta.path to all other clients
+        this.client?.set_meta_path(uuid, file.path);
+      } else {
+        // Renamed to a non-synced extension — remove from sync
+        this.client?.index_remove(uuid);
+        this.client?.remove_doc(uuid);
+        this.knownFiles.delete(uuid);
+      }
+    } else if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
+      // File was not previously tracked (e.g. renamed from an ignored extension)
       this.addFile(file);
     }
-    
+
     this.settings.knownFiles = Array.from(this.knownFiles);
     void this.saveSettings();
   };

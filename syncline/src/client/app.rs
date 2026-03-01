@@ -1,7 +1,7 @@
 use crate::client::diff::apply_diff_to_yrs;
 use crate::client::network::SynclineClient;
 use crate::client::protocol::{Message, MsgType};
-use crate::client::state::LocalState;
+use crate::client::state::{read_meta_path, write_meta_path, LocalState};
 use crate::client::storage::{load_doc, save_doc};
 use crate::client::watcher::DebouncedWatcher;
 use colored::Colorize;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
 
 pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> anyhow::Result<()> {
     println!(
@@ -35,13 +35,13 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
     info!("{} Server URL: {}", "🌐".cyan(), url);
 
     let dir_to_watch = folder;
-    let local_state = LocalState::new(&dir_to_watch, name);
+    let mut local_state = LocalState::new(&dir_to_watch, name);
     info!("Client name: {}", local_state.client_name);
 
     // Bootstrap all local documents BEFORE connecting to the server.
     // This ensures local state is fully consistent (disk → CRDT) before any
-    // network activity begins. The `freshly_created` set tracks doc_ids that
-    // had no prior `.bin` state — used later for conflict detection.
+    // network activity begins. The `freshly_created` set tracks UUIDs that
+    // had no prior `.bin` state — used later for path-collision conflict detection.
     let (initial_offline_changes, mut freshly_created) =
         match local_state.bootstrap_offline_changes() {
             Ok(result) => result,
@@ -85,23 +85,28 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
             }
         };
 
-        // Track which doc_ids we have subscribed to via SyncStep1 so we can
-        // subscribe on-the-fly when the watcher discovers a new file.
+        // Track which UUIDs we have subscribed to via SyncStep1.
         let mut subscribed_docs: HashSet<String> = HashSet::new();
+        // Snapshot of the server's __index__ at first connection. Used to prevent
+        // false conflict detection: only UUIDs that were on the server BEFORE we
+        // connected can be "server truth" vs our freshly-created docs. UUIDs that
+        // arrive later (uploaded by other clients after we connected) should be
+        // handled by those clients, not by us.
+        let mut initial_server_uuids: Option<HashSet<String>> = None;
 
         // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
-        if let Ok(docs) = local_state.list_doc_ids() {
-            for doc_id in docs {
-                let state_path = local_state.get_state_path(&doc_id);
+        if let Ok(uuids) = local_state.list_doc_ids() {
+            for uuid in uuids {
+                let state_path = local_state.get_state_path_for_uuid(&uuid);
                 if let Ok(doc) = load_doc(&state_path) {
                     let sv = doc.transact().state_vector().encode_v1();
                     if let Err(e) = ws_tx
-                        .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
+                        .send(Message::new(MsgType::SyncStep1, uuid.clone(), sv))
                         .await
                     {
-                        error!("Failed to send SyncStep1 for doc {}: {:?}", doc_id, e);
+                        error!("Failed to send SyncStep1 for uuid {}: {:?}", uuid, e);
                     }
-                    subscribed_docs.insert(doc_id);
+                    subscribed_docs.insert(uuid);
                 }
             }
         }
@@ -121,37 +126,41 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
         // Broadcast offline changes (first connection only; None on reconnects)
         let offline_changes = pending_offline_changes.take().unwrap_or_default();
-        for (doc_id, update) in offline_changes {
+        for (uuid, update) in offline_changes {
             if let Err(e) = ws_tx
-                .send(Message::new(MsgType::Update, doc_id.clone(), update))
+                .send(Message::new(MsgType::Update, uuid.clone(), update))
                 .await
             {
-                error!("Failed to broadcast offline update for {}: {:?}", doc_id, e);
+                error!("Failed to broadcast offline update for {}: {:?}", uuid, e);
             } else {
-                info!("Broadcasted offline changes for {}", doc_id);
+                info!("Broadcasted offline changes for {}", uuid);
             }
         }
 
         loop {
             tokio::select! {
-                    app_msg = app_rx.recv() => {
-                        let msg = match app_msg {
-                            Some(m) => m,
-                            None => {
-                                error!("Connection to server lost. Reconnecting...");
-                                break; // break the inner loop to trigger reconnect
-                            }
-                        };
-                        match msg.msg_type {
+                app_msg = app_rx.recv() => {
+                    let msg = match app_msg {
+                        Some(m) => m,
+                        None => {
+                            error!("Connection to server lost. Reconnecting...");
+                            break;
+                        }
+                    };
+                    match msg.msg_type {
                         MsgType::SyncStep2 | MsgType::Update => {
-                            let doc_id = msg.doc_id;
+                            let doc_id = msg.doc_id; // This is now a UUID (or "__index__")
                             let is_index = doc_id == "__index__";
 
-                            let state_path = local_state.get_state_path(&doc_id);
+                            let state_path = if is_index {
+                                local_state.get_state_path_for_uuid("__index__")
+                            } else {
+                                local_state.get_state_path_for_uuid(&doc_id)
+                            };
                             let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
 
                             if is_index {
-                                info!("Received update for __index__, msg payload len: {}", msg.payload.len());
+                                info!("Received update for __index__, payload len: {}", msg.payload.len());
                                 match Update::decode_v1(&msg.payload) {
                                     Ok(update) => {
                                         let text_ref = doc.get_or_insert_text("content");
@@ -161,53 +170,72 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                         let index_content = text_ref.get_string(&txn);
                                         drop(txn);
 
-                                        info!("__index__ content is now: {:?}", index_content);
+                                        info!("__index__ content: {:?}", index_content);
 
                                         if let Err(e) = save_doc(&doc, &state_path) {
-                                            error!("Failed to save doc state {}: {:?}", doc_id, e);
+                                            error!("Failed to save __index__ state: {:?}", e);
                                         }
 
-                                        let new_index_docs: HashSet<&str> = index_content.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                        // __index__ contains UUID keys
+                                        let new_index_uuids: HashSet<&str> = index_content
+                                            .lines()
+                                            .map(|s| s.trim())
+                                            .filter(|s| !s.is_empty())
+                                            .collect();
 
-                                        // Detect deletions: docs that are in subscribed_docs but no longer in __index__
+                                        // Record the server-side UUIDs at first connection.
+                                        // This snapshot is used by conflict detection below to
+                                        // distinguish "server had this before I connected" (conflict)
+                                        // from "another client added this after I connected" (no conflict).
+                                        if initial_server_uuids.is_none() {
+                                            initial_server_uuids = Some(
+                                                new_index_uuids.iter().map(|s| s.to_string()).collect()
+                                            );
+                                        }
+
+                                        // Detect UUID removals from index → delete local files
                                         let mut to_remove = Vec::new();
-                                        for sub_doc in &subscribed_docs {
-                                            if sub_doc == "__index__" { continue; }
-                                            if !new_index_docs.contains(sub_doc.as_str()) {
-                                                to_remove.push(sub_doc.clone());
+                                        for sub_uuid in &subscribed_docs {
+                                            if sub_uuid == "__index__" { continue; }
+                                            if !new_index_uuids.contains(sub_uuid.as_str()) {
+                                                to_remove.push(sub_uuid.clone());
                                             }
                                         }
-
-                                        for removed_doc in to_remove {
-                                            info!("Document {} removed from __index__, deleting locally", removed_doc);
-                                            let phys_path = local_state.root_dir.join(&removed_doc);
-                                            if fs::metadata(&phys_path).is_ok() {
-                                                if let Err(e) = fs::remove_file(&phys_path) {
-                                                    error!("Failed to delete physical file {}: {:?}", phys_path.display(), e);
-                                                } else {
-                                                    info!("Deleted physical file {}", phys_path.display());
+                                        for removed_uuid in to_remove {
+                                            info!("UUID {} removed from __index__, deleting locally", removed_uuid);
+                                            // Find the physical path via path_map
+                                            if let Some(rel_path) = local_state.path_map.get_path_for_uuid(&removed_uuid).map(|s| s.to_string()) {
+                                                let phys_path = local_state.root_dir.join(&rel_path);
+                                                if fs::metadata(&phys_path).is_ok() {
+                                                    if let Err(e) = fs::remove_file(&phys_path) {
+                                                        error!("Failed to delete file {:?}: {:?}", phys_path, e);
+                                                    } else {
+                                                        info!("Deleted file {}", phys_path.display());
+                                                    }
+                                                }
+                                                local_state.path_map.remove_by_path(&rel_path);
+                                                if let Err(e) = local_state.path_map.save() {
+                                                    error!("Failed to save path_map: {:?}", e);
                                                 }
                                             }
-                                            subscribed_docs.remove(&removed_doc);
+                                            subscribed_docs.remove(&removed_uuid);
                                         }
 
-                                        for discovered_doc_id in new_index_docs {
-                                            if !subscribed_docs.contains(discovered_doc_id) {
-                                                info!("Discovered new document from __index__: {}", discovered_doc_id);
-                                                let discovered_state_path = local_state.get_state_path(discovered_doc_id);
-                                                info!("Sending SyncStep1 for newly discovered doc: {}", discovered_doc_id);
-                                                let discovered_doc = load_doc(&discovered_state_path).unwrap_or_else(|_| Doc::new());
-                                                let sv = discovered_doc.transact().state_vector().encode_v1();
-
+                                        // Discover new UUIDs in the index
+                                        for discovered_uuid in new_index_uuids {
+                                            if !subscribed_docs.contains(discovered_uuid) {
+                                                info!("Discovered new UUID from __index__: {}", discovered_uuid);
+                                                let disc_state_path = local_state.get_state_path_for_uuid(discovered_uuid);
+                                                let disc_doc = load_doc(&disc_state_path).unwrap_or_else(|_| Doc::new());
+                                                let sv = disc_doc.transact().state_vector().encode_v1();
                                                 if let Err(e) = ws_tx.send(Message::new(
                                                     MsgType::SyncStep1,
-                                                    discovered_doc_id.to_string(),
+                                                    discovered_uuid.to_string(),
                                                     sv,
                                                 )).await {
-                                                    error!("Failed to send SyncStep1 for discovered doc {}: {:?}", discovered_doc_id, e);
+                                                    error!("Failed to send SyncStep1 for discovered UUID {}: {:?}", discovered_uuid, e);
                                                 } else {
-                                                    info!("Successfully sent SyncStep1 for {}!", discovered_doc_id);
-                                                    subscribed_docs.insert(discovered_doc_id.to_string());
+                                                    subscribed_docs.insert(discovered_uuid.to_string());
                                                 }
                                             }
                                         }
@@ -219,205 +247,345 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                 continue;
                             }
 
-                            // --- Conflict detection for freshly created docs ---
-                            // A freshly created doc is one that had no .bin state before bootstrap,
-                            // meaning the client independently authored it. If the server also has
-                            // content for the same doc_id, the two documents have no shared CRDT
-                            // history and a naive merge would produce garbled output. Instead, we
-                            // keep both copies: server content as the canonical file, local content
-                            // renamed with the client name as a suffix.
-                            if freshly_created.contains(&doc_id) {
-                                freshly_created.remove(&doc_id);
+                            // --- Content document handling (UUID-based) ---
 
-                                if !msg.payload.is_empty() {
-                                    if let Ok(server_update) = Update::decode_v1(&msg.payload) {
-                                        let server_doc = Doc::new();
-                                        let server_text_ref = server_doc.get_or_insert_text("content");
-                                        {
-                                            let mut txn = server_doc.transact_mut();
-                                            txn.apply_update(server_update);
-                                        }
-                                        let server_text = server_text_ref.get_string(&server_doc.transact());
-
-                                        let local_text_ref = doc.get_or_insert_text("content");
-                                        let local_text = local_text_ref.get_string(&doc.transact());
-
-                                        if !server_text.is_empty()
-                                            && !local_text.is_empty()
-                                            && server_text != local_text
-                                        {
-                                            info!(
-                                                "Creation conflict detected for '{}': local content differs from server. Resolving...",
-                                                doc_id
-                                            );
-                                            if let Err(e) = resolve_creation_conflict(
-                                                &local_state,
-                                                &doc_id,
-                                                &local_text,
-                                                &server_text,
-                                                &server_doc,
-                                                &ws_tx,
-                                                &mut subscribed_docs,
-                                            ).await {
-                                                error!("Conflict resolution failed for {}: {:?}", doc_id, e);
-                                            }
-                                            continue; // skip normal SyncStep2 processing
-                                        }
-                                        // No true conflict (e.g. server has same content or empty) —
-                                        // fall through to normal processing below.
-                                    }
-                                }
-                                // payload empty or not decodable — no server content yet, fall through
-                            }
-                            // --- End conflict detection ---
-
-                            let phys_path = local_state.root_dir.join(&doc_id);
-
-                            // 1. Check for unsynced local disk changes before we overwrite the disk
+                            // 1. Capture current state for local change detection
+                            let prev_rel_path = local_state.path_map.get_path_for_uuid(&doc_id).map(|s| s.to_string());
                             let text_ref = doc.get_or_insert_text("content");
                             let yjs_content_before = text_ref.get_string(&doc.transact());
-                            let has_file = fs::metadata(&phys_path).is_ok();
-                            let disk_content = if has_file {
-                                match fs::read_to_string(&phys_path) {
-                                    Ok(content) => content,
-                                    Err(e) => {
-                                        error!("Failed to read physical file {}: {:?}", phys_path.display(), e);
-                                        continue;
+
+                            // Check for unsynced local disk changes before applying remote update
+                            if let Some(ref rp) = prev_rel_path {
+                                let phys_path = local_state.root_dir.join(rp);
+                                if let Ok(disk_content) = fs::read_to_string(&phys_path) {
+                                    if disk_content != yjs_content_before {
+                                        info!("Unsynced local changes in {}! Applying before remote update.", rp);
+                                        let prev_sv = doc.transact().state_vector();
+                                        apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
+                                        let local_update = doc.transact().encode_state_as_update_v1(&prev_sv);
+                                        if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id.clone(), local_update)).await {
+                                            error!("Failed to send unsynced local update: {:?}", e);
+                                        }
                                     }
-                                }
-                            } else {
-                                String::new()
-                            };
-
-                            if has_file && yjs_content_before != disk_content {
-                                info!("Unsynced local changes in {}! Diffing before applying remote update.", doc_id);
-                                let previous_sv = doc.transact().state_vector();
-                                apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
-
-                                // Broadcast the local edits so the other remote peers get them too
-                                let local_update = doc.transact().encode_state_as_update_v1(&previous_sv);
-                                if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id.clone(), local_update)).await {
-                                    error!("Failed to send unsynced local update: {:?}", e);
                                 }
                             }
 
-                            // 2. NOW apply the remote update
+                            // 2. Apply the remote update
                             if let Ok(update) = Update::decode_v1(&msg.payload) {
                                 let mut txn = doc.transact_mut();
                                 txn.apply_update(update);
+                            }
 
-                                let text_val = text_ref.get_string(&txn);
-                                drop(txn);
+                            // 3. Read meta.path (the file path this UUID corresponds to)
+                            let new_meta_path = read_meta_path(&doc);
+                            let text_val = text_ref.get_string(&doc.transact());
 
-                                if let Err(e) = save_doc(&doc, &state_path) {
-                                    error!("Failed to save doc state {}: {:?}", doc_id, e);
+                            // Save updated .bin
+                            if let Err(e) = save_doc(&doc, &state_path) {
+                                error!("Failed to save doc state for {}: {:?}", doc_id, e);
+                            }
+
+                            let target_rel_path = match new_meta_path {
+                                Some(p) if !p.is_empty() => p,
+                                _ => {
+                                    // meta.path not set yet; skip writing to disk
+                                    info!("UUID {} has no meta.path yet, skipping disk write", doc_id);
+                                    continue;
                                 }
+                            };
 
-                                let current_disk_content = fs::read_to_string(&phys_path).unwrap_or_default();
-                                let file_exists = fs::metadata(&phys_path).is_ok();
-
-                                if text_val.is_empty() {
-                                    if file_exists {
-                                        if let Err(e) = fs::remove_file(&phys_path) {
-                                            error!("Failed to delete physical file {}: {:?}", phys_path.display(), e);
+                            // 4. Check for path collision with a freshly-created local doc
+                            {
+                                let collision_local_uuid = local_state.path_map
+                                    .get_uuid(&target_rel_path)
+                                    .and_then(|u| {
+                                        // Only conflict-detect if:
+                                        // - Different UUID from ours
+                                        // - Our local UUID was freshly created (no prior .bin)
+                                        // - The incoming UUID was on the server BEFORE we
+                                        //   connected (initial snapshot). UUIDs that appeared
+                                        //   after we connected are handled by the other client.
+                                        if u != doc_id
+                                            && freshly_created.contains(u)
+                                            && initial_server_uuids
+                                                .as_ref()
+                                                .map_or(false, |s| s.contains(&doc_id))
+                                        {
+                                            Some(u.to_string())
                                         } else {
-                                            info!("Applied remote deletion to file {}", phys_path.display());
+                                            None
+                                        }
+                                    });
+
+                                if let Some(local_uuid) = collision_local_uuid {
+                                    freshly_created.remove(&local_uuid);
+                                    info!(
+                                        "Path collision: UUID {} (server) and UUID {} (local, freshly created) both want '{}'. Resolving...",
+                                        doc_id, local_uuid, target_rel_path
+                                    );
+                                    if let Err(e) = resolve_path_conflict(
+                                        &mut local_state,
+                                        &doc_id,
+                                        &target_rel_path,
+                                        &local_uuid,
+                                        &doc,
+                                        &ws_tx,
+                                        &mut subscribed_docs,
+                                    ).await {
+                                        error!("Conflict resolution failed: {:?}", e);
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // 5. Handle path change (rename propagated from remote)
+                            if prev_rel_path.as_deref() != Some(target_rel_path.as_str()) {
+                                if let Some(ref old_rp) = prev_rel_path {
+                                    let old_phys = local_state.root_dir.join(old_rp);
+                                    let new_phys = local_state.root_dir.join(&target_rel_path);
+                                    if old_phys.exists() {
+                                        if let Some(parent) = new_phys.parent() {
+                                            let _ = fs::create_dir_all(parent);
+                                        }
+                                        if let Err(e) = fs::rename(&old_phys, &new_phys) {
+                                            error!("Failed to rename {:?} → {:?}: {:?}", old_phys, new_phys, e);
+                                        } else {
+                                            info!("Renamed {} → {} from remote update", old_rp, target_rel_path);
                                         }
                                     }
-                                } else if !file_exists || current_disk_content != text_val {
-                                    if let Some(parent) = phys_path.parent() {
-                                        let _ = fs::create_dir_all(parent);
-                                    }
+                                    local_state.path_map.remove_by_path(old_rp);
+                                }
+                                local_state.path_map.insert(target_rel_path.clone(), doc_id.clone());
+                                if let Err(e) = local_state.path_map.save() {
+                                    error!("Failed to save path_map: {:?}", e);
+                                }
+                            }
 
-                                    if let Err(e) = fs::write(&phys_path, &text_val) {
-                                        error!("Failed to write physical file {}: {:?}", phys_path.display(), e);
+                            // 6. Write content to physical file
+                            let phys_path = local_state.root_dir.join(&target_rel_path);
+                            if text_val.is_empty() {
+                                if phys_path.exists() {
+                                    if let Err(e) = fs::remove_file(&phys_path) {
+                                        error!("Failed to delete file {:?}: {:?}", phys_path, e);
                                     } else {
-                                        info!("Applied remote update to file {}", phys_path.display());
+                                        info!("Deleted file {} (empty content)", phys_path.display());
+                                    }
+                                }
+                            } else {
+                                if let Some(parent) = phys_path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                let current_disk = fs::read_to_string(&phys_path).unwrap_or_default();
+                                if current_disk != text_val {
+                                    if let Err(e) = fs::write(&phys_path, &text_val) {
+                                        error!("Failed to write file {:?}: {:?}", phys_path, e);
+                                    } else {
+                                        info!("Applied remote update to {}", phys_path.display());
                                     }
                                 }
                             }
-                        },
-                        MsgType::SyncStep1 => { }
+                        }
+                        MsgType::SyncStep1 => {}
                     }
                 }
+
                 Some(res) = watcher_rx.recv() => {
                     match res {
                         Ok(events) => {
-                            for ev in events {
-                                let path = ev.path;
+                            // Two-pass rename detection within the event batch.
+                            // First pass: classify events into deletes and creates/modifies.
+                            struct WatchDelete {
+                                rel_path: String,
+                                uuid: String,
+                            }
+                            struct WatchCreate {
+                                path: std::path::PathBuf,
+                                rel_path: String,
+                                disk_content: String,
+                            }
 
-                                let is_deleted = !path.exists();
-                                if is_deleted {
-                                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                    if ext != "md" && ext != "txt" { continue; }
+                            let mut batch_deletes: Vec<WatchDelete> = Vec::new();
+                            let mut batch_creates: Vec<WatchCreate> = Vec::new();
 
-                                    let doc_id = match local_state.get_doc_id(&path) {
-                                        Ok(d) => d,
-                                        Err(_) => continue,
-                                    };
+                            for ev in &events {
+                                let path = &ev.path;
+                                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                                if ext != "md" && ext != "txt" { continue; }
 
-                                    let state_path = local_state.get_state_path(&doc_id);
-                                    if !state_path.exists() {
-                                        continue; // Never tracked, ignore deletion
-                                    }
-                                } else if !path.is_file() {
-                                    continue;
-                                } else {
-                                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                    if ext != "md" && ext != "txt" { continue; }
-                                }
-
-                                let doc_id = match local_state.get_doc_id(&path) {
-                                    Ok(d) => d,
+                                let rel_path = match local_state.get_doc_id(path) {
+                                    Ok(r) => r,
                                     Err(_) => continue,
                                 };
+                                if rel_path.split('/').any(|c| c.starts_with('.')) { continue; }
 
-                                // Check if any part of the relative path is hidden (starts with .)
-                                if doc_id.split('/').any(|comp| comp.starts_with('.')) {
+                                if !path.exists() {
+                                    // Delete event
+                                    if let Some(uuid) = local_state.path_map.get_uuid(&rel_path) {
+                                        let state_path = local_state.get_state_path_for_uuid(uuid);
+                                        if state_path.exists() {
+                                            batch_deletes.push(WatchDelete {
+                                                rel_path,
+                                                uuid: uuid.to_string(),
+                                            });
+                                        }
+                                    }
+                                } else if path.is_file() {
+                                    match fs::read_to_string(path) {
+                                        Ok(content) => batch_creates.push(WatchCreate {
+                                            path: path.clone(),
+                                            rel_path,
+                                            disk_content: content,
+                                        }),
+                                        Err(_) => {}
+                                    }
+                                }
+                            }
+
+                            // Second pass: match deletes with creates (rename detection)
+                            let mut matched_renames: Vec<(String, String, String, String)> = Vec::new(); // (uuid, new_rel_path, disk_content, old_rel_path)
+                            let mut used_create_indices: HashSet<usize> = HashSet::new();
+
+                            for wd in &batch_deletes {
+                                let state_path = local_state.get_state_path_for_uuid(&wd.uuid);
+                                let old_content = load_doc(&state_path)
+                                    .map(|d| {
+                                        let t = d.get_or_insert_text("content");
+                                        t.get_string(&d.transact())
+                                    })
+                                    .unwrap_or_default();
+
+                                for (i, wc) in batch_creates.iter().enumerate() {
+                                    if !used_create_indices.contains(&i) && wc.disk_content == old_content {
+                                        matched_renames.push((
+                                            wd.uuid.clone(),
+                                            wc.rel_path.clone(),
+                                            wc.disk_content.clone(),
+                                            wd.rel_path.clone(),
+                                        ));
+                                        used_create_indices.insert(i);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let matched_delete_uuids: HashSet<String> = matched_renames.iter().map(|(u, _, _, _)| u.clone()).collect();
+
+                            // Process renames
+                            for (uuid, new_rel_path, disk_content, old_rel_path) in matched_renames {
+                                info!("Detected rename: {} → {} (UUID {})", old_rel_path, new_rel_path, uuid);
+                                local_state.path_map.remove_by_path(&old_rel_path);
+                                local_state.path_map.insert(new_rel_path.clone(), uuid.clone());
+                                if let Err(e) = local_state.path_map.save() {
+                                    error!("Failed to save path_map: {:?}", e);
+                                }
+
+                                let state_path = local_state.get_state_path_for_uuid(&uuid);
+                                let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+                                let text_ref = doc.get_or_insert_text("content");
+                                let yjs_content = text_ref.get_string(&doc.transact());
+                                let previous_sv = doc.transact().state_vector();
+                                // Update meta.path and content (content is same, but record for CRDT)
+                                write_meta_path(&doc, &new_rel_path);
+                                if disk_content != yjs_content {
+                                    apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
+                                }
+                                if let Err(e) = save_doc(&doc, &state_path) {
+                                    error!("Failed to save renamed doc {}: {:?}", uuid, e);
                                     continue;
                                 }
-                                let state_path = local_state.get_state_path(&doc_id);
+                                if !subscribed_docs.contains(&uuid) {
+                                    let sv = doc.transact().state_vector().encode_v1();
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::SyncStep1, uuid.clone(), sv)).await {
+                                        error!("Failed to subscribe to renamed doc {}: {:?}", uuid, e);
+                                    } else {
+                                        subscribed_docs.insert(uuid.clone());
+                                    }
+                                }
+                                let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                                if let Err(e) = ws_tx.send(Message::new(MsgType::Update, uuid, update)).await {
+                                    error!("Failed to send rename update: {:?}", e);
+                                }
+                            }
+
+                            // Process unmatched deletes (true deletions)
+                            for wd in batch_deletes.iter().filter(|wd| !matched_delete_uuids.contains(&wd.uuid)) {
+                                info!("File deleted: {} (UUID {})", wd.rel_path, wd.uuid);
+                                let state_path = local_state.get_state_path_for_uuid(&wd.uuid);
+                                if let Ok(doc) = load_doc(&state_path) {
+                                    let text_ref = doc.get_or_insert_text("content");
+                                    let yjs_content = text_ref.get_string(&doc.transact());
+                                    if !yjs_content.is_empty() {
+                                        let previous_sv = doc.transact().state_vector();
+                                        apply_diff_to_yrs(&doc, &text_ref, &yjs_content, "");
+                                        if let Err(e) = save_doc(&doc, &state_path) {
+                                            error!("Failed to save deletion for {}: {:?}", wd.uuid, e);
+                                            continue;
+                                        }
+                                        local_state.path_map.remove_by_path(&wd.rel_path);
+                                        if let Err(e) = local_state.path_map.save() {
+                                            error!("Failed to save path_map: {:?}", e);
+                                        }
+                                        let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                                        if let Err(e) = ws_tx.send(Message::new(MsgType::Update, wd.uuid.clone(), update)).await {
+                                            error!("Failed to send deletion update: {:?}", e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Process creates/modifies (unmatched creates + modifications)
+                            for (i, wc) in batch_creates.iter().enumerate() {
+                                if used_create_indices.contains(&i) { continue; } // was matched as rename
+
+                                let is_newly_discovered = local_state.path_map.get_uuid(&wc.rel_path).is_none();
+                                let uuid = local_state.get_or_create_uuid(&wc.rel_path);
+                                let state_path = local_state.get_state_path_for_uuid(&uuid);
+
+                                if let Some(parent) = state_path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
 
                                 let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
                                 let text_ref = doc.get_or_insert_text("content");
+                                let current_meta = read_meta_path(&doc);
+                                // Take previous_sv BEFORE write_meta_path so the broadcast delta
+                                // includes meta.path (needed by other clients to locate the file).
+                                let previous_sv = doc.transact().state_vector();
+                                if current_meta.as_deref() != Some(wc.rel_path.as_str()) {
+                                    write_meta_path(&doc, &wc.rel_path);
+                                }
 
-                                let newly_discovered = !subscribed_docs.contains(&doc_id);
-                                // If this document has never been subscribed to, send SyncStep1
-                                // first so the server creates a broadcast channel for it and we
-                                // receive updates from other clients.
-                                if newly_discovered {
+                                let newly_subscribed = !subscribed_docs.contains(&uuid);
+                                if newly_subscribed {
                                     let sv = doc.transact().state_vector().encode_v1();
-                                    if let Err(e) = ws_tx
-                                        .send(Message::new(MsgType::SyncStep1, doc_id.clone(), sv))
-                                        .await
-                                    {
-                                        error!("Failed to subscribe to new doc {}: {:?}", doc_id, e);
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::SyncStep1, uuid.clone(), sv)).await {
+                                        error!("Failed to subscribe to new doc {}: {:?}", uuid, e);
                                     } else {
-                                        subscribed_docs.insert(doc_id.clone());
+                                        subscribed_docs.insert(uuid.clone());
+                                        if is_newly_discovered {
+                                            freshly_created.insert(uuid.clone());
+                                        }
                                     }
                                 }
 
-                                let disk_content = if is_deleted {
-                                    "".to_string()
-                                } else {
-                                    match fs::read_to_string(&path) {
-                                        Ok(c) => c,
-                                        Err(_) => continue,
-                                    }
-                                };
-
                                 let yjs_content = text_ref.get_string(&doc.transact());
-                                if newly_discovered || disk_content != yjs_content {
-                                    info!("Local file {} modified or newly discovered, diffing and broadcasting...", path.display());
-                                    let previous_sv = doc.transact().state_vector();
-                                    apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &disk_content);
+                                let needs_update = newly_subscribed
+                                    || wc.disk_content != yjs_content
+                                    || current_meta.as_deref() != Some(wc.rel_path.as_str());
+
+                                if needs_update {
+                                    info!("Local file {} changed, broadcasting...", wc.path.display());
+                                    // previous_sv already captured before write_meta_path above
+                                    apply_diff_to_yrs(&doc, &text_ref, &yjs_content, &wc.disk_content);
                                     if let Err(e) = save_doc(&doc, &state_path) {
                                         error!("Failed to save doc locally: {:?}", e);
                                         continue;
                                     }
-
+                                    if let Err(e) = local_state.path_map.save() {
+                                        error!("Failed to save path_map: {:?}", e);
+                                    }
                                     let update = doc.transact().encode_state_as_update_v1(&previous_sv);
-                                    if let Err(e) = ws_tx.send(Message::new(MsgType::Update, doc_id, update)).await {
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::Update, uuid, update)).await {
                                         error!("Failed to send update: {:?}", e);
                                     }
                                 }
@@ -433,11 +601,11 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
 /// Generates a conflict filename by appending the client name to the stem.
 ///
-/// For `doc_id = "notes/idea.md"` and `client_name = "laptop-abc123"`:
+/// For `rel_path = "notes/idea.md"` and `client_name = "laptop-abc123"`:
 /// - attempt 0 → `"notes/idea (laptop-abc123).md"`
 /// - attempt 1 → `"notes/idea (laptop-abc123 2).md"`
-fn make_conflict_doc_id(doc_id: &str, client_name: &str, attempt: u32) -> String {
-    let path = std::path::Path::new(doc_id);
+fn make_conflict_path(rel_path: &str, client_name: &str, attempt: u32) -> String {
+    let path = std::path::Path::new(rel_path);
     let parent = path
         .parent()
         .map(|p| {
@@ -448,7 +616,7 @@ fn make_conflict_doc_id(doc_id: &str, client_name: &str, attempt: u32) -> String
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or(doc_id);
+        .unwrap_or(rel_path);
     let ext = path.extension().and_then(|s| s.to_str());
 
     let suffix = if attempt == 0 {
@@ -463,30 +631,30 @@ fn make_conflict_doc_id(doc_id: &str, client_name: &str, attempt: u32) -> String
     }
 }
 
-/// Resolves a creation conflict: two clients independently created a file with the same name.
+/// Resolves a path collision: the server's UUID (server_uuid) wants to occupy
+/// `canonical_path`, but a locally-freshly-created UUID (local_uuid) already
+/// lives there.
 ///
-/// The server's content is kept as the canonical file. The local content is saved under
-/// a new name `"{stem} ({client_name}).{ext}"` (with a counter suffix to avoid collisions).
-/// Both files are synced to the server.
-async fn resolve_creation_conflict(
-    state: &LocalState,
-    doc_id: &str,
-    local_text: &str,
-    server_text: &str,
+/// Resolution: the server's version is canonical. The local doc is moved to a
+/// conflict filename. Both are synced.
+async fn resolve_path_conflict(
+    state: &mut LocalState,
+    server_uuid: &str,
+    canonical_path: &str,
+    local_uuid: &str,
     server_doc: &Doc,
     ws_tx: &mpsc::Sender<Message>,
     subscribed_docs: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     // Find a conflict filename that doesn't already exist on disk
-    let conflict_doc_id = (0u32..)
-        .map(|attempt| make_conflict_doc_id(doc_id, &state.client_name, attempt))
+    let conflict_rel_path = (0u32..)
+        .map(|attempt| make_conflict_path(canonical_path, &state.client_name, attempt))
         .find(|candidate| !state.root_dir.join(candidate).exists())
         .expect("conflict filename search is unbounded");
 
-    let conflict_phys = state.root_dir.join(&conflict_doc_id);
-    let conflict_state_path = state.get_state_path(&conflict_doc_id);
+    let conflict_phys = state.root_dir.join(&conflict_rel_path);
+    let conflict_state_path = state.get_state_path_for_uuid(local_uuid);
 
-    // Create parent directories for the conflict file if needed
     if let Some(parent) = conflict_phys.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -494,59 +662,58 @@ async fn resolve_creation_conflict(
         fs::create_dir_all(parent)?;
     }
 
-    // Write the local content to the conflict file (physical + CRDT)
-    fs::write(&conflict_phys, local_text)?;
-    let conflict_doc = Doc::new();
-    let conflict_text_ref = conflict_doc.get_or_insert_text("content");
-    {
-        let mut txn = conflict_doc.transact_mut();
-        conflict_text_ref.insert(&mut txn, 0, local_text);
-    }
-    save_doc(&conflict_doc, &conflict_state_path)?;
+    // Load local doc, update its meta.path to the conflict name
+    let local_doc = load_doc(&conflict_state_path).unwrap_or_else(|_| Doc::new());
+    let local_text_ref = local_doc.get_or_insert_text("content");
+    let local_text = local_text_ref.get_string(&local_doc.transact());
+    let local_previous_sv = local_doc.transact().state_vector();
+    write_meta_path(&local_doc, &conflict_rel_path);
+    save_doc(&local_doc, &conflict_state_path)?;
 
-    // Replace the canonical doc's .bin with the server-only state (no merge)
-    let canonical_state_path = state.get_state_path(doc_id);
-    save_doc(server_doc, &canonical_state_path)?;
+    // Write local content to the conflict file on disk
+    fs::write(&conflict_phys, &local_text)?;
 
-    // Write the server content to the canonical physical file
-    let canonical_phys = state.root_dir.join(doc_id);
+    // Update path_map: local UUID now at conflict path
+    state.path_map.remove_by_path(canonical_path);
+    state.path_map.insert(conflict_rel_path.clone(), local_uuid.to_string());
+
+    // Write server content to canonical path
+    let server_text_ref = server_doc.get_or_insert_text("content");
+    let server_text = server_text_ref.get_string(&server_doc.transact());
+    let canonical_phys = state.root_dir.join(canonical_path);
     if let Some(parent) = canonical_phys.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&canonical_phys, server_text)?;
+    fs::write(&canonical_phys, &server_text)?;
 
-    info!(
-        "Conflict resolved: '{}' keeps server content; local content saved as '{}'",
-        doc_id, conflict_doc_id
-    );
-
-    // Subscribe to the conflict file on the server, then upload its content
-    let sv = StateVector::default().encode_v1();
-    if let Err(e) = ws_tx
-        .send(Message::new(
-            MsgType::SyncStep1,
-            conflict_doc_id.clone(),
-            sv,
-        ))
-        .await
-    {
-        warn!("Failed to subscribe to conflict file {}: {:?}", conflict_doc_id, e);
-    } else {
-        subscribed_docs.insert(conflict_doc_id.clone());
+    // Save server doc to .bin under server_uuid
+    let server_state_path = state.get_state_path_for_uuid(server_uuid);
+    if let Some(parent) = server_state_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    save_doc(server_doc, &server_state_path)?;
+    state.path_map.insert(canonical_path.to_string(), server_uuid.to_string());
+    if let Err(e) = state.path_map.save() {
+        warn!("Failed to save path_map after conflict resolution: {:?}", e);
     }
 
-    let conflict_update = conflict_doc
-        .transact()
-        .encode_state_as_update_v1(&StateVector::default());
-    if let Err(e) = ws_tx
-        .send(Message::new(
-            MsgType::Update,
-            conflict_doc_id.clone(),
-            conflict_update,
-        ))
-        .await
-    {
-        warn!("Failed to upload conflict file {}: {:?}", conflict_doc_id, e);
+    info!(
+        "Conflict resolved: '{}' keeps server content (UUID {}); local content saved as '{}' (UUID {})",
+        canonical_path, server_uuid, conflict_rel_path, local_uuid
+    );
+
+    // Broadcast the conflict file (local UUID with new meta.path)
+    let conflict_update = local_doc.transact().encode_state_as_update_v1(&local_previous_sv);
+    if !subscribed_docs.contains(local_uuid) {
+        let sv = StateVector::default().encode_v1();
+        if let Err(e) = ws_tx.send(Message::new(MsgType::SyncStep1, local_uuid.to_string(), sv)).await {
+            warn!("Failed to subscribe to conflict file {}: {:?}", local_uuid, e);
+        } else {
+            subscribed_docs.insert(local_uuid.to_string());
+        }
+    }
+    if let Err(e) = ws_tx.send(Message::new(MsgType::Update, local_uuid.to_string(), conflict_update)).await {
+        warn!("Failed to upload conflict file {}: {:?}", local_uuid, e);
     }
 
     Ok(())
