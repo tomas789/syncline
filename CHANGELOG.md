@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/tomas789/syncline/compare/v0.4.1...v0.5.0) (2026-03-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* The E2E test suite now requires the syncline binary to compile synchronously before spawning parallel processes.
+
+### Tests
+
+* resolve E2E compilation timeout race condition ([59d27bb](https://github.com/tomas789/syncline/commit/59d27bbaf717146593345281369bdcb0d6349326))
+
 ## [0.4.1](https://github.com/tomas789/syncline/compare/v0.4.0...v0.4.1) (2026-02-22)
 
 
