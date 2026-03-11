@@ -1,0 +1,11 @@
+# TLA+ tools (downloaded, not checked in)
+tla2tools.jar
+
+# TLC state files
+*.states/
+states/
+
+# TLC generated files
+*.dot
+*.dump
+*_TTrace_*.tla
