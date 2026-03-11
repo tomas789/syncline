@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.6.0](https://github.com/tomas789/syncline/compare/v0.5.2...v0.6.0) (2026-03-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* The E2E test suite now requires the syncline binary to compile synchronously before spawning parallel processes.
+
+### Features
+
+* Add WASM build process and upload client, server, and WASM artifacts. ([04270c9](https://github.com/tomas789/syncline/commit/04270c907ec88ed16bb55fbc257edea422bbec87))
+* **client_folder:** add --exclude CLI flag for configurable sync exclusions ([3d9ca6f](https://github.com/tomas789/syncline/commit/3d9ca6f26368c3917a2dcfde0ead9276ffebebfa))
+* **desktop:** implement syncline desktop tray app with live stats and auto-updates ([bf59672](https://github.com/tomas789/syncline/commit/bf596722909ef91975ca30d31718b688686c80cd))
+* implement binary file synchronization support ([064bfcd](https://github.com/tomas789/syncline/commit/064bfcd699595166624cacb846f70c4f3a1b9f25))
+* merge server and client_folder into unified syncline binary ([cf66972](https://github.com/tomas789/syncline/commit/cf66972cfbb75754177c4b9e8d72f778d5f46ef8))
+* New logo ([860c1ca](https://github.com/tomas789/syncline/commit/860c1ca6fa13885f2e8a5947ea4394bc32e73e46))
+
+
+### Bug Fixes
+
+* bug 13: Propagation of empty remote file as file deletion ([5def540](https://github.com/tomas789/syncline/commit/5def540f7f39efe9f3d1c2aca77c7265fd9e118c))
+* bug 14: Task leak in Network Client on reconnection ([546dd01](https://github.com/tomas789/syncline/commit/546dd01dfd49cd0a5fc3a1d25127f6a04da03c6d))
+* bug 15: get_doc_id correctly handles macOS symlinked paths gracefully failing canonicalization ([eb78a8f](https://github.com/tomas789/syncline/commit/eb78a8fdff16545c338b69eaaedb09ba5d3faeae))
+* bug in Arc usage by Yrs ([6613f37](https://github.com/tomas789/syncline/commit/6613f37153da9004480e215f404c802743e13342))
+* close stale-read race window in Obsidian file-watcher suppression ([20f6e36](https://github.com/tomas789/syncline/commit/20f6e36971587185da89df81df0b704d782c6edb))
+* make test_both_offline_same_name_conflict resilient to slow CI ([10a9d16](https://github.com/tomas789/syncline/commit/10a9d160695ad049394ee413fa230f8295b8414d))
+* prevent stale file content from deleting recently typed characters ([c5fe508](https://github.com/tomas789/syncline/commit/c5fe50828e6b9d027c69e16a3c1b22b5c276d51b))
+* remove initial_server_uuids guard from path collision detection ([fb9f98c](https://github.com/tomas789/syncline/commit/fb9f98cddceed82ae5b47661d4814f635bbed144))
+* trigger release workflow to verify artifacts ([20e918a](https://github.com/tomas789/syncline/commit/20e918a17b66014730526d2cd72beae22c26c787))
+* two-tier collision detection with deterministic tie-breaker ([573074a](https://github.com/tomas789/syncline/commit/573074a70ced291962ed214126f5909263a8b6f1))
+
+
+### Tests
+
+* resolve E2E compilation timeout race condition ([d879f8b](https://github.com/tomas789/syncline/commit/d879f8b500dd2f883b41f37d0407463ac02d5cbf))
+
 ## [0.5.2](https://github.com/tomas789/syncline/compare/v0.5.1...v0.5.2) (2026-03-11)
 
 
