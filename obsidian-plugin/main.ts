@@ -40,6 +40,11 @@ interface WasmModule {
 interface SynclineClient {
   connect(): void;
   add_doc(doc_id: string, callback: () => void): void;
+  add_binary_doc(
+    doc_id: string,
+    callback: () => void,
+    blob_callback: (doc_id: string, data: Uint8Array) => void,
+  ): void;
   remove_doc(doc_id: string): void;
   get_text(doc_id: string): string | undefined;
   update(doc_id: string, content: string): void;
@@ -52,6 +57,12 @@ interface SynclineClient {
   index_keys(): string[];
   get_meta_path(doc_id: string): string | undefined;
   set_meta_path(doc_id: string, path: string): void;
+  get_meta_type(doc_id: string): string | undefined;
+  set_meta_type(doc_id: string, file_type: string): void;
+  get_blob_hash(doc_id: string): string | undefined;
+  set_blob_hash(doc_id: string, hash: string): void;
+  send_blob(doc_id: string, data: Uint8Array): void;
+  request_blob(doc_id: string, hash: string): void;
   disconnect(): void;
   free(): void;
 }
@@ -81,6 +92,21 @@ async function initWasm(): Promise<WasmModule> {
  * without this guard, a stale disk read generates spurious DELETE operations.
  */
 const IGNORE_CHANGES_TIMEOUT_MS = 1000;
+
+/** Text-based file extensions that use Y.Text CRDT for content sync. */
+const TEXT_EXTENSIONS = ["md", "txt"];
+
+/** Returns true if a file should be synced as binary (not via Y.Text CRDT). */
+function isBinaryFile(file: TFile): boolean {
+  return !TEXT_EXTENSIONS.includes(file.extension ?? "");
+}
+
+/** Compute SHA-256 hex hash of a byte array using Web Crypto. */
+async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 export default class SynclinePlugin extends Plugin {
   settings: SynclineSettings;
@@ -241,9 +267,7 @@ export default class SynclinePlugin extends Plugin {
       });
 
       // Register all vault files under their UUIDs BEFORE connecting
-      const files = this.app.vault
-        .getFiles()
-        .filter((f) => ["md", "txt"].includes(f.extension ?? ""));
+      const files = this.app.vault.getFiles();
       console.debug("[Syncline] Adding", files.length, "files to index");
 
       for (const file of files) {
@@ -259,7 +283,11 @@ export default class SynclinePlugin extends Plugin {
       for (const file of files) {
         const uuid = this.settings.uuidMap[file.path];
         if (uuid) {
-          this.addDocOnly(file, uuid);
+          if (isBinaryFile(file)) {
+            this.addBinaryDocOnly(file, uuid);
+          } else {
+            this.addDocOnly(file, uuid);
+          }
         }
       }
 
@@ -471,6 +499,89 @@ export default class SynclinePlugin extends Plugin {
     });
   }
 
+  /** Subscribe to a binary doc by UUID. Handles blob upload/download for non-text files. */
+  addBinaryDocOnly(file: TFile, uuid: string) {
+    if (!this.client) return;
+
+    let initialSyncDone = false;
+
+    // Metadata callback: fires when the CRDT meta document is updated
+    const onMetaUpdate = () => {
+      this.client?.set_meta_path(uuid, file.path);
+      this.client?.set_meta_type(uuid, "binary");
+
+      if (!initialSyncDone) {
+        initialSyncDone = true;
+        // On initial sync: compare local hash with remote hash
+        this.app.vault
+          .readBinary(file)
+          .then(async (data) => {
+            const localHash = await sha256Hex(data);
+            const remoteHash = this.client?.get_blob_hash(uuid);
+
+            if (!remoteHash || remoteHash === "") {
+              // No remote hash yet — upload our data
+              this.client?.set_blob_hash(uuid, localHash);
+              this.client?.send_blob(uuid, new Uint8Array(data));
+            } else if (remoteHash !== localHash) {
+              // Remote has different content — request it
+              this.client?.request_blob(uuid, remoteHash);
+            }
+            // else: hashes match, nothing to do
+          })
+          .catch((error) => {
+            console.error(`[Syncline] Error reading binary file ${file.path}:`, error);
+          });
+      } else {
+        // Subsequent meta updates: check if blob hash changed
+        const remoteHash = this.client?.get_blob_hash(uuid);
+        if (remoteHash && remoteHash !== "") {
+          this.app.vault
+            .readBinary(file)
+            .then(async (data) => {
+              const localHash = await sha256Hex(data);
+              if (remoteHash !== localHash) {
+                // Remote has newer blob — request it
+                this.client?.request_blob(uuid, remoteHash);
+              }
+            })
+            .catch((error) => {
+              console.error(`[Syncline] Error reading binary file ${file.path}:`, error);
+            });
+        }
+      }
+    };
+
+    // Blob callback: fires when MSG_BLOB_UPDATE arrives with binary data
+    const onBlobReceived = (_docId: string, data: Uint8Array) => {
+      const targetPath = this.client?.get_meta_path(uuid) ?? file.path;
+      this.ignoreChanges.add(targetPath);
+
+      const existingFile = this.app.vault.getAbstractFileByPath(targetPath);
+      const promise: Promise<unknown> = existingFile instanceof TFile
+        ? this.app.vault.modifyBinary(existingFile, data.buffer as ArrayBuffer)
+        : this.ensureParentFolders(targetPath).then(() => {
+            return this.app.vault.createBinary(targetPath, data.buffer as ArrayBuffer).then(() => {
+              this.settings.uuidMap[targetPath] = uuid;
+              void this.saveSettings();
+            });
+          });
+
+      promise
+        .then(() => {
+          console.debug(`[Syncline] Wrote binary file ${targetPath} (${data.length} bytes)`);
+        })
+        .catch((error) => {
+          console.error(`[Syncline] Failed to write binary file ${targetPath}:`, error);
+        })
+        .finally(() => {
+          setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
+        });
+    };
+
+    this.client.add_binary_doc(uuid, onMetaUpdate, onBlobReceived);
+  }
+
   /** Register a new file: assign UUID, track it, insert into index, subscribe. */
   addFile(file: TFile) {
     if (!this.client) return;
@@ -478,7 +589,11 @@ export default class SynclinePlugin extends Plugin {
     const uuid = this.getOrCreateUuid(file.path);
     this.knownFiles.add(uuid);
     this.client.index_insert(uuid);
-    this.addDocOnly(file, uuid);
+    if (isBinaryFile(file)) {
+      this.addBinaryDocOnly(file, uuid);
+    } else {
+      this.addDocOnly(file, uuid);
+    }
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
@@ -505,13 +620,35 @@ export default class SynclinePlugin extends Plugin {
   createFileFromRemote(uuid: string) {
     if (!this.client) return;
 
+    // We don't know yet if this is text or binary — use add_doc first,
+    // and once meta.type arrives via CRDT we can decide.
     this.client.add_doc(uuid, () => {
       const path = this.client?.get_meta_path(uuid);
+      const metaType = this.client?.get_meta_type(uuid);
       if (path) {
         // Record the path→uuid mapping now that we know it
         this.settings.uuidMap[path] = uuid;
         void this.saveSettings();
-        void this.onRemoteUpdate(uuid);
+
+        if (metaType === "binary") {
+          // Re-register as binary doc and request blob
+          this.client?.remove_doc(uuid);
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (file instanceof TFile) {
+            this.addBinaryDocOnly(file, uuid);
+          } else {
+            // Create placeholder, then register binary doc
+            void this.ensureParentFolders(path).then(() => {
+              void this.app.vault.createBinary(path, new ArrayBuffer(0)).then((newFile) => {
+                this.addBinaryDocOnly(newFile, uuid);
+              }).catch((error) => {
+                console.error(`[Syncline] Failed to create binary file ${path}:`, error);
+              });
+            });
+          }
+        } else {
+          void this.onRemoteUpdate(uuid);
+        }
       }
     });
   }
@@ -615,37 +752,42 @@ export default class SynclinePlugin extends Plugin {
 
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (!["md", "txt"].includes(file.extension ?? "")) return;
     if (this.ignoreChanges.has(file.path)) return;
     if (!this.client) return;
 
     const uuid = this.settings.uuidMap[file.path];
     if (!uuid) return;
 
-    try {
-      const content = await this.app.vault.read(file);
-
-      // FIX(Issue #6): After the async read, re-check ignoreChanges.
-      // A remote update may have been applied between the debounce
-      // trigger and the actual disk read, making our content stale.
-      if (this.ignoreChanges.has(file.path)) return;
-
-      // FIX(Issue #6): Compare disk content against the current CRDT state.
-      // If they already match, skip the update — this prevents the diff
-      // from generating no-op (or worse, spurious rollback) operations
-      // when the disk content reflects a recently-applied remote update.
-      const crdtContent = this.client.get_text(uuid);
-      if (crdtContent === content) return;
-
-      this.client.update(uuid, content);
-    } catch (error) {
-      console.error("[Syncline] Error syncing:", error);
+    if (isBinaryFile(file)) {
+      // Binary file: read bytes, compute hash, upload if changed
+      try {
+        const data = await this.app.vault.readBinary(file);
+        if (this.ignoreChanges.has(file.path)) return;
+        const hash = await sha256Hex(data);
+        const currentHash = this.client.get_blob_hash(uuid);
+        if (currentHash === hash) return; // unchanged
+        this.client.set_blob_hash(uuid, hash);
+        this.client.set_meta_type(uuid, "binary");
+        this.client.send_blob(uuid, new Uint8Array(data));
+      } catch (error) {
+        console.error(`[Syncline] Error syncing binary file ${file.path}:`, error);
+      }
+    } else {
+      // Text file: existing behavior
+      try {
+        const content = await this.app.vault.read(file);
+        if (this.ignoreChanges.has(file.path)) return;
+        const crdtContent = this.client.get_text(uuid);
+        if (crdtContent === content) return;
+        this.client.update(uuid, content);
+      } catch (error) {
+        console.error("[Syncline] Error syncing:", error);
+      }
     }
   }, 300);
 
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (!["md", "txt"].includes(file.extension ?? "")) return;
     if (this.ignoreChanges.has(file.path)) return;
 
     this.addFile(file);
@@ -676,18 +818,18 @@ export default class SynclinePlugin extends Plugin {
     if (uuid) {
       // Keep the same UUID — only update the path mapping and broadcast via set_meta_path
       delete this.settings.uuidMap[oldPath];
-      if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
+      if (file instanceof TFile) {
         this.settings.uuidMap[file.path] = uuid;
         // This CRDT update broadcasts the new meta.path to all other clients
         this.client?.set_meta_path(uuid, file.path);
       } else {
-        // Renamed to a non-synced extension — remove from sync
+        // Renamed to a non-file — remove from sync
         this.client?.index_remove(uuid);
         this.client?.remove_doc(uuid);
         this.knownFiles.delete(uuid);
       }
-    } else if (file instanceof TFile && ["md", "txt"].includes(file.extension ?? "")) {
-      // File was not previously tracked (e.g. renamed from an ignored extension)
+    } else if (file instanceof TFile) {
+      // File was not previously tracked
       this.addFile(file);
     }
 

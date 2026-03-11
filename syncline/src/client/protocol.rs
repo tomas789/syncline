@@ -6,6 +6,8 @@ pub enum MsgType {
     SyncStep1 = 0x00,
     SyncStep2 = 0x01,
     Update = 0x02,
+    BlobUpdate = 0x04,
+    BlobRequest = 0x05,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -16,6 +18,8 @@ impl TryFrom<u8> for MsgType {
             0x00 => Ok(MsgType::SyncStep1),
             0x01 => Ok(MsgType::SyncStep2),
             0x02 => Ok(MsgType::Update),
+            0x04 => Ok(MsgType::BlobUpdate),
+            0x05 => Ok(MsgType::BlobRequest),
             _ => Err(anyhow!("Invalid message type: {}", value)),
         }
     }
@@ -85,6 +89,8 @@ mod tests {
         assert_eq!(MsgType::try_from(0x00).unwrap(), MsgType::SyncStep1);
         assert_eq!(MsgType::try_from(0x01).unwrap(), MsgType::SyncStep2);
         assert_eq!(MsgType::try_from(0x02).unwrap(), MsgType::Update);
+        assert_eq!(MsgType::try_from(0x04).unwrap(), MsgType::BlobUpdate);
+        assert_eq!(MsgType::try_from(0x05).unwrap(), MsgType::BlobRequest);
         assert!(MsgType::try_from(0x03).is_err());
         assert!(MsgType::try_from(0xFF).is_err());
     }
