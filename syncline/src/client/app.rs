@@ -87,12 +87,6 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
         // Track which UUIDs we have subscribed to via SyncStep1.
         let mut subscribed_docs: HashSet<String> = HashSet::new();
-        // Snapshot of the server's __index__ at first connection. Used to prevent
-        // false conflict detection: only UUIDs that were on the server BEFORE we
-        // connected can be "server truth" vs our freshly-created docs. UUIDs that
-        // arrive later (uploaded by other clients after we connected) should be
-        // handled by those clients, not by us.
-        let mut initial_server_uuids: Option<HashSet<String>> = None;
 
         // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
         if let Ok(uuids) = local_state.list_doc_ids() {
@@ -183,15 +177,7 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                             .filter(|s| !s.is_empty())
                                             .collect();
 
-                                        // Record the server-side UUIDs at first connection.
-                                        // This snapshot is used by conflict detection below to
-                                        // distinguish "server had this before I connected" (conflict)
-                                        // from "another client added this after I connected" (no conflict).
-                                        if initial_server_uuids.is_none() {
-                                            initial_server_uuids = Some(
-                                                new_index_uuids.iter().map(|s| s.to_string()).collect()
-                                            );
-                                        }
+
 
                                         // Detect UUID removals from index → delete local files
                                         let mut to_remove = Vec::new();
@@ -296,26 +282,12 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
                             // 4. Check for path collision with a freshly-created local doc
                             {
-                                let collision_local_uuid = local_state.path_map
-                                    .get_uuid(&target_rel_path)
-                                    .and_then(|u| {
-                                        // Only conflict-detect if:
-                                        // - Different UUID from ours
-                                        // - Our local UUID was freshly created (no prior .bin)
-                                        // - The incoming UUID was on the server BEFORE we
-                                        //   connected (initial snapshot). UUIDs that appeared
-                                        //   after we connected are handled by the other client.
-                                        if u != doc_id
-                                            && freshly_created.contains(u)
-                                            && initial_server_uuids
-                                                .as_ref()
-                                                .map_or(false, |s| s.contains(&doc_id))
-                                        {
-                                            Some(u.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    });
+                                let collision_local_uuid = detect_path_collision(
+                                    &local_state.path_map,
+                                    &doc_id,
+                                    &target_rel_path,
+                                    &freshly_created,
+                                );
 
                                 if let Some(local_uuid) = collision_local_uuid {
                                     freshly_created.remove(&local_uuid);
@@ -717,4 +689,134 @@ async fn resolve_path_conflict(
     }
 
     Ok(())
+}
+
+/// Check if an incoming document (identified by `incoming_uuid` wanting
+/// `incoming_path`) collides with a locally-created document.
+///
+/// Returns `Some(local_uuid)` if a freshly-created local doc occupies
+/// `incoming_path` and should be conflict-resolved.
+///
+/// Uses path_map collision detection directly: any incoming doc whose
+/// path collides with a freshly-created local doc triggers resolution,
+/// regardless of when the doc appeared on the server. This fixes a race
+/// condition where both clients connect before either uploads (found by
+/// TLA+ formal verification, Phase 6).
+pub(crate) fn detect_path_collision(
+    path_map: &crate::client::state::PathMap,
+    incoming_uuid: &str,
+    incoming_path: &str,
+    freshly_created: &HashSet<String>,
+) -> Option<String> {
+    path_map
+        .get_uuid(incoming_path)
+        .and_then(|local_uuid| {
+            if local_uuid != incoming_uuid
+                && freshly_created.contains(local_uuid)
+            {
+                Some(local_uuid.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Reproduces the bug found by TLA+ Phase 6 (NoPathDuplication violation).
+    ///
+    /// Scenario:
+    /// 1. Client A creates file.md offline → UUID = "uuid-a"
+    /// 2. Client B creates file.md offline → UUID = "uuid-b"
+    /// 3. Both clients connect simultaneously (before either uploads)
+    ///    → initial_server_uuids for BOTH clients is empty
+    /// 4. Client A uploads uuid-a first → server registers it
+    /// 5. Client B discovers uuid-a, syncs it (path = "file.md")
+    /// 6. Client B receives uuid-a at "file.md" — collision check:
+    ///    - uuid-b is at "file.md" in B's path_map ✓
+    ///    - uuid-b is in freshly_created ✓
+    ///    - uuid-a in initial_server_uuids? NO (it was empty!) ✗
+    ///    → Collision NOT detected → BUG!
+    #[test]
+    fn test_path_collision_race_both_connect_before_upload() {
+        let dir = tempdir().unwrap();
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
+
+        // Simulate: Client B has uuid-b at "file.md" in its path_map
+        // (created offline, freshly created)
+        let mut path_map = state.path_map;
+        path_map.insert("file.md".to_string(), "uuid-b".to_string());
+
+        let mut freshly_created = HashSet::new();
+        freshly_created.insert("uuid-b".to_string());
+
+        // Client B receives uuid-a with meta.path = "file.md"
+        // Both clients connected before either uploaded, so
+        // initial_server_uuids would be empty — but now the fix
+        // doesn't depend on it at all.
+        let collision = detect_path_collision(
+            &path_map,
+            "uuid-a",       // incoming UUID from server
+            "file.md",      // incoming path
+            &freshly_created,
+        );
+
+        // FIXED: The collision IS now detected because we check
+        // path_map directly, regardless of initial_server_uuids.
+        assert!(
+            collision.is_some(),
+            "Collision should be detected: uuid-b (local, freshly created) \
+             and uuid-a (incoming) both want 'file.md'."
+        );
+        assert_eq!(collision.unwrap(), "uuid-b");
+    }
+
+    /// Verify that collision IS detected when initial_server_uuids
+    /// contains the incoming UUID (the "working" case).
+    #[test]
+    fn test_path_collision_detected_when_uuid_in_initial_snapshot() {
+        let dir = tempdir().unwrap();
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
+
+        let mut path_map = state.path_map;
+        path_map.insert("file.md".to_string(), "uuid-b".to_string());
+
+        let mut freshly_created = HashSet::new();
+        freshly_created.insert("uuid-b".to_string());
+
+        let collision = detect_path_collision(
+            &path_map,
+            "uuid-a",
+            "file.md",
+            &freshly_created,
+        );
+
+        assert!(collision.is_some(), "Collision should be detected");
+        assert_eq!(collision.unwrap(), "uuid-b");
+    }
+
+    /// No collision when the incoming UUID matches the local UUID at that path.
+    #[test]
+    fn test_no_collision_same_uuid() {
+        let dir = tempdir().unwrap();
+        let state = LocalState::new(dir.path(), Some("test-client".to_string()));
+
+        let mut path_map = state.path_map;
+        path_map.insert("file.md".to_string(), "uuid-a".to_string());
+
+        let mut freshly_created = HashSet::new();
+        freshly_created.insert("uuid-a".to_string());
+
+        let collision = detect_path_collision(
+            &path_map,
+            "uuid-a",  // same UUID — this is our own doc coming back
+            "file.md",
+            &freshly_created,
+        );
+
+        assert!(collision.is_none(), "No collision when UUIDs match");
+    }
 }
