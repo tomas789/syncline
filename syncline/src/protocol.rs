@@ -1,6 +1,11 @@
 pub const MSG_SYNC_STEP_1: u8 = 0;
 pub const MSG_SYNC_STEP_2: u8 = 1;
 pub const MSG_UPDATE: u8 = 2;
+pub const MSG_BLOB_UPDATE: u8 = 4;
+pub const MSG_BLOB_REQUEST: u8 = 5;
+
+/// Maximum blob size in bytes (50 MB).
+pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;
 
 pub fn encode_message(msg_type: u8, doc_id: &str, payload: &[u8]) -> Vec<u8> {
     let doc_id_bytes = doc_id.as_bytes();
@@ -65,5 +70,28 @@ mod tests {
         let mut encoded = vec![MSG_UPDATE, 0, 1];
         encoded.push(0xff); // invalid UTF-8 byte
         assert!(decode_message(&encoded).is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_blob_update() {
+        let blob_data = vec![0x89, 0x50, 0x4e, 0x47]; // PNG header bytes
+        let encoded = encode_message(MSG_BLOB_UPDATE, "image.png", &blob_data);
+
+        let (msg_type, doc_id, payload) = decode_message(&encoded).unwrap();
+        assert_eq!(msg_type, MSG_BLOB_UPDATE);
+        assert_eq!(doc_id, "image.png");
+        assert_eq!(payload, blob_data.as_slice());
+    }
+
+    #[test]
+    fn test_encode_decode_blob_request() {
+        // 32-byte SHA256 hash as payload
+        let hash_bytes = [0xABu8; 32];
+        let encoded = encode_message(MSG_BLOB_REQUEST, "image.png", &hash_bytes);
+
+        let (msg_type, doc_id, payload) = decode_message(&encoded).unwrap();
+        assert_eq!(msg_type, MSG_BLOB_REQUEST);
+        assert_eq!(doc_id, "image.png");
+        assert_eq!(payload, &hash_bytes);
     }
 }

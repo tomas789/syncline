@@ -18,7 +18,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use yrs::{Doc, GetString, StateVector, Text, Transact, Update, updates::decoder::Decode};
 
 use crate::protocol::{
-    MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, decode_message, encode_message,
+    MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
+    decode_message, encode_message,
 };
 
 type ChannelMap = Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>;
@@ -65,8 +66,10 @@ async fn update_index_for_new_doc(state: &AppState, doc_id: &str) {
     // Broadcast delta to currently-connected clients subscribed to __index__.
     let channels = state.channels.read().await;
     if let Some(tx) = channels.get("__index__") {
+        // Pre-frame the delta so the forwarding task can pass it through unchanged.
+        let msg = encode_message(MSG_UPDATE, "__index__", &delta);
         // uuid::Uuid::nil() means "no sender", so every subscriber receives this.
-        let _ = tx.send((delta, uuid::Uuid::nil()));
+        let _ = tx.send((msg, uuid::Uuid::nil()));
     }
 }
 
@@ -176,14 +179,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         _ = tx_fwd.closed() => break,
                                         res = rx.recv() => {
                                             match res {
-                                                Ok((payload, sender_id)) => {
+                                                Ok((framed_msg, sender_id)) => {
                                                     if sender_id == connection_id {
                                                         continue;
                                                     }
-                                                    tracing::debug!("Forwarding broadcast update for doc: {} with payload len: {}", doc_id_str, payload.len());
-                                                    let msg =
-                                                        encode_message(MSG_UPDATE, &doc_id_str, &payload);
-                                                    if tx_fwd.send(msg).is_err() {
+                                                    tracing::debug!("Forwarding broadcast for doc: {} with {} bytes", doc_id_str, framed_msg.len());
+                                                    // Messages are already framed (encode_message
+                                                    // was called before broadcasting).
+                                                    if tx_fwd.send(framed_msg).is_err() {
                                                         // Outgoing channel closed — connection gone.
                                                         break;
                                                     }
@@ -240,11 +243,77 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             // Auto-create the channel if it doesn't exist yet. This handles
                             // the race where a client sends MSG_UPDATE before any SyncStep1
                             // has been received for this doc_id.
+                            let msg = encode_message(MSG_UPDATE, doc_id, payload);
                             let mut channels = state_clone.channels.write().await;
                             let tx = channels
                                 .entry(doc_id.to_string())
                                 .or_insert_with(|| broadcast::channel(65_536).0);
-                            let _ = tx.send((payload.to_vec(), connection_id));
+                            let _ = tx.send((msg, connection_id));
+                        }
+                        MSG_BLOB_UPDATE => {
+                            // Binary blob upload: compute SHA256 hash, store in blobs
+                            // table, and relay the raw blob to all other subscribers.
+                            use sha2::{Digest, Sha256};
+
+                            if payload.len() > crate::protocol::MAX_BLOB_SIZE {
+                                tracing::warn!(
+                                    "Rejected blob for doc {} — {} bytes exceeds {} byte limit",
+                                    doc_id,
+                                    payload.len(),
+                                    crate::protocol::MAX_BLOB_SIZE
+                                );
+                            } else {
+                                let hash = format!("{:x}", Sha256::digest(payload));
+                                tracing::info!(
+                                    "Received BLOB_UPDATE for doc {} — hash={} size={}",
+                                    doc_id,
+                                    hash,
+                                    payload.len()
+                                );
+
+                                // Content-addressable store: INSERT OR IGNORE
+                                if let Err(e) =
+                                    state_clone.db.save_blob(&hash, payload).await
+                                {
+                                    tracing::error!("DB blob save error: {}", e);
+                                }
+
+                                // Relay raw blob to all other subscribers of this doc.
+                                // The message is pre-framed with encode_message so the
+                                // forwarding task passes it through unchanged.
+                                let msg =
+                                    encode_message(MSG_BLOB_UPDATE, doc_id, payload);
+                                let channels = state_clone.channels.read().await;
+                                if let Some(tx) = channels.get(doc_id) {
+                                    let _ = tx.send((msg, connection_id));
+                                }
+                            }
+                        }
+                        MSG_BLOB_REQUEST => {
+                            // Client requests a blob by its hex-encoded SHA256 hash.
+                            let hash = std::str::from_utf8(payload).unwrap_or("");
+                            tracing::info!(
+                                "Received BLOB_REQUEST for doc {} — hash={}",
+                                doc_id,
+                                hash
+                            );
+                            match state_clone.db.load_blob(hash).await {
+                                Ok(Some(blob_data)) => {
+                                    let resp =
+                                        encode_message(MSG_BLOB_UPDATE, doc_id, &blob_data);
+                                    let _ = tx_socket_clone.send(resp);
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "Blob not found: hash={} for doc {}",
+                                        hash,
+                                        doc_id
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("DB blob load error: {}", e);
+                                }
+                            }
                         }
                         _ => {}
                     }

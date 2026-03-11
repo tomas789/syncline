@@ -5244,6 +5244,7 @@ dependencies = [
  "notify-debouncer-mini",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
