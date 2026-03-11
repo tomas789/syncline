@@ -1,35 +1,39 @@
-# 🧠 How It Works Under the Hood
+# How It Works Under the Hood
 
-Syncline isn't just a file copier—it has a deep understanding of text changes. It does this through **CRDTs (Conflict-free Replicated Data Types)**, specifically by using the fantastic `yrs` (Yjs for Rust) library.
+Syncline uses **CRDTs (Conflict-free Replicated Data Types)** for text files and a separate content-addressed blob system for binary files. The CRDT implementation comes from `yrs`, the Rust port of the Yjs library.
 
-## The Problem with Sync
+## The Problem with File-Level Sync
 
-Usually, syncing systems like Dropbox or Nextcloud work on the _file level_. If I change `line 1` on my phone, and you change `line 10` on your PC, and we both sync... the system throws its hands up. "Conflict! Choose which file to keep!" This happens because it just sees two different files, and it doesn't know what you actually meant.
+Most sync tools — Dropbox, Nextcloud, iCloud — work on whole files. If you change line 1 on your phone and I change line 10 on my laptop, the system sees two different files and gives up. "Conflict! Choose which one to keep!" It has no idea what either of us actually did.
 
-## The CRDT Solution
+This is annoying even when you're online. When you're offline for a few days, it's a disaster.
 
-Instead of syncing the whole file, Syncline syncs _intent_.
-Every time you take an action—like pressing "A" or deleting "B" at index 5—that action is given a locally unique ID.
-When the server and client connect, they don't say "Here's my version of the file." They say, "Here's a mathematical vector of exactly which keystrokes I know about."
+## How CRDTs Fix This
 
-1. **State Vectors**: The server and client compare notes, realizing that the server knows about your friend's edits, and the client knows about your offline edits.
-2. **Missing Updates**: They trade only the exact modifications each is missing.
-3. **Deterministic Merge**: Due to the math of CRDTs, both the server and the client can take those independent edits, toss them into a blender, and end up with the _exact same document_ every time, guaranteed.
+Instead of syncing entire files, Syncline syncs individual edit operations.
 
-No merge conflicts, no weird duplicated `_Conflict_Copy` files, just seamless syncing magic.
+Every keystroke — inserting "A" at position 5, deleting "B" at position 12 — gets a globally unique ID based on the client that created it and a local clock. These IDs define a partial order over all edits across all devices, and the CRDT merge function is designed so that applying the same set of edits in any order produces the same final document. Always.
 
-## Real-Time & WebSockets
+When a client connects to the server, the exchange looks like this:
 
-When you're online, all of this happens basically instantly over WebSockets. The second you tap a letter on your phone, an incredibly tiny binary update is shot to the server, and the server broadcasts that letter out to your desktop where it magically pops up right within Obsidian.
+1. **State vectors.** Both sides compare what they know. The client says "I have updates 1–47 from device A and 1–23 from device B." The server checks what it has.
+2. **Missing updates.** They trade only the edits each side is missing. No full file transfer.
+3. **Deterministic merge.** Both the server and the client fold the new edits into their local document. The math guarantees identical results regardless of arrival order.
+
+No merge conflicts. No `_Conflict_Copy` files.
+
+## Real-Time Sync via WebSockets
+
+When you're online, this all happens within milliseconds. You type a letter on your phone, a tiny binary update goes to the server over a WebSocket connection, and the server broadcasts it to every other connected client. It shows up in Obsidian on your laptop almost instantly.
 
 ## Binary File Synchronization
 
-Not everything is text. Images, PDFs, and attachments are **binary files** that can't be merged character-by-character like text. Syncline handles these with a different strategy:
+Text files get character-level merging. Binary files — images, PDFs, attachments — obviously can't be merged that way. Syncline handles them differently:
 
-1. **Content-Addressable Storage**: Each binary file is identified by its **SHA-256 hash**. The server stores blobs in a content-addressable `blobs` table — if two files have the same content, they share the same blob.
+**Content-addressable storage.** Each binary file is identified by its SHA-256 hash. The server stores blobs in a `blobs` table keyed by hash, so duplicate content is only stored once.
 
-2. **Metadata CRDTs**: Binary files still use a CRDT document, but only for **metadata** (`meta.path`, `meta.type`, `meta.blob_hash`). The actual binary content is transferred via separate `MSG_BLOB_UPDATE` messages, not through the CRDT.
+**Metadata CRDTs.** Binary files still have a CRDT document, but it only tracks metadata (`meta.path`, `meta.type`, `meta.blob_hash`). The actual binary content is transferred via separate `MSG_BLOB_UPDATE` messages, not through the CRDT.
 
-3. **Change Detection**: When a binary file is modified, the client computes its new SHA-256 hash and compares it with the hash stored in the CRDT. If they differ, the new blob is uploaded to the server and broadcast to all other clients.
+**Change detection.** When a binary file changes on disk, the client computes its new SHA-256 hash and compares it against the hash stored in the CRDT. Different hash means new content, which gets uploaded to the server and pushed to all other clients.
 
-4. **Conflict Resolution**: Binary files use **Last-Write-Wins (LWW)** based on the CRDT timestamp of the `blob_hash` field. The latest writer's content wins. This is simpler than text merging but appropriate for binary data where character-level merging isn't possible.
+**Conflict resolution.** Binary files use last-write-wins (LWW) based on the CRDT timestamp of the `blob_hash` field. The most recent writer's content wins. Simpler than text merging, but appropriate — you can't character-merge a JPEG.

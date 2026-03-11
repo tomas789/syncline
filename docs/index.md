@@ -2,15 +2,15 @@
   <img src="logo-with-name.jpg" alt="Syncline — Self-hosted Obsidian Sync" width="400">
 </p>
 
-# 🌊 Introduction & Usage
+# Introduction & Usage
 
-Hey there! Built a cool vault in Obsidian and want to keep it synced everywhere completely on your own terms? Enter **Syncline**.
+Syncline is a self-hosted sync system for Obsidian vaults. You run the server on your own hardware, install the Obsidian plugin, and your notes stay in sync across all your devices. No subscriptions, no third-party cloud.
 
-Syncline is a privacy-first, self-hosted synchronization system that magically keeps your Obsidian notes in perfect harmony across all your devices, even if you've been offline for weeks taking a digital detox. No merge conflicts, no lost data, just your thoughts living rent-free across your entire ecosystem.
+Under the hood it uses CRDTs (Conflict-free Replicated Data Types) to merge edits at the character level. That means you can edit the same note on two devices while both are offline for days, and when they reconnect the edits merge cleanly. No conflict dialogs, no duplicate files.
 
-## ⚖️ Why Syncline?
+## Why Syncline?
 
-Most sync solutions for Obsidian ask you to trust a third party with your notes. Syncline is different:
+Every other sync option either costs money monthly or can't merge concurrent text edits. Here's the short version:
 
 |                           | Syncline | Obsidian Sync | iCloud / Dropbox |
 | ------------------------- | -------- | ------------- | ---------------- |
@@ -22,49 +22,54 @@ Most sync solutions for Obsidian ask you to trust a third party with your notes.
 | **Single-file database**  | ✅       | ❌            | ❌               |
 | **Subscription required** | ❌       | ✅            | ✅               |
 
-## ✨ Key Benefits
+## What You Get
 
-- **🔒 Privacy-First**: Your notes never leave your infrastructure. The Syncline server runs on hardware you control. No telemetry, no analytics, no third-party access.
-- **📁 Single-File Server Storage**: All vault data is stored in a single SQLite database file on your server. Backup is as simple as copying one file.
-- **⚡ Fast & Lightweight**: Built in Rust, the server is extremely efficient. It uses WebSockets for real-time communication, meaning changes appear on your other devices within milliseconds.
-- **✈️ True Offline Mode**: Work without an internet connection for hours, days, or weeks. When you reconnect, Syncline automatically merges all changes.
-- **🤝 No Conflict Dialogs — Ever**: Syncline uses CRDTs (Conflict-free Replicated Data Types). When two devices edit the same note simultaneously, the changes are merged mathematically.
-- **🖼️ Binary File Synchronization**: Images, PDFs, attachments — all synchronized using content-addressed storage.
+**Privacy.** Notes never leave your infrastructure. The server runs on whatever you own — a home server, a $5/month VPS, a Raspberry Pi. No telemetry, no analytics, no phoning home.
+
+**A single database file.** The entire vault history sits in one SQLite file (`syncline.db`). Backups? Copy that file. That's it.
+
+**Speed.** The server is written in Rust and communicates over WebSockets. A keystroke on your phone shows up on your laptop in under a second.
+
+**Real offline support.** Not the "kinda works if you reconnect within an hour" kind. Work offline for weeks. Syncline merges everything when you come back.
+
+**Character-level merging.** Same technology as Notion and Figma. Two devices edit the same paragraph simultaneously, and the result contains both edits. No human intervention needed.
+
+**Binary files too.** Images, PDFs, attachments — all synced. Concurrent edits to a binary file preserve both versions under distinct file names.
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Step 1: Run the Syncline Server
 
-The easiest way to run the server on your PC or Mac is to use the native **Syncline Desktop App**. It runs silently in your system tray, manages the database for you, and securely provides the connection URLs you need.
+The easiest way on a Mac or Windows machine is the **Syncline Desktop App**. It sits in your system tray, handles the database, and shows you the connection URL.
 
-**Download the latest installer from the [Releases Page](https://github.com/tomas789/syncline/releases):**
+**Download from the [Releases Page](https://github.com/tomas789/syncline/releases):**
 
-- **Mac:** Download the `.dmg`
-- **Windows:** Download the `.msi` or `.nsis.zip`
+- **Mac:** `.dmg`
+- **Windows:** `.msi` or `.nsis.zip`
 
-Once installed, it will automatically start with your computer. Just click the Syncline menu bar icon and select **Start Server**!
+It auto-starts with your computer. Click the Syncline menu bar icon, select **Start Server**, and you're up.
 
 ---
 
-**Advanced/CLI Users:**
-If you prefer to run the standalone headless CLI (e.g., on a headless Linux VPS or Raspberry Pi):
+**Headless / CLI setup:**
+For a Linux VPS or Raspberry Pi where there's no desktop environment:
 
 ```bash
-# Download the unified CLI binary from Releases, or build from source:
+# Download the CLI binary from Releases, or build from source:
 syncline server --port 3030 --db-path ./syncline.db
 ```
 
-**Run the CLI Client:**
-If you prefer to run the standalone headless CLI client rather than using the Obsidian plugin:
+**CLI Client:**
+If you don't want to use the Obsidian plugin (maybe you're syncing a vault to a backup machine), there's a standalone headless client:
 
 ```bash
 # Point the client to your vault folder and the server URL
 syncline sync -f /path/to/my/vault -u ws://127.0.0.1:3030/sync
 ```
 
-Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) and feature rich text output with customizable log levels (`--log-level trace|debug|info|warn|error`).
+Both binaries are cross-platform (Linux, macOS, Windows) and have configurable log levels (`--log-level trace|debug|info|warn|error`).
 
 ### Step 2: Install the Plugin
 
@@ -72,32 +77,34 @@ Both the server and CLI client are fully cross-platform (Linux, macOS, Windows) 
 
 1. Open Obsidian → Settings → Community Plugins
 2. Search for **Syncline**
-3. Click Install, then Enable
+3. Install, then Enable
 
-**Option B — Manual Installation**
+**Option B — Manual**
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/tomas789/syncline/releases)
 2. Copy them to `<your-vault>/.obsidian/plugins/syncline-obsidian/`
-3. Reload Obsidian and enable the plugin in Settings → Community Plugins
+3. Reload Obsidian, enable in Settings → Community Plugins
 
 ### Step 3: Connect
 
-1. Open Settings → Syncline
+1. Settings → Syncline
 2. Enter your server URL (e.g. `ws://192.168.1.100:3030/sync` or `wss://sync.yourdomain.com/sync`)
 3. Click **Connect**
 
-Your vault will begin syncing immediately. Install the plugin on your other devices and point them to the same server.
+Syncing starts immediately. Install the plugin on your other devices and point them at the same server.
 
 ---
 
-## 🧐 What is this wizardry? (Layman's Explanation)
+## How Does It Actually Work?
 
-Imagine you and your friend are both editing the same Google Doc, but neither of you has internet access. You add a new paragraph, your friend deletes a sentence. When you both get back online, instead of shouting "FILE CONFLICT! CHOOSE WHICH ONE TO KEEP!", a magical arbiter looks at exactly _what_ you pressed and weaves both your changes together perfectly.
+Think of it this way. Regular file sync (Dropbox, iCloud, Nextcloud) works at the file level. You change a file, I change the same file, and the system panics because it's looking at two different blobs of bytes. "Conflict! Pick one!"
 
-That's what Syncline does for your Markdown files. Under the hood, it uses something called **CRDTs (Conflict-free Replicated Data Types)**.
+Syncline doesn't sync files. It syncs individual edits.
 
-When you type a letter, Syncline doesn't just save the whole file; it remembers that specific keystroke and where it lives. The server acts as a giant mailroom, collecting these extremely specific, tiny updates. When devices connect, they just trade the updates they missed. The math behind the CRDT guarantees that no matter what order the updates arrive in, the final document will look exactly the same on every device. It's like Git, but completely automatic and down to the individual character level!
+When you type a letter, Syncline records that specific keystroke and its position. The server collects these tiny updates from all connected devices. When a client reconnects, it sends its state vector — basically a list of "I've seen edits 1 through 47 from device A, and 1 through 23 from device B." The server responds with exactly the edits the client is missing. Because CRDTs guarantee that order of application doesn't matter, the documents converge to the same state on every device, regardless of what order the updates arrived in.
+
+It's like Git, but automatic, and it tracks individual characters instead of lines.
 
 ---
 
-Read more about [How It Works](how-it-works.md) under the hood. 🚀
+Read more about [how it works](how-it-works.md) under the hood.

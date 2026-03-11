@@ -1,5 +1,5 @@
-site_name: Syncline
-site_description: Privacy-first, self-hosted synchronization system for Obsidian vaults.
+site_name: Syncline (live sync)
+site_description: A privacy-first, self-hosted synchronization system for Obsidian vaults. Powered by Rust and CRDTs for seamless, conflict-free merging across devices, even after extended offline periods.
 theme:
   name: material
   logo: logo.jpg

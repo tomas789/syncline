@@ -1,9 +1,9 @@
-# 🔐 A Note on Encryption
+# A Note on Encryption
 
-Right now, Syncline protects your data in transit by relying on Secure WebSockets (`wss://`). This means anyone snooping on your network traffic just sees encrypted gibberish. That’s standard internet security and should be your absolute minimum for any self-hosted service exposed to the world.
+Syncline protects data in transit through Secure WebSockets (`wss://`). Traffic between clients and the server is encrypted, which is the baseline you should expect from anything exposed to the internet.
 
-**However**, as of now, data is _not_ End-to-End Encrypted (E2EE) at rest on the server. The server stores the raw CRDT updates in the SQLite database. That means, mathematically, if your server gets compromised or a hostile actor gains root access to your machine, the attacker can piece together your notes and read everything.
+**Data at rest is not encrypted.** The server stores raw CRDT updates in the SQLite database. If someone gets root access to your server, they can reconstruct your notes and read everything.
 
-If you are running this on a VPS you don't fully control, or if you are storing your deepest dark secrets and banking passwords in plain text Markdown... keep this reality in mind! We are huge proponents of privacy, and it is the main reason this tool is self-hosted.
+If you're running this on a VPS you don't fully control, keep that in mind. The whole point of self-hosting is that *you* control the machine. If you can't trust the machine, the privacy guarantees don't hold.
 
-(Check out our [Future Work](future-work.md) for plans on adding proper E2EE.)
+End-to-end encryption is on the roadmap. See the [future work](future-work.md) page for more on that.
