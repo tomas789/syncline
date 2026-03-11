@@ -29,9 +29,22 @@ jobs:
   build-and-release:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
-    runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            binary_name: syncline-linux-amd64
+            build_plugin: true
+          - platform: macos-latest
+            binary_name: syncline-macos-amd64
+            build_plugin: false
+          - platform: windows-latest
+            binary_name: syncline-windows-amd64.exe
+            build_plugin: false
+    runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,26 +55,40 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
+        if: matrix.build_plugin
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Setup Node.js
+        if: matrix.build_plugin
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Build Rust Binaries (Linux amd64)
+      - name: Build Rust binary
         run: cargo build --release -p syncline
 
       - name: Build Obsidian Plugin
+        if: matrix.build_plugin
         run: |
           cd obsidian-plugin
           npm install
           npm run build
 
-      - name: Prepare artifacts
+      - name: Prepare artifacts (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir artifacts
-          cp target/release/syncline artifacts/syncline-linux-amd64
+          cp target/release/syncline artifacts/${{ matrix.binary_name }}
+
+      - name: Prepare artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir artifacts
+          copy target\release\syncline.exe artifacts\${{ matrix.binary_name }}
+
+      - name: Prepare plugin artifacts
+        if: matrix.build_plugin
+        run: |
           cp obsidian-plugin/main.js artifacts/main.js
           cp manifest.json artifacts/manifest.json
           cp obsidian-plugin/styles.css artifacts/styles.css
@@ -70,35 +97,41 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
-          files: |
-            artifacts/syncline-linux-amd64
-            artifacts/main.js
-            artifacts/manifest.json
-            artifacts/styles.css
+          files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   tauri-release:
-    needs: [release-please, build-and-release]
+    needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, windows-latest]
+        platform: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-      - name: setup node
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: install Rust stable
+
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-      - name: build tauri app
+
+      - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
+          tagName: ${{ needs.release-please.outputs.tag_name }}
