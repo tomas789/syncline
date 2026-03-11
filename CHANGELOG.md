@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/tomas789/syncline/compare/v0.5.0...v0.5.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* prevent stale file content from deleting recently typed characters ([72d5327](https://github.com/tomas789/syncline/commit/72d532706c791f5652d18514c61fd61edc5f26c8))
+
 ## [0.5.0](https://github.com/tomas789/syncline/compare/v0.4.1...v0.5.0) (2026-03-02)
 
 
