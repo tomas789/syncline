@@ -1,5 +1,3 @@
-import { join } from 'path';
-
 export const config = {
     runner: 'local',
     autoCompileOpts: {
@@ -15,8 +13,8 @@ export const config = {
     capabilities: [{
         browserName: 'obsidian',
         'wdio:obsidianOptions': {
-            plugins: [join(__dirname, '../obsidian-plugin')],
-            vault: join(__dirname, 'test-vault')
+            plugins: [`${__dirname}/../obsidian-plugin`],
+            vault: `${__dirname}/test-vault`
         }
     }],
     logLevel: 'info',
