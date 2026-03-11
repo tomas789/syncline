@@ -98,14 +98,14 @@ export default class SynclinePlugin extends Plugin {
       cls: "status-icon disconnected",
     });
     this.statusText = this.statusBarItem.createDiv({
-      text: "Syncline: Disconnected",
+      text: "Syncline: disconnected",
     });
 
     this.statusBarItem.onClickEvent(() => {
       this.showStatusDetails();
     });
 
-    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline: Disconnected", () => {
+    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline: disconnected", () => {
       this.showStatusDetails();
     });
     this.ribbonIconEl.addClass("syncline-ribbon", "disconnected");
@@ -173,10 +173,10 @@ export default class SynclinePlugin extends Plugin {
     this.statusIcon.className = `status-icon ${status}`;
 
     const statusTexts: Record<SyncStatus, string> = {
-      synced: "Syncline: Synced",
-      syncing: "Syncline: Syncing...",
-      error: "Syncline: Error",
-      disconnected: "Syncline: Disconnected",
+      synced: "Syncline: synced",
+      syncing: "Syncline: syncing…",
+      error: "Syncline: error",
+      disconnected: "Syncline: disconnected",
     };
 
     const newText = text || statusTexts[status];
@@ -218,7 +218,7 @@ export default class SynclinePlugin extends Plugin {
     }
 
     try {
-      this.updateStatus("syncing", "Syncline: Connecting...");
+      this.updateStatus("syncing", "Syncline: connecting…");
       console.debug("[Syncline] Connecting to:", this.settings.serverUrl);
 
       const wasmMod = await initWasm();
@@ -313,10 +313,10 @@ export default class SynclinePlugin extends Plugin {
         ticksDisconnected = 0;
         this.reconnectAttempts = 0;
         const count = this.client.doc_count();
-        this.updateStatus("synced", `Syncline: ${count} files`);
+        this.updateStatus("synced", `Syncline: ${count} file${count === 1 ? '' : 's'}`);
       } else {
         if (wasConnected) {
-          this.updateStatus("error", "Syncline: Connection lost");
+          this.updateStatus("error", "Syncline: connection lost");
           wasConnected = false;
           ticksDisconnected = 0;
           this.scheduleReconnect();
@@ -324,10 +324,10 @@ export default class SynclinePlugin extends Plugin {
           ticksDisconnected++;
           if (ticksDisconnected > 5 && this.reconnectTimeout === null) {
             console.warn("[Syncline] Connection timed out after 5s");
-            this.updateStatus("error", "Syncline: Connection failed");
+            this.updateStatus("error", "Syncline: connection failed");
             this.scheduleReconnect();
           } else if (this.syncStatus !== "syncing" && this.syncStatus !== "error") {
-            this.updateStatus("syncing", "Syncline: Connecting...");
+            this.updateStatus("syncing", "Syncline: connecting…");
           }
         }
       }
