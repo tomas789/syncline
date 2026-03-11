@@ -1,7 +1,10 @@
 use crate::client::diff::apply_diff_to_yrs;
 use crate::client::network::SynclineClient;
 use crate::client::protocol::{Message, MsgType};
-use crate::client::state::{read_meta_path, write_meta_path, LocalState};
+use crate::client::state::{
+    is_binary_file, read_meta_blob_hash, read_meta_path, read_meta_type, sha256_hash,
+    write_meta_blob_hash, write_meta_path, write_meta_type, BlobChange, LocalState,
+};
 use crate::client::storage::{load_doc, save_doc};
 use crate::client::watcher::DebouncedWatcher;
 use colored::Colorize;
@@ -42,18 +45,19 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
     // This ensures local state is fully consistent (disk → CRDT) before any
     // network activity begins. The `freshly_created` set tracks UUIDs that
     // had no prior `.bin` state — used later for path-collision conflict detection.
-    let (initial_offline_changes, mut freshly_created) =
+    let (initial_offline_changes, mut freshly_created, initial_blob_changes) =
         match local_state.bootstrap_offline_changes() {
             Ok(result) => result,
             Err(e) => {
                 error!("Error bootstrapping offline changes: {:?}", e);
-                (Vec::new(), HashSet::new())
+                (Vec::new(), HashSet::new(), Vec::new())
             }
         };
     // Use take() so offline changes are broadcast exactly once (on first
     // successful connection). On subsequent reconnects this is None.
     let mut pending_offline_changes: Option<Vec<(String, Vec<u8>)>> =
         Some(initial_offline_changes);
+    let mut pending_blob_changes: Option<Vec<BlobChange>> = Some(initial_blob_changes);
 
     // Setup network
     let server_url = url;
@@ -132,6 +136,19 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                 error!("Failed to broadcast offline update for {}: {:?}", uuid, e);
             } else {
                 info!("Broadcasted offline changes for {}", uuid);
+            }
+        }
+
+        // Upload pending blobs (first connection only)
+        let blob_changes = pending_blob_changes.take().unwrap_or_default();
+        for blob in blob_changes {
+            if let Err(e) = ws_tx
+                .send(Message::new(MsgType::BlobUpdate, blob.uuid.clone(), blob.data))
+                .await
+            {
+                error!("Failed to upload blob for {}: {:?}", blob.uuid, e);
+            } else {
+                info!("Uploaded blob for {} (hash: {})", blob.uuid, blob.hash);
             }
         }
 
@@ -254,8 +271,8 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                             // Check for unsynced local disk changes before applying remote update
                             if let Some(ref rp) = prev_rel_path {
                                 let phys_path = local_state.root_dir.join(rp);
-                                if let Ok(disk_content) = fs::read_to_string(&phys_path) {
-                                    if disk_content != yjs_content_before {
+                                if let Ok(disk_content) = fs::read_to_string(&phys_path)
+                                    && disk_content != yjs_content_before {
                                         info!("Unsynced local changes in {}! Applying before remote update.", rp);
                                         let prev_sv = doc.transact().state_vector();
                                         apply_diff_to_yrs(&doc, &text_ref, &yjs_content_before, &disk_content);
@@ -264,7 +281,6 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                             error!("Failed to send unsynced local update: {:?}", e);
                                         }
                                     }
-                                }
                             }
 
                             // 2. Apply the remote update
@@ -347,29 +363,89 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
                             // 6. Write content to physical file
                             let phys_path = local_state.root_dir.join(&target_rel_path);
-                            if text_val.is_empty() {
-                                if phys_path.exists() {
-                                    if let Err(e) = fs::remove_file(&phys_path) {
-                                        error!("Failed to delete file {:?}: {:?}", phys_path, e);
-                                    } else {
-                                        info!("Deleted file {} (empty content)", phys_path.display());
+                            let meta_type = read_meta_type(&doc)
+                                .unwrap_or_else(|| "text".to_string());
+
+                            if meta_type == "binary" {
+                                // Binary file: check blob_hash
+                                let blob_hash = read_meta_blob_hash(&doc);
+                                match blob_hash.as_deref() {
+                                    Some("") | None => {
+                                        // Empty or missing hash → deletion
+                                        if phys_path.exists() {
+                                            if let Err(e) = fs::remove_file(&phys_path) {
+                                                error!("Failed to delete binary file {:?}: {:?}", phys_path, e);
+                                            } else {
+                                                info!("Deleted binary file {} (empty blob_hash)", phys_path.display());
+                                            }
+                                        }
+                                    }
+                                    Some(hash) => {
+                                        // Check if local file already matches
+                                        let local_hash = fs::read(&phys_path)
+                                            .ok()
+                                            .map(|d| sha256_hash(&d));
+                                        if local_hash.as_deref() != Some(hash) {
+                                            // Need to request blob from server
+                                            info!("Binary file {} needs blob {} from server", target_rel_path, hash);
+                                            let request_payload = hash.as_bytes().to_vec();
+                                            if let Err(e) = ws_tx
+                                                .send(Message::new(
+                                                    MsgType::BlobRequest,
+                                                    doc_id.clone(),
+                                                    request_payload,
+                                                ))
+                                                .await
+                                            {
+                                                error!("Failed to request blob: {:?}", e);
+                                            }
+                                        }
                                     }
                                 }
                             } else {
-                                if let Some(parent) = phys_path.parent() {
+                                // Text file: write content
+                                if text_val.is_empty() {
+                                    if phys_path.exists() {
+                                        if let Err(e) = fs::remove_file(&phys_path) {
+                                            error!("Failed to delete file {:?}: {:?}", phys_path, e);
+                                        } else {
+                                            info!("Deleted file {} (empty content)", phys_path.display());
+                                        }
+                                    }
+                                } else if let Some(parent) = phys_path.parent() {
                                     let _ = fs::create_dir_all(parent);
-                                }
-                                let current_disk = fs::read_to_string(&phys_path).unwrap_or_default();
-                                if current_disk != text_val {
-                                    if let Err(e) = fs::write(&phys_path, &text_val) {
-                                        error!("Failed to write file {:?}: {:?}", phys_path, e);
-                                    } else {
-                                        info!("Applied remote update to {}", phys_path.display());
+                                    let current_disk = fs::read_to_string(&phys_path).unwrap_or_default();
+                                    if current_disk != text_val {
+                                        if let Err(e) = fs::write(&phys_path, &text_val) {
+                                            error!("Failed to write file {:?}: {:?}", phys_path, e);
+                                        } else {
+                                            info!("Applied remote update to {}", phys_path.display());
+                                        }
                                     }
                                 }
                             }
                         }
-                        MsgType::SyncStep1 => {}
+                        MsgType::BlobUpdate => {
+                            // Received blob data from server (in response to BlobRequest)
+                            let doc_id = msg.doc_id;
+                            let blob_data = msg.payload;
+
+                            // Find the physical path for this UUID
+                            if let Some(rel_path) = local_state.path_map.get_path_for_uuid(&doc_id).map(|s| s.to_string()) {
+                                let phys_path = local_state.root_dir.join(&rel_path);
+                                if let Some(parent) = phys_path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                if let Err(e) = fs::write(&phys_path, &blob_data) {
+                                    error!("Failed to write binary file {:?}: {:?}", phys_path, e);
+                                } else {
+                                    info!("Downloaded binary file {} ({} bytes)", phys_path.display(), blob_data.len());
+                                }
+                            } else {
+                                warn!("Received blob for unknown UUID {}", doc_id);
+                            }
+                        }
+                        MsgType::SyncStep1 | MsgType::BlobRequest => {}
                     }
                 }
 
@@ -387,14 +463,19 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                 rel_path: String,
                                 disk_content: String,
                             }
+                            struct WatchBinaryCreate {
+                                path: std::path::PathBuf,
+                                rel_path: String,
+                                data: Vec<u8>,
+                                hash: String,
+                            }
 
                             let mut batch_deletes: Vec<WatchDelete> = Vec::new();
                             let mut batch_creates: Vec<WatchCreate> = Vec::new();
+                            let mut batch_binary_creates: Vec<WatchBinaryCreate> = Vec::new();
 
                             for ev in &events {
                                 let path = &ev.path;
-                                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                if ext != "md" && ext != "txt" { continue; }
 
                                 let rel_path = match local_state.get_doc_id(path) {
                                     Ok(r) => r,
@@ -414,13 +495,23 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                         }
                                     }
                                 } else if path.is_file() {
-                                    match fs::read_to_string(path) {
-                                        Ok(content) => batch_creates.push(WatchCreate {
+                                    if is_binary_file(std::path::Path::new(&rel_path)) {
+                                        // Binary file
+                                        if let Ok(data) = fs::read(path) {
+                                            let hash = sha256_hash(&data);
+                                            batch_binary_creates.push(WatchBinaryCreate {
+                                                path: path.clone(),
+                                                rel_path,
+                                                data,
+                                                hash,
+                                            });
+                                        }
+                                    } else if let Ok(content) = fs::read_to_string(path) {
+                                        batch_creates.push(WatchCreate {
                                             path: path.clone(),
                                             rel_path,
                                             disk_content: content,
-                                        }),
-                                        Err(_) => {}
+                                        });
                                     }
                                 }
                             }
@@ -571,6 +662,69 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                     let update = doc.transact().encode_state_as_update_v1(&previous_sv);
                                     if let Err(e) = ws_tx.send(Message::new(MsgType::Update, uuid, update)).await {
                                         error!("Failed to send update: {:?}", e);
+                                    }
+                                }
+                            }
+
+                            // Process binary file creates/modifies
+                            for bwc in &batch_binary_creates {
+                                let is_newly_discovered = local_state.path_map.get_uuid(&bwc.rel_path).is_none();
+                                let uuid = local_state.get_or_create_uuid(&bwc.rel_path);
+                                let state_path = local_state.get_state_path_for_uuid(&uuid);
+
+                                if let Some(parent) = state_path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+
+                                let doc = load_doc(&state_path).unwrap_or_else(|_| Doc::new());
+                                let current_meta = read_meta_path(&doc);
+                                let current_hash = read_meta_blob_hash(&doc);
+                                let previous_sv = doc.transact().state_vector();
+
+                                // Update metadata
+                                let meta_changed = current_meta.as_deref() != Some(bwc.rel_path.as_str());
+                                let hash_changed = current_hash.as_deref() != Some(bwc.hash.as_str());
+
+                                if meta_changed {
+                                    write_meta_path(&doc, &bwc.rel_path);
+                                }
+                                write_meta_type(&doc, "binary");
+                                if hash_changed {
+                                    write_meta_blob_hash(&doc, &bwc.hash);
+                                }
+
+                                let newly_subscribed = !subscribed_docs.contains(&uuid);
+                                if newly_subscribed {
+                                    let sv = doc.transact().state_vector().encode_v1();
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::SyncStep1, uuid.clone(), sv)).await {
+                                        error!("Failed to subscribe to new binary doc {}: {:?}", uuid, e);
+                                    } else {
+                                        subscribed_docs.insert(uuid.clone());
+                                        if is_newly_discovered {
+                                            freshly_created.insert(uuid.clone());
+                                        }
+                                    }
+                                }
+
+                                let needs_update = newly_subscribed || meta_changed || hash_changed;
+                                if needs_update {
+                                    info!("Binary file {} changed, broadcasting...", bwc.path.display());
+                                    if let Err(e) = save_doc(&doc, &state_path) {
+                                        error!("Failed to save binary doc locally: {:?}", e);
+                                        continue;
+                                    }
+                                    if let Err(e) = local_state.path_map.save() {
+                                        error!("Failed to save path_map: {:?}", e);
+                                    }
+                                    // Send CRDT update (meta changes)
+                                    let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                                    if let Err(e) = ws_tx.send(Message::new(MsgType::Update, uuid.clone(), update)).await {
+                                        error!("Failed to send binary meta update: {:?}", e);
+                                    }
+                                    // Send blob data
+                                    if hash_changed
+                                        && let Err(e) = ws_tx.send(Message::new(MsgType::BlobUpdate, uuid, bwc.data.clone())).await {
+                                            error!("Failed to upload blob: {:?}", e);
                                     }
                                 }
                             }

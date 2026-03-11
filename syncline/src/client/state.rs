@@ -2,6 +2,7 @@ use crate::client::diff::apply_diff_to_yrs;
 use crate::client::storage::{load_doc, save_doc};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ impl PathMap {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for reading/writing meta.path from a Yrs Y.Map
+// Helpers for reading/writing meta fields from a Yrs Y.Map
 // ---------------------------------------------------------------------------
 
 /// Read the "path" field from the "meta" Y.Map in a doc.
@@ -94,12 +95,80 @@ pub fn read_meta_path(doc: &Doc) -> Option<String> {
     }
 }
 
-/// Write the "path" field to the "meta" Y.Map in a doc, returning the
-/// encoded CRDT update (starting from the given state vector).
+/// Write the "path" field to the "meta" Y.Map in a doc.
 pub fn write_meta_path(doc: &Doc, rel_path: &str) {
     let meta: MapRef = doc.get_or_insert_map("meta");
     let mut txn = doc.transact_mut();
     meta.insert(&mut txn, "path", rel_path);
+}
+
+/// Read `meta.type` — returns "text" or "binary".
+pub fn read_meta_type(doc: &Doc) -> Option<String> {
+    let meta: MapRef = doc.get_or_insert_map("meta");
+    let txn = doc.transact();
+    match meta.get(&txn, "type") {
+        Some(Out::Any(Any::String(arc))) => Some(arc.to_string()),
+        _ => None,
+    }
+}
+
+/// Write `meta.type` — "text" or "binary".
+pub fn write_meta_type(doc: &Doc, file_type: &str) {
+    let meta: MapRef = doc.get_or_insert_map("meta");
+    let mut txn = doc.transact_mut();
+    meta.insert(&mut txn, "type", file_type);
+}
+
+/// Read `meta.blob_hash` — the SHA256 hex hash of the binary content.
+pub fn read_meta_blob_hash(doc: &Doc) -> Option<String> {
+    let meta: MapRef = doc.get_or_insert_map("meta");
+    let txn = doc.transact();
+    match meta.get(&txn, "blob_hash") {
+        Some(Out::Any(Any::String(arc))) => Some(arc.to_string()),
+        _ => None,
+    }
+}
+
+/// Write `meta.blob_hash` — the SHA256 hex hash of the binary content.
+pub fn write_meta_blob_hash(doc: &Doc, hash: &str) {
+    let meta: MapRef = doc.get_or_insert_map("meta");
+    let mut txn = doc.transact_mut();
+    meta.insert(&mut txn, "blob_hash", hash);
+}
+
+// ---------------------------------------------------------------------------
+// File classification
+// ---------------------------------------------------------------------------
+
+/// Text extensions that use CRDT text synchronization.
+const TEXT_EXTENSIONS: &[&str] = &["md", "txt"];
+
+/// Returns true if the file should be treated as binary (blob-based sync).
+pub fn is_binary_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    !TEXT_EXTENSIONS.contains(&ext)
+}
+
+/// Compute SHA256 hex digest of a byte slice.
+pub fn sha256_hash(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+// ---------------------------------------------------------------------------
+// BlobChange — returned by bootstrap for binary files that need uploading
+// ---------------------------------------------------------------------------
+
+/// Represents a binary file whose blob content needs to be uploaded to the server.
+pub struct BlobChange {
+    /// The UUID of the document.
+    pub uuid: String,
+    /// The raw binary content.
+    pub data: Vec<u8>,
+    /// The SHA256 hex hash of the data.
+    pub hash: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,15 +283,22 @@ impl LocalState {
     /// Returns:
     /// - A list of `(uuid, update)` tuples that were modified offline and need to be synced.
     /// - A set of UUIDs that were **freshly created** (had no `.bin` state before this call).
-    ///   This set is used by the sync client to detect same-path file conflicts.
-    pub fn bootstrap_offline_changes(&mut self) -> Result<(Vec<(String, Vec<u8>)>, HashSet<String>)> {
+    /// - A list of `BlobChange` entries for binary files whose blobs need uploading.
+    pub fn bootstrap_offline_changes(
+        &mut self,
+    ) -> Result<(Vec<(String, Vec<u8>)>, HashSet<String>, Vec<BlobChange>)> {
         let mut offline_changes = Vec::new();
         let mut freshly_created: HashSet<String> = HashSet::new();
+        let mut blob_changes: Vec<BlobChange> = Vec::new();
 
         // ---- Phase 1: Collect all disk files --------------------------------
+        enum Content {
+            Text(String),
+            Binary { data: Vec<u8>, hash: String },
+        }
         struct DiskFile {
             rel_path: String,
-            disk_content: String,
+            content: Content,
         }
         let mut disk_files: Vec<DiskFile> = Vec::new();
 
@@ -233,16 +309,13 @@ impl LocalState {
                     return true;
                 }
                 let name = e.file_name().to_string_lossy();
-                name != ".git" && name != ".syncline"
+                // Skip hidden dirs/files and .syncline metadata
+                !name.starts_with('.') && name != ".syncline"
             })
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
             if !path.is_file() {
-                continue;
-            }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "md" && ext != "txt" {
                 continue;
             }
 
@@ -259,41 +332,61 @@ impl LocalState {
                 continue;
             }
 
-            let disk_content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let content = if is_binary_file(path) {
+                match fs::read(path) {
+                    Ok(data) => {
+                        let hash = sha256_hash(&data);
+                        Content::Binary { data, hash }
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                match fs::read_to_string(path) {
+                    Ok(c) => Content::Text(c),
+                    Err(_) => continue,
+                }
             };
 
-            disk_files.push(DiskFile {
-                rel_path,
-                disk_content,
-            });
+            disk_files.push(DiskFile { rel_path, content });
         }
 
         // ---- Phase 2: Separate known vs new files ---------------------------
         // known: rel_path already in path_map
         // new: not in path_map → potential new file or rename target
 
-        let mut known_files: Vec<(String, String, String)> = Vec::new(); // (rel_path, disk_content, uuid)
-        let mut new_files: Vec<(String, String)> = Vec::new(); // (rel_path, disk_content)
+        struct KnownFile {
+            rel_path: String,
+            content: Content,
+            uuid: String,
+        }
+        let mut known_files: Vec<KnownFile> = Vec::new();
+        let mut new_files: Vec<DiskFile> = Vec::new();
 
         for df in disk_files {
             if let Some(uuid) = self.path_map.get_uuid(&df.rel_path) {
-                known_files.push((df.rel_path, df.disk_content, uuid.to_string()));
+                known_files.push(KnownFile {
+                    rel_path: df.rel_path,
+                    content: df.content,
+                    uuid: uuid.to_string(),
+                });
             } else {
-                new_files.push((df.rel_path, df.disk_content));
+                new_files.push(df);
             }
         }
 
         // ---- Phase 3: Find orphaned UUIDs -----------------------------------
         // An orphaned UUID is one whose mapped path is not on disk (possibly renamed/deleted).
 
-        let known_paths: HashSet<&str> = known_files.iter().map(|(rp, _, _)| rp.as_str()).collect();
+        let known_paths: HashSet<&str> =
+            known_files.iter().map(|kf| kf.rel_path.as_str()).collect();
 
         struct Orphaned {
             uuid: String,
             old_rel_path: String,
+            /// For text files: CRDT text content. For binary: empty.
             crdt_content: String,
+            /// For binary files: the stored blob hash. For text: None.
+            blob_hash: Option<String>,
         }
         let mut orphaned: Vec<Orphaned> = Vec::new();
 
@@ -307,110 +400,196 @@ impl LocalState {
         for (rel_path, uuid) in &all_path_map_entries {
             if !known_paths.contains(rel_path.as_str()) {
                 let state_path = self.get_state_path_for_uuid(uuid);
-                if state_path.exists() {
-                    let crdt_content = load_doc(&state_path)
-                        .map(|doc| {
+                if state_path.exists()
+                    && let Ok(doc) = load_doc(&state_path) {
+                        let meta_type =
+                            read_meta_type(&doc).unwrap_or_else(|| "text".to_string());
+                        if meta_type == "binary" {
+                            let blob_hash = read_meta_blob_hash(&doc);
+                            orphaned.push(Orphaned {
+                                uuid: uuid.clone(),
+                                old_rel_path: rel_path.clone(),
+                                crdt_content: String::new(),
+                                blob_hash,
+                            });
+                        } else {
                             let text = doc.get_or_insert_text("content");
-                            text.get_string(&doc.transact())
-                        })
-                        .unwrap_or_default();
-                    orphaned.push(Orphaned {
-                        uuid: uuid.clone(),
-                        old_rel_path: rel_path.clone(),
-                        crdt_content,
-                    });
-                }
+                            let crdt_content = text.get_string(&doc.transact());
+                            orphaned.push(Orphaned {
+                                uuid: uuid.clone(),
+                                old_rel_path: rel_path.clone(),
+                                crdt_content,
+                                blob_hash: None,
+                            });
+                        }
+                    }
             }
         }
 
         // ---- Phase 4: Content-based rename detection ------------------------
-        // If a new file's disk content exactly matches an orphaned UUID's CRDT content,
-        // treat it as a rename (preserve UUID and CRDT history).
+        // If a new file's disk content exactly matches an orphaned UUID's CRDT content
+        // (text) or blob hash (binary), treat it as a rename.
 
         let mut renamed_map: HashMap<String, String> = HashMap::new(); // uuid → new_rel_path
-        let mut unmatched_new: Vec<(String, String)> = Vec::new();
+        let mut unmatched_new: Vec<DiskFile> = Vec::new();
 
-        for (new_rel_path, disk_content) in new_files {
-            let matched = orphaned
-                .iter()
-                .position(|o| o.crdt_content == disk_content);
+        for df in new_files {
+            let matched = match &df.content {
+                Content::Text(text) => orphaned
+                    .iter()
+                    .position(|o| o.blob_hash.is_none() && o.crdt_content == *text),
+                Content::Binary { hash, .. } => orphaned
+                    .iter()
+                    .position(|o| o.blob_hash.as_deref() == Some(hash.as_str())),
+            };
 
             if let Some(idx) = matched {
                 let o = orphaned.remove(idx);
-                renamed_map.insert(o.uuid.clone(), new_rel_path.clone());
+                renamed_map.insert(o.uuid.clone(), df.rel_path.clone());
                 // Update path_map: remove old entry, add new one
                 self.path_map.remove_by_path(&o.old_rel_path);
-                self.path_map.insert(new_rel_path.clone(), o.uuid.clone());
-                known_files.push((new_rel_path, disk_content, o.uuid));
+                self.path_map.insert(df.rel_path.clone(), o.uuid.clone());
+                known_files.push(KnownFile {
+                    rel_path: df.rel_path,
+                    content: df.content,
+                    uuid: o.uuid,
+                });
             } else {
-                unmatched_new.push((new_rel_path, disk_content));
+                unmatched_new.push(df);
             }
         }
 
         // ---- Phase 5: Process known files (including renamed ones) ----------
 
-        for (rel_path, disk_content, uuid) in &known_files {
-            let state_path = self.get_state_path_for_uuid(uuid);
-            let was_renamed = renamed_map.contains_key(uuid.as_str());
+        for kf in &known_files {
+            let state_path = self.get_state_path_for_uuid(&kf.uuid);
+            let was_renamed = renamed_map.contains_key(kf.uuid.as_str());
 
             if state_path.exists() {
-                // File existed before. Check for offline modification OR rename.
                 let doc = match load_doc(&state_path) {
                     Ok(doc) => doc,
                     Err(_) => continue,
                 };
 
-                // Take previous_sv BEFORE any writes so the broadcast delta includes
-                // meta.path changes (needed by other clients to locate the file on disk).
                 let previous_sv = doc.transact().state_vector();
 
                 // Ensure meta.path is up to date (important for renamed files).
                 let current_meta = read_meta_path(&doc);
-                let meta_path_changed = current_meta.as_deref() != Some(rel_path.as_str());
+                let meta_path_changed =
+                    current_meta.as_deref() != Some(kf.rel_path.as_str());
                 if meta_path_changed {
-                    write_meta_path(&doc, rel_path);
+                    write_meta_path(&doc, &kf.rel_path);
                 }
 
-                let text_ref = doc.get_or_insert_text("content");
-                let yrs_content = text_ref.get_string(&doc.transact());
+                match &kf.content {
+                    Content::Text(disk_content) => {
+                        // Ensure meta.type is set
+                        if read_meta_type(&doc).is_none() {
+                            write_meta_type(&doc, "text");
+                        }
 
-                if *disk_content != yrs_content || was_renamed || meta_path_changed {
-                    if *disk_content != yrs_content {
-                        apply_diff_to_yrs(&doc, &text_ref, &yrs_content, disk_content);
+                        let text_ref = doc.get_or_insert_text("content");
+                        let yrs_content = text_ref.get_string(&doc.transact());
+
+                        if *disk_content != yrs_content
+                            || was_renamed
+                            || meta_path_changed
+                        {
+                            if *disk_content != yrs_content {
+                                apply_diff_to_yrs(
+                                    &doc,
+                                    &text_ref,
+                                    &yrs_content,
+                                    disk_content,
+                                );
+                            }
+                            if let Err(e) = save_doc(&doc, &state_path) {
+                                tracing::error!(
+                                    "Failed to save offline edits for {}: {}",
+                                    kf.uuid,
+                                    e
+                                );
+                                continue;
+                            }
+                            let update = doc
+                                .transact()
+                                .encode_state_as_update_v1(&previous_sv);
+                            offline_changes.push((kf.uuid.clone(), update));
+                        }
                     }
-                    if let Err(e) = save_doc(&doc, &state_path) {
-                        tracing::error!("Failed to save offline edits for {}: {}", uuid, e);
-                        continue;
+                    Content::Binary { data, hash } => {
+                        write_meta_type(&doc, "binary");
+                        let prev_hash = read_meta_blob_hash(&doc);
+                        let hash_changed =
+                            prev_hash.as_deref() != Some(hash.as_str());
+
+                        if hash_changed || was_renamed || meta_path_changed {
+                            if hash_changed {
+                                write_meta_blob_hash(&doc, hash);
+                            }
+                            if let Err(e) = save_doc(&doc, &state_path) {
+                                tracing::error!(
+                                    "Failed to save binary meta for {}: {}",
+                                    kf.uuid,
+                                    e
+                                );
+                                continue;
+                            }
+                            let update = doc
+                                .transact()
+                                .encode_state_as_update_v1(&previous_sv);
+                            offline_changes.push((kf.uuid.clone(), update));
+                            if hash_changed {
+                                blob_changes.push(BlobChange {
+                                    uuid: kf.uuid.clone(),
+                                    data: data.clone(),
+                                    hash: hash.clone(),
+                                });
+                            }
+                        }
                     }
-                    let update = doc.transact().encode_state_as_update_v1(&previous_sv);
-                    offline_changes.push((uuid.clone(), update));
                 }
             } else {
-                // First time this file is seen with its current UUID (shouldn't normally
-                // happen since get_or_create_uuid also creates the .bin, but handle it).
+                // First time this file is seen with its current UUID.
                 let doc = Doc::new();
-                // Take previous_sv from empty doc so the delta includes meta.path + content.
                 let previous_sv = doc.transact().state_vector();
-                write_meta_path(&doc, rel_path);
-                let text_ref = doc.get_or_insert_text("content");
-                {
-                    let mut txn = doc.transact_mut();
-                    text_ref.insert(&mut txn, 0, disk_content);
+                write_meta_path(&doc, &kf.rel_path);
+
+                match &kf.content {
+                    Content::Text(disk_content) => {
+                        write_meta_type(&doc, "text");
+                        let text_ref = doc.get_or_insert_text("content");
+                        {
+                            let mut txn = doc.transact_mut();
+                            text_ref.insert(&mut txn, 0, disk_content);
+                        }
+                    }
+                    Content::Binary { data, hash } => {
+                        write_meta_type(&doc, "binary");
+                        write_meta_blob_hash(&doc, hash);
+                        blob_changes.push(BlobChange {
+                            uuid: kf.uuid.clone(),
+                            data: data.clone(),
+                            hash: hash.clone(),
+                        });
+                    }
                 }
+
                 if let Err(e) = save_doc(&doc, &state_path) {
-                    tracing::error!("Failed to save new doc {}: {}", uuid, e);
+                    tracing::error!("Failed to save new doc {}: {}", kf.uuid, e);
                     continue;
                 }
-                let update = doc.transact().encode_state_as_update_v1(&previous_sv);
-                offline_changes.push((uuid.clone(), update));
-                freshly_created.insert(uuid.clone());
+                let update =
+                    doc.transact().encode_state_as_update_v1(&previous_sv);
+                offline_changes.push((kf.uuid.clone(), update));
+                freshly_created.insert(kf.uuid.clone());
             }
         }
 
         // ---- Phase 6: Truly new files (no matching orphan) ------------------
 
-        for (rel_path, disk_content) in unmatched_new {
-            let uuid = self.get_or_create_uuid(&rel_path);
+        for df in unmatched_new {
+            let uuid = self.get_or_create_uuid(&df.rel_path);
             let state_path = self.get_state_path_for_uuid(&uuid);
 
             if let Some(parent) = state_path.parent() {
@@ -418,19 +597,35 @@ impl LocalState {
             }
 
             let doc = Doc::new();
-            // Take previous_sv from empty doc so the delta includes meta.path + content.
             let previous_sv = doc.transact().state_vector();
-            write_meta_path(&doc, &rel_path);
-            let text_ref = doc.get_or_insert_text("content");
-            {
-                let mut txn = doc.transact_mut();
-                text_ref.insert(&mut txn, 0, &disk_content);
+            write_meta_path(&doc, &df.rel_path);
+
+            match &df.content {
+                Content::Text(disk_content) => {
+                    write_meta_type(&doc, "text");
+                    let text_ref = doc.get_or_insert_text("content");
+                    {
+                        let mut txn = doc.transact_mut();
+                        text_ref.insert(&mut txn, 0, disk_content);
+                    }
+                }
+                Content::Binary { data, hash } => {
+                    write_meta_type(&doc, "binary");
+                    write_meta_blob_hash(&doc, hash);
+                    blob_changes.push(BlobChange {
+                        uuid: uuid.clone(),
+                        data: data.clone(),
+                        hash: hash.clone(),
+                    });
+                }
             }
+
             if let Err(e) = save_doc(&doc, &state_path) {
                 tracing::error!("Failed to save new doc {}: {}", uuid, e);
                 continue;
             }
-            let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+            let update =
+                doc.transact().encode_state_as_update_v1(&previous_sv);
             offline_changes.push((uuid.clone(), update));
             freshly_created.insert(uuid.clone());
         }
@@ -438,12 +633,33 @@ impl LocalState {
         // ---- Phase 7: Offline deletions (remaining orphaned UUIDs) ----------
 
         for orphan in orphaned {
-            if !orphan.crdt_content.is_empty() {
-                let state_path = self.get_state_path_for_uuid(&orphan.uuid);
-                if let Ok(doc) = load_doc(&state_path) {
+            let state_path = self.get_state_path_for_uuid(&orphan.uuid);
+            if let Ok(doc) = load_doc(&state_path) {
+                let previous_sv = doc.transact().state_vector();
+                let needs_update = if orphan.blob_hash.is_some() {
+                    // Binary file: clear blob_hash to signal deletion
+                    let current_hash = read_meta_blob_hash(&doc);
+                    if current_hash.is_some() {
+                        write_meta_blob_hash(&doc, "");
+                        true
+                    } else {
+                        false
+                    }
+                } else if !orphan.crdt_content.is_empty() {
+                    // Text file: clear content
                     let text_ref = doc.get_or_insert_text("content");
-                    let previous_sv = doc.transact().state_vector();
-                    apply_diff_to_yrs(&doc, &text_ref, &orphan.crdt_content, "");
+                    apply_diff_to_yrs(
+                        &doc,
+                        &text_ref,
+                        &orphan.crdt_content,
+                        "",
+                    );
+                    true
+                } else {
+                    false
+                };
+
+                if needs_update {
                     if let Err(e) = save_doc(&doc, &state_path) {
                         tracing::error!(
                             "Failed to save offline deletion for {}: {}",
@@ -452,7 +668,9 @@ impl LocalState {
                         );
                         continue;
                     }
-                    let update = doc.transact().encode_state_as_update_v1(&previous_sv);
+                    let update = doc
+                        .transact()
+                        .encode_state_as_update_v1(&previous_sv);
                     offline_changes.push((orphan.uuid.clone(), update));
                 }
             }
@@ -465,7 +683,7 @@ impl LocalState {
             tracing::error!("Failed to save path_map: {}", e);
         }
 
-        Ok((offline_changes, freshly_created))
+        Ok((offline_changes, freshly_created, blob_changes))
     }
 
     /// List all known UUIDs from the local .syncline storage (by reading .bin filenames).
@@ -538,7 +756,7 @@ mod tests {
         fs::write(&file1, "Hello World").unwrap();
 
         // 1. First run, file is new
-        let (changed, freshly) = state.bootstrap_offline_changes().unwrap();
+        let (changed, freshly, _blobs) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed.len(), 1);
         // doc_id is now a UUID string
         assert!(
@@ -553,13 +771,13 @@ mod tests {
         );
 
         // 2. Second run, no changes
-        let (changed_none, freshly_none) = state.bootstrap_offline_changes().unwrap();
+        let (changed_none, freshly_none, _) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed_none.len(), 0);
         assert!(freshly_none.is_empty(), "No new files, freshly_created should be empty");
 
         // 3. Third run, offline modification
         fs::write(&file1, "Hello CRDT World!").unwrap();
-        let (changed_mod, freshly_mod) = state.bootstrap_offline_changes().unwrap();
+        let (changed_mod, freshly_mod, _) = state.bootstrap_offline_changes().unwrap();
         assert_eq!(changed_mod.len(), 1);
         assert!(
             uuid::Uuid::parse_str(&changed_mod[0].0).is_ok(),
@@ -603,7 +821,7 @@ mod tests {
         fs::rename(&file1, &file2).unwrap();
 
         // Bootstrap again — should detect rename via content matching
-        let (changed, freshly) = state.bootstrap_offline_changes().unwrap();
+        let (changed, freshly, _) = state.bootstrap_offline_changes().unwrap();
 
         // UUID should be preserved (rename, not new file)
         assert!(
@@ -676,7 +894,7 @@ mod tests {
             changed.is_ok(),
             "Issue 5: Loop aborted early and returned Err!"
         );
-        let (docs, _) = changed.unwrap();
+        let (docs, _, _) = changed.unwrap();
         // b/file2.md should still have been processed despite file1 failing
         let rel2 = "b/file2.md";
         let uuid2 = state.path_map.get_uuid(rel2).unwrap().to_string();
@@ -733,7 +951,7 @@ mod tests {
         fs::remove_file(&file1).unwrap();
 
         // 3. Run bootstrap again, it should detect the offline deletion
-        let (changed, freshly) = state.bootstrap_offline_changes().unwrap();
+        let (changed, freshly, _) = state.bootstrap_offline_changes().unwrap();
 
         // Should have one change corresponding to the empty string
         assert_eq!(changed.len(), 1);

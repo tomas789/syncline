@@ -95,3 +95,11 @@ For a vault with many documents and a long history, this scan grows linearly wit
 **Issue**: When a file is deleted and the deletion is signaled as an empty-content update, the corresponding `.bin` state snapshot is updated to reflect empty content but is never removed from `.syncline/data/`. Over time, the state directory accumulates orphaned `.bin` files for documents that no longer exist.
 
 **Recommendation**: After applying an empty-content update for a deleted document, remove the corresponding `.bin` file from `.syncline/data/`.
+
+### F-11. No Blob Chunking for Large Binary Files
+
+**Location**: `syncline/src/protocol.rs`, `MAX_BLOB_SIZE`
+
+**Issue**: Binary file synchronization sends the entire blob as a single WebSocket message. The current hard limit is 50 MB. Files larger than this are rejected at the protocol layer. Very large files (e.g. multi-hundred-megabyte attachments) cannot be synchronized.
+
+**Recommendation**: Implement chunked blob transfer with a streaming protocol that splits large files into fixed-size chunks (e.g. 1 MB), each sent as a separate `MSG_BLOB_CHUNK` message with a sequence number. This would allow synchronization of arbitrarily large files while keeping memory usage bounded.
