@@ -2,6 +2,8 @@ site_name: Syncline
 site_description: Privacy-first, self-hosted synchronization system for Obsidian vaults.
 theme:
   name: material
+  logo: logo.jpg
+  favicon: favicon.png
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
