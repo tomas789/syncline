@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/tomas789/syncline/compare/v0.5.2...v0.6.0) (2026-03-11)
+
+
+### Features
+
+* implement binary file synchronization support ([6c9cbca](https://github.com/tomas789/syncline/commit/6c9cbca4769bfac3aeb32a959e84ab30e90f25b0))
+* New logo ([cc894ab](https://github.com/tomas789/syncline/commit/cc894ab51c35fad9d90540e0fda85881103cd46e))
+
+
+### Bug Fixes
+
+* make test_both_offline_same_name_conflict resilient to slow CI ([f10536b](https://github.com/tomas789/syncline/commit/f10536bdcfd4aabc27dc697e2f3aea8dc0209f7f))
+* remove initial_server_uuids guard from path collision detection ([108e072](https://github.com/tomas789/syncline/commit/108e072f7c8fb5b2118cdd4e2581900e8cddf1ea))
+* two-tier collision detection with deterministic tie-breaker ([4907ad4](https://github.com/tomas789/syncline/commit/4907ad4e190054dedbeebf79a8ad829ead913724))
+
 ## [0.5.2](https://github.com/tomas789/syncline/compare/v0.5.1...v0.5.2) (2026-03-11)
 
 
