@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/tomas789/syncline/compare/v0.5.1...v0.5.2) (2026-03-11)
+
+
+### Bug Fixes
+
+* close stale-read race window in Obsidian file-watcher suppression ([5d5bc35](https://github.com/tomas789/syncline/commit/5d5bc359e1179a53b90ba82027a5f7d002695cb8))
+
 ## [0.5.1](https://github.com/tomas789/syncline/compare/v0.5.0...v0.5.1) (2026-03-11)
 
 
