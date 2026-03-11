@@ -1,27 +1,27 @@
-# 💾 Dealing with Backups
+# Dealing with Backups
 
-Because Syncline uses an append-only, CRDT-based database structure, you have an inherent history of updates. But servers break, hard drives fry, and databases get corrupted. Even cool tools like this one need a solid backup strategy.
+Syncline's append-only CRDT database gives you built-in edit history. But servers die, drives fail, databases corrupt. You still need backups.
 
-## How to back up your data
+## Backing Up the Database
 
-The easiest and safest way to back up your Syncline setup is to backup the server's SQLite database file (`syncline.db`). This file contains the entirety of your workspace sync history and the current state.
+The safest approach: back up the server's SQLite database file (`syncline.db`). It contains the full sync history and current state of every document.
 
-### Live Server Backup
+### While the Server Is Running
 
-Because SQLite is phenomenal, you can actually back it up while the server is actively running without taking it offline. You can use the standard SQLite backup API or just use the CLI:
+SQLite handles concurrent access well enough that you can take a backup without stopping the server:
 
 ```bash
 sqlite3 syncline.db ".backup 'syncline_backup.db'"
 ```
 
-Set that up on a cron job, ship the backup to an S3 bucket or another drive, and you are literally golden. 🏆
+Throw that in a cron job, ship the backup file to S3 or another drive, and you're covered.
 
-### Folder Level Backup
+### Using the Folder Client as a Live Backup
 
-Another awesome way to back up? Just run an instance of `client_folder` on a separate, secure machine (like a NAS). Let it sync the vault automatically in the background.
+You can also run a `syncline sync` instance on a separate machine (a NAS, a second VPS, whatever) and let it pull down every edit in real time:
 
 ```bash
 syncline sync -f /path/to/my/backup/folder -u ws://my-server:3030/sync
 ```
 
-Whenever anyone edits anything in Obsidian, `client_folder` quietly pulls down the update and syncs it straight into plain text Markdown right there. Presto, you have a constantly updated plain-text, human-readable backup of all your Markdown files!
+This gives you a constantly-updated, plain-text Markdown copy of the entire vault. If the server dies, you still have readable files.
