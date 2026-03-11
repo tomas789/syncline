@@ -9,3 +9,4 @@ states/
 *.dot
 *.dump
 *_TTrace_*.tla
+*.bin
