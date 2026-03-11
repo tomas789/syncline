@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/banner.png" alt="SYNCLINE Banner" width="80%">
+  <img src="./docs/logo-with-name.jpg" alt="Syncline — Self-hosted Obsidian Sync" width="400">
 </p>
 
 <p align="center">

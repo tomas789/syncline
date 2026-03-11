@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo-with-name.jpg" alt="Syncline — Self-hosted Obsidian Sync" width="400">
+</p>
+
 # 🌊 Introduction & Usage
 
 Hey there! Built a cool vault in Obsidian and want to keep it synced everywhere completely on your own terms? Enter **Syncline**.
