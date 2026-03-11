@@ -565,13 +565,32 @@ async fn test_both_offline_same_name_conflict() {
     fs::write(dir_a.path().join("shared.md"), "A's offline content").unwrap();
     fs::write(dir_b.path().join("shared.md"), "B's offline content").unwrap();
 
-    // A reconnects first — its content becomes server truth
+    // A reconnects first — its content becomes server truth.
+    // Wait until A has synced (state dir contains more than just __index__)
+    // before starting B, to ensure B sees A's UUID in initial_server_uuids.
     let mut client_a2 = spawn_client_with_name(dir_a.path(), port, "client-a").await;
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let state_dir = dir_a.path().join(".syncline").join("data");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if state_dir.exists() {
+            let count = fs::read_dir(&state_dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).count())
+                .unwrap_or(0);
+            // __index__.bin + at least one doc .bin = 2+ files
+            if count >= 2 {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Timed out waiting for client A to sync its document"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     // B reconnects — detects conflict, renames its content
     let mut client_b2 = spawn_client_with_name(dir_b.path(), port, "client-b").await;
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+    tokio::time::sleep(Duration::from_millis(8000)).await;
 
     // B's shared.md should now have A's content
     let shared_b = fs::read_to_string(dir_b.path().join("shared.md")).unwrap();
