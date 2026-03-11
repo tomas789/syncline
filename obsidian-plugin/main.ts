@@ -71,6 +71,17 @@ async function initWasm(): Promise<WasmModule> {
   return wasm;
 }
 
+/**
+ * Duration to suppress the file-watcher after writing a remote update to disk.
+ * Must be strictly greater than the onFileModify debounce window (300 ms) to
+ * guarantee that any debounced handler triggered by our own vault.modify()
+ * call is still suppressed when it finally fires.
+ *
+ * See docs/tla/SynclineSyncDiffLayer.tla — the TLA+ model proved that
+ * without this guard, a stale disk read generates spurious DELETE operations.
+ */
+const IGNORE_CHANGES_TIMEOUT_MS = 1000;
+
 export default class SynclinePlugin extends Plugin {
   settings: SynclineSettings;
   statusBarItem: HTMLElement;
@@ -416,7 +427,7 @@ export default class SynclinePlugin extends Plugin {
               this.app.vault
                 .modify(file, remoteContent)
                 .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), 500);
+                  setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
                 })
                 .catch((error) => {
                   console.error(`[Syncline] Error updating ${file.path} after initial merge:`, error);
@@ -432,7 +443,7 @@ export default class SynclinePlugin extends Plugin {
               this.app.vault
                 .modify(file, merged)
                 .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), 500);
+                  setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
                 })
                 .catch((error) => {
                   console.error(`[Syncline] Error updating ${file.path} after merge:`, error);
@@ -448,6 +459,12 @@ export default class SynclinePlugin extends Plugin {
           });
       } else {
         if (!isMerging) {
+          // FIX(Issue #6): Suppress the file-watcher IMMEDIATELY when CRDT
+          // is updated, BEFORE the async disk write in onRemoteUpdate().
+          // The TLA+ model proved that without this, there is a window
+          // where the watcher reads stale disk content and generates a
+          // spurious diff that deletes valid remote content.
+          this.ignoreChanges.add(file.path);
           void this.onRemoteUpdate(uuid);
         }
       }
@@ -506,7 +523,7 @@ export default class SynclinePlugin extends Plugin {
       this.app.fileManager.trashFile(file).catch((error) => {
         console.error(`[Syncline] Error deleting file ${filePath}:`, error);
       }).finally(() => {
-        setTimeout(() => this.ignoreChanges.delete(filePath), 500);
+        setTimeout(() => this.ignoreChanges.delete(filePath), IGNORE_CHANGES_TIMEOUT_MS);
       });
     }
     this.client?.remove_doc(uuid);
@@ -546,7 +563,7 @@ export default class SynclinePlugin extends Plugin {
           setTimeout(() => {
             this.ignoreChanges.delete(currentPath);
             this.ignoreChanges.delete(metaPath);
-          }, 500);
+          }, IGNORE_CHANGES_TIMEOUT_MS);
         }
       }
     }
@@ -557,14 +574,22 @@ export default class SynclinePlugin extends Plugin {
       try {
         const currentContent = await this.app.vault.read(file);
         if (currentContent === content) {
+          // Disk already matches CRDT — clear ignore early, nothing to write.
+          this.ignoreChanges.delete(targetPath);
           return;
         }
+        // ignoreChanges is already set by the caller (addDocOnly callback)
+        // but ensure it's set in case onRemoteUpdate is called from elsewhere.
         this.ignoreChanges.add(targetPath);
         await this.app.vault.modify(file, content);
       } catch (error) {
         console.error(`[Syncline] Error updating file ${targetPath}:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(targetPath), 500);
+        // Clear the suppression after IGNORE_CHANGES_TIMEOUT_MS.
+        // This MUST be longer than the 300 ms debounce on onFileModify so
+        // that any watcher event caused by our vault.modify() call above
+        // is still suppressed when the debounced handler fires.
+        setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
       }
     } else if (!file && targetPath) {
       try {
@@ -579,7 +604,7 @@ export default class SynclinePlugin extends Plugin {
       } catch (error) {
         console.error(`[Syncline] Failed to create file ${targetPath} on remote update:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(targetPath), 500);
+        setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -599,6 +624,19 @@ export default class SynclinePlugin extends Plugin {
 
     try {
       const content = await this.app.vault.read(file);
+
+      // FIX(Issue #6): After the async read, re-check ignoreChanges.
+      // A remote update may have been applied between the debounce
+      // trigger and the actual disk read, making our content stale.
+      if (this.ignoreChanges.has(file.path)) return;
+
+      // FIX(Issue #6): Compare disk content against the current CRDT state.
+      // If they already match, skip the update — this prevents the diff
+      // from generating no-op (or worse, spurious rollback) operations
+      // when the disk content reflects a recently-applied remote update.
+      const crdtContent = this.client.get_text(uuid);
+      if (crdtContent === content) return;
+
       this.client.update(uuid, content);
     } catch (error) {
       console.error("[Syncline] Error syncing:", error);
