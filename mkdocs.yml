@@ -25,6 +25,7 @@ nav:
   - Introduction & Usage: index.md
   - Architecture & How It Works: how-it-works.md
   - Protocol: PROTOCOL.md
+  - Formal Verification: formal-verification.md
   - Operations:
       - Backups: backups.md
       - Encryption: encryption.md
