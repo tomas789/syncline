@@ -16,6 +16,9 @@ java -XX:+UseParallelGC -jar tla2tools.jar -config SynclineSyncDiffLayerBug.cfg 
 
 # Phase 2: Diff layer FIXED — confirms the fix works (~14s)
 java -XX:+UseParallelGC -jar tla2tools.jar -config SynclineSyncDiffLayerFixed.cfg -workers 4 -nowarning SynclineSyncDiffLayerFixed.tla
+
+# Phase 3: Cross-client (Obsidian + folder) convergence (~37s)
+java -XX:+UseParallelGC -Xmx4g -jar tla2tools.jar -config SynclineSyncCrossClient.cfg -workers 4 -nowarning SynclineSyncCrossClient.tla
 ```
 
 ## Specification Files
@@ -36,6 +39,13 @@ java -XX:+UseParallelGC -jar tla2tools.jar -config SynclineSyncDiffLayerFixed.cf
 | `SynclineSyncDiffLayerBug.cfg`   | Config that demonstrates the NoContentLoss violation          |
 | `SynclineSyncDiffLayerFixed.tla` | Fixed model with atomic apply+write — bug eliminated          |
 | `SynclineSyncDiffLayerFixed.cfg` | Config that verifies the fix holds                            |
+
+### Phase 3: Cross-Client (Obsidian + Folder)
+
+| File                          | Description                                                            |
+| ----------------------------- | ---------------------------------------------------------------------- |
+| `SynclineSyncCrossClient.tla` | Both client types in one model: Obsidian (fixed) vs folder (pre-apply) |
+| `SynclineSyncCrossClient.cfg` | Config: A=Obsidian, B=Folder, safety + convergence liveness            |
 
 ## Verified Properties
 
@@ -64,6 +74,15 @@ java -XX:+UseParallelGC -jar tla2tools.jar -config SynclineSyncDiffLayerFixed.cf
 | `ChannelOnlyForConnected` | ✅ Pass                    | ✅ Pass     |
 | `NoContentLoss`           | ❌ **VIOLATED** (Issue #6) | ✅ Pass     |
 
+### Phase 3: Cross-Client Properties
+
+| Property                  | Mixed Deployment (A=Obsidian, B=Folder) |
+| ------------------------- | --------------------------------------- |
+| `NoEcho`                  | ✅ Pass                                 |
+| `ChannelOnlyForConnected` | ✅ Pass                                 |
+| `NoContentLoss`           | ✅ Pass                                 |
+| `CrossClientConvergence`  | ✅ Pass (liveness)                      |
+
 ## Issue #6 Counterexample (TLC Trace)
 
 The buggy model produces a 10-step counterexample trace:
@@ -83,13 +102,27 @@ The buggy model produces a 10-step counterexample trace:
 
 ## Verification Results
 
-| Spec          | States Generated | Distinct | Depth | Time | Result                    |
-| ------------- | ---------------- | -------- | ----- | ---- | ------------------------- |
-| Phase 1 Small | 133K             | 26K      | 27    | 1s   | ✅ All pass               |
-| Phase 1 Full  | 4.5M             | 860K     | 35    | 34s  | ✅ All pass               |
-| Phase 2 Buggy | 123K             | 34K      | 11    | 1s   | ❌ NoContentLoss violated |
-| Phase 2 Fixed | 10.3M            | 1.7M     | 37    | 14s  | ✅ All pass               |
+| Spec                 | States Generated | Distinct | Depth | Time | Result                    |
+| -------------------- | ---------------- | -------- | ----- | ---- | ------------------------- |
+| Phase 1 Small        | 133K             | 26K      | 27    | 1s   | ✅ All pass               |
+| Phase 1 Full         | 4.5M             | 860K     | 35    | 34s  | ✅ All pass               |
+| Phase 2 Buggy        | 123K             | 34K      | 11    | 1s   | ❌ NoContentLoss violated |
+| Phase 2 Fixed        | 10.3M            | 1.7M     | 37    | 14s  | ✅ All pass               |
+| Phase 3 Cross-Client | 4.7M             | 811K     | 36    | 37s  | ✅ All pass               |
+
+## Key Insights from Phase 3
+
+The cross-client model revealed an important correctness constraint:
+
+**`ObsidianIgnoreExpires` must not fire before the disk write completes.** The model initially violated NoContentLoss when the ignore timer expired before `ObsidianWriteToDisk` had a chance to run. In the real code, this is guaranteed because:
+
+1. `await vault.modify()` completes before the `setTimeout` starts
+2. The 1000ms timeout far exceeds the time needed for disk I/O
+
+The TLA+ spec encodes this via a precondition: `clientDisk[c][d] = clientDoc[c][d]` on `ObsidianIgnoreExpires`, ensuring the write-before-expire ordering.
+
+The folder client's pre-apply strategy (read disk → apply local diff → apply remote → write atomically) is **provably safe** — it needs no `ignoreChanges` mechanism because disk always matches CRDT after processing.
 
 ## Architecture
 
-See [FORMAL_VERIFICATION.md](../FORMAL_VERIFICATION.md) for the full design rationale, action-to-code mapping, and the roadmap for further verification (compaction, 3+ clients).
+See [FORMAL_VERIFICATION.md](../FORMAL_VERIFICATION.md) for the full design rationale, action-to-code mapping, and the roadmap for further verification (compaction, multi-doc, cross-client).
