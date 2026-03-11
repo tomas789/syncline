@@ -416,7 +416,7 @@ export default class SynclinePlugin extends Plugin {
               this.app.vault
                 .modify(file, remoteContent)
                 .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), 100);
+                  setTimeout(() => this.ignoreChanges.delete(file.path), 500);
                 })
                 .catch((error) => {
                   console.error(`[Syncline] Error updating ${file.path} after initial merge:`, error);
@@ -432,7 +432,7 @@ export default class SynclinePlugin extends Plugin {
               this.app.vault
                 .modify(file, merged)
                 .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), 100);
+                  setTimeout(() => this.ignoreChanges.delete(file.path), 500);
                 })
                 .catch((error) => {
                   console.error(`[Syncline] Error updating ${file.path} after merge:`, error);
@@ -506,7 +506,7 @@ export default class SynclinePlugin extends Plugin {
       this.app.fileManager.trashFile(file).catch((error) => {
         console.error(`[Syncline] Error deleting file ${filePath}:`, error);
       }).finally(() => {
-        setTimeout(() => this.ignoreChanges.delete(filePath), 100);
+        setTimeout(() => this.ignoreChanges.delete(filePath), 500);
       });
     }
     this.client?.remove_doc(uuid);
@@ -546,7 +546,7 @@ export default class SynclinePlugin extends Plugin {
           setTimeout(() => {
             this.ignoreChanges.delete(currentPath);
             this.ignoreChanges.delete(metaPath);
-          }, 100);
+          }, 500);
         }
       }
     }
@@ -564,7 +564,7 @@ export default class SynclinePlugin extends Plugin {
       } catch (error) {
         console.error(`[Syncline] Error updating file ${targetPath}:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(targetPath), 100);
+        setTimeout(() => this.ignoreChanges.delete(targetPath), 500);
       }
     } else if (!file && targetPath) {
       try {
@@ -579,7 +579,7 @@ export default class SynclinePlugin extends Plugin {
       } catch (error) {
         console.error(`[Syncline] Failed to create file ${targetPath} on remote update:`, error);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(targetPath), 100);
+        setTimeout(() => this.ignoreChanges.delete(targetPath), 500);
       }
     }
   }
