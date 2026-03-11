@@ -118,15 +118,27 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
             if rel_path.is_empty() {
                 continue;
             }
-            // Read content
-            let t = doc.get_or_insert_text("content");
-            let txn = doc.transact();
-            result.insert(rel_path, GetString::get_string(&t, &txn));
+            // Check meta.type — skip Y.Text for binary docs
+            let meta_type = {
+                let txn = doc.transact();
+                match meta.get(&txn, "type") {
+                    Some(Out::Any(Any::String(arc))) => arc.to_string(),
+                    _ => String::new(),
+                }
+            };
+            if meta_type == "binary" {
+                result.insert(rel_path, "[binary]".to_string());
+            } else {
+                // Read content
+                let t = doc.get_or_insert_text("content");
+                let txn = doc.transact();
+                result.insert(rel_path, GetString::get_string(&t, &txn));
+            }
         }
         result
     };
 
-    let mut expected_files: HashMap<String, String> = HashMap::new();
+    let mut expected_files: HashMap<String, Vec<u8>> = HashMap::new();
     let expected_yrs = load_yrs_map(&client_dirs[0]);
 
     for entry in walkdir::WalkDir::new(&client_dirs[0]).min_depth(1) {
@@ -139,7 +151,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
         if path.is_file() {
             let rel = path.strip_prefix(&client_dirs[0]).unwrap();
             let name = rel.to_string_lossy().into_owned();
-            let content = fs::read_to_string(path).unwrap();
+            let content = fs::read(path).unwrap();
             expected_files.insert(name, content);
         }
     }
@@ -147,7 +159,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
     let mut converged = true;
 
     for (idx, dir) in client_dirs.iter().enumerate().skip(1) {
-        let mut actual_files: HashMap<String, String> = HashMap::new();
+        let mut actual_files: HashMap<String, Vec<u8>> = HashMap::new();
         let actual_yrs = load_yrs_map(dir);
 
         for entry in walkdir::WalkDir::new(dir).min_depth(1) {
@@ -160,7 +172,7 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
             if path.is_file() {
                 let rel = path.strip_prefix(dir).unwrap();
                 let name = rel.to_string_lossy().into_owned();
-                let content = fs::read_to_string(path).unwrap();
+                let content = fs::read(path).unwrap();
                 actual_files.insert(name, content);
             }
         }
@@ -181,8 +193,8 @@ fn compare_directories(client_dirs: &[PathBuf]) -> bool {
                 && content != expected_content
             {
                 error!(
-                    "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {:?}\nClient {}: {:?}",
-                    name, idx, expected_content, idx, content
+                    "DISK File {} mismatches between Client 0 and Client {}.\nClient 0: {} bytes\nClient {}: {} bytes",
+                    name, idx, expected_content.len(), idx, content.len()
                 );
                 converged = false;
             }
@@ -409,17 +421,20 @@ async fn test_complex_directory_operations() {
 #[tokio::test]
 async fn test_filter_ignored_files() {
     let env = TestEnv::new(2).await;
-    let ignored0 = env.client_path(0).join("ignored.png");
+    let binary0 = env.client_path(0).join("image.png");
     let hidden0 = env.client_path(0).join(".hidden.md");
 
-    fs::write(&ignored0, "binary data").unwrap();
+    fs::write(&binary0, "binary data").unwrap();
     fs::write(&hidden0, "secret text").unwrap();
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
-    // Neither should appear in client 1
-    assert!(!env.client_path(1).join("ignored.png").exists());
-    assert!(!env.client_path(1).join(".hidden.md").exists());
+    // Binary files (like .png) should now be synced via binary support
+    assert!(env.client_path(1).join("image.png").exists(),
+            ".png file should be synced with binary file support");
+    // Hidden files (starting with .) should still NOT be synced
+    assert!(!env.client_path(1).join(".hidden.md").exists(),
+            ".hidden files should not be synced");
 }
 
 #[tokio::test]
@@ -683,5 +698,122 @@ async fn test_rename_sync() {
     assert!(
         wait_for_convergence(&env.dirs(), Duration::from_secs(5)).await,
         "Clients did not converge after rename"
+    );
+}
+
+// =============================================================================
+// Binary file tests
+// =============================================================================
+
+/// Client A creates a binary file (.png), and it should sync to Client B
+/// with identical bytes.
+#[tokio::test]
+async fn test_binary_file_sync() {
+    let env = TestEnv::new(2).await;
+
+    // Create a small "PNG" file (with valid PNG header)
+    let png_data: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG header
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+        0xDE, 0xAD, 0xBE, 0xEF, // test payload
+    ];
+    let png_path = env.client_path(0).join("test.png");
+    fs::write(&png_path, &png_data).unwrap();
+
+    // Wait for sync (binary files need time for blob upload+download)
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Client B should have the file with identical bytes
+    let client_b_path = env.client_path(1).join("test.png");
+    assert!(
+        client_b_path.exists(),
+        "Binary file test.png should exist on Client B"
+    );
+    let synced_data = fs::read(&client_b_path).unwrap();
+    assert_eq!(
+        png_data, synced_data,
+        "Binary file should have identical bytes on both clients"
+    );
+}
+
+/// Client A creates a binary file, syncs it, then modifies it.
+/// The updated binary should propagate to Client B.
+#[tokio::test]
+async fn test_binary_file_modify_sync() {
+    let env = TestEnv::new(2).await;
+
+    // Create initial binary file
+    let initial_data: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03, 0x04];
+    let bin_path = env.client_path(0).join("data.bin");
+    fs::write(&bin_path, &initial_data).unwrap();
+
+    // Wait for initial sync
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let client_b_path = env.client_path(1).join("data.bin");
+    assert!(
+        client_b_path.exists(),
+        "Binary file data.bin should exist on Client B after initial sync"
+    );
+    assert_eq!(
+        initial_data,
+        fs::read(&client_b_path).unwrap(),
+        "Initial binary content should match"
+    );
+
+    // Modify the binary file on Client A
+    let updated_data: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+    fs::write(&bin_path, &updated_data).unwrap();
+
+    // Wait for update to propagate
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let synced_updated = fs::read(&client_b_path).unwrap();
+    assert_eq!(
+        updated_data, synced_updated,
+        "Updated binary file should have new content on Client B"
+    );
+}
+
+/// Mixed text and binary files should all sync correctly together.
+#[tokio::test]
+async fn test_binary_and_text_mixed_sync() {
+    let env = TestEnv::new(2).await;
+
+    // Create a mix of text and binary files on Client A
+    fs::write(env.client_path(0).join("notes.md"), "# My Notes\nHello").unwrap();
+    fs::write(
+        env.client_path(0).join("image.png"),
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    )
+    .unwrap();
+    fs::write(
+        env.client_path(0).join("config.json"),
+        &[0x7B, 0x22, 0x6B, 0x65, 0x79, 0x22, 0x7D], // {"key"}
+    )
+    .unwrap();
+
+    // Wait for sync
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // All files should exist on Client B
+    assert!(env.client_path(1).join("notes.md").exists(), "notes.md should sync");
+    assert!(env.client_path(1).join("image.png").exists(), "image.png should sync");
+    assert!(env.client_path(1).join("config.json").exists(), "config.json should sync");
+
+    // Text file should have correct content
+    assert_eq!(
+        fs::read_to_string(env.client_path(1).join("notes.md")).unwrap(),
+        "# My Notes\nHello"
+    );
+
+    // Binary files should have identical bytes
+    assert_eq!(
+        fs::read(env.client_path(1).join("image.png")).unwrap(),
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+    assert_eq!(
+        fs::read(env.client_path(1).join("config.json")).unwrap(),
+        vec![0x7B, 0x22, 0x6B, 0x65, 0x79, 0x22, 0x7D]
     );
 }

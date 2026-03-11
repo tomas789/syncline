@@ -14,13 +14,25 @@ impl Db {
 
         let mut conn = pool.acquire().await?;
 
-        // Ensure table exists
+        // Ensure tables exist
         conn.execute(
             r#"
             CREATE TABLE IF NOT EXISTS updates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_id TEXT NOT NULL,
                 update_data BLOB NOT NULL
+            );
+            "#,
+        )
+        .await?;
+
+        conn.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS blobs (
+                hash TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             "#,
         )
@@ -98,6 +110,38 @@ impl Db {
         })
         .await
         .unwrap()
+    }
+
+    /// Store a binary blob by its SHA256 hash. Content-addressable: if the hash
+    /// already exists the insert is silently ignored (deduplication).
+    pub async fn save_blob(&self, hash: &str, data: &[u8]) -> Result<()> {
+        let size = data.len() as i64;
+        sqlx::query("INSERT OR IGNORE INTO blobs (hash, data, size) VALUES (?, ?, ?)")
+            .bind(hash)
+            .bind(data)
+            .bind(size)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a binary blob by its SHA256 hash. Returns None if not found.
+    pub async fn load_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query("SELECT data FROM blobs WHERE hash = ?")
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Check whether a blob with the given hash exists.
+    pub async fn has_blob(&self, hash: &str) -> Result<bool> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM blobs WHERE hash = ?")
+                .bind(hash)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 > 0)
     }
 }
 
@@ -177,5 +221,48 @@ mod tests {
         txn2.apply_update(Update::decode_v1(&sync_update).unwrap());
 
         assert_eq!(txt2.get_string(&txn2), "Hello! World.");
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_blob() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+
+        let hash = "abc123def456";
+        let data = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]; // PNG header
+
+        // Initially not present
+        assert!(!db.has_blob(hash).await.unwrap());
+        assert!(db.load_blob(hash).await.unwrap().is_none());
+
+        // Save it
+        db.save_blob(hash, &data).await.unwrap();
+
+        // Now present
+        assert!(db.has_blob(hash).await.unwrap());
+        let loaded = db.load_blob(hash).await.unwrap().unwrap();
+        assert_eq!(loaded, data);
+    }
+
+    #[tokio::test]
+    async fn test_blob_deduplication() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+
+        let hash = "dedup_hash";
+        let data1 = vec![1, 2, 3];
+        let data2 = vec![4, 5, 6]; // different data, same hash (shouldn't overwrite)
+
+        db.save_blob(hash, &data1).await.unwrap();
+        db.save_blob(hash, &data2).await.unwrap(); // INSERT OR IGNORE
+
+        // Should still return the original data (first insert wins)
+        let loaded = db.load_blob(hash).await.unwrap().unwrap();
+        assert_eq!(loaded, data1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_not_found() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+        assert!(db.load_blob("nonexistent").await.unwrap().is_none());
+        assert!(!db.has_blob("nonexistent").await.unwrap());
     }
 }

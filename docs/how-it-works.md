@@ -21,3 +21,15 @@ No merge conflicts, no weird duplicated `_Conflict_Copy` files, just seamless sy
 ## Real-Time & WebSockets
 
 When you're online, all of this happens basically instantly over WebSockets. The second you tap a letter on your phone, an incredibly tiny binary update is shot to the server, and the server broadcasts that letter out to your desktop where it magically pops up right within Obsidian.
+
+## Binary File Synchronization
+
+Not everything is text. Images, PDFs, and attachments are **binary files** that can't be merged character-by-character like text. Syncline handles these with a different strategy:
+
+1. **Content-Addressable Storage**: Each binary file is identified by its **SHA-256 hash**. The server stores blobs in a content-addressable `blobs` table — if two files have the same content, they share the same blob.
+
+2. **Metadata CRDTs**: Binary files still use a CRDT document, but only for **metadata** (`meta.path`, `meta.type`, `meta.blob_hash`). The actual binary content is transferred via separate `MSG_BLOB_UPDATE` messages, not through the CRDT.
+
+3. **Change Detection**: When a binary file is modified, the client computes its new SHA-256 hash and compares it with the hash stored in the CRDT. If they differ, the new blob is uploaded to the server and broadcast to all other clients.
+
+4. **Conflict Resolution**: Binary files use **Last-Write-Wins (LWW)** based on the CRDT timestamp of the `blob_hash` field. The latest writer's content wins. This is simpler than text merging but appropriate for binary data where character-level merging isn't possible.

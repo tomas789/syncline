@@ -31,7 +31,7 @@ Every message exchanged between the client and the server has the following bina
 
 ### Message Types
 
-There are three types of messages defined in the protocol:
+There are five types of messages defined in the protocol:
 
 - **`MSG_SYNC_STEP_1` (0x00)**
   - **Direction**: Client ➞ Server
@@ -49,6 +49,18 @@ There are three types of messages defined in the protocol:
   - **Purpose**: Disseminates newly applied changes to the document.
   - **Payload**: A Yjs Document update.
   - **Server behavior**: When the server receives a `MSG_UPDATE`, it (1) registers the `doc_id` in `__index__` if new, (2) persists the update to the database, and (3) broadcasts the update to all subscribers of the document's broadcast channel **except** the sender.
+
+- **`MSG_BLOB_UPDATE` (0x04)**
+  - **Direction**: Bidirectional (Client ➞ Server, Server ➞ Client)
+  - **Purpose**: Transfers raw binary file content (blobs). Used for files that cannot be represented as Yjs Text (images, PDFs, etc.).
+  - **Payload**: The raw binary content of the file.
+  - **Server behavior**: When the server receives a `MSG_BLOB_UPDATE`, it (1) computes the SHA-256 hash of the payload, (2) stores the blob in the `blobs` table (content-addressable by hash), and (3) broadcasts the blob to all subscribers of the document's broadcast channel **except** the sender.
+
+- **`MSG_BLOB_REQUEST` (0x05)**
+  - **Direction**: Client ➞ Server
+  - **Purpose**: Requests a specific blob by its SHA-256 hash. Used when a client receives a metadata update indicating a new `blob_hash` but does not have the corresponding binary content.
+  - **Payload**: The SHA-256 hash of the requested blob, encoded as a UTF-8 hex string.
+  - **Server behavior**: The server looks up the blob by hash in the `blobs` table and responds with a `MSG_BLOB_UPDATE` containing the blob data.
 
 ## Document Identification
 
@@ -158,23 +170,50 @@ The server and clients use a special reserved document ID `"__index__"` to track
 
 Each file in the vault is represented by a Yjs Document identified by a **UUID**.
 
-The document contains two top-level Yjs structures:
+#### Text File Documents
+
+Text files (`.md`, `.txt`) use the full Yjs CRDT for content synchronization:
 
 | Yrs Type | Name        | Purpose                                                      |
 | -------- | ----------- | ------------------------------------------------------------ |
 | `Y.Text` | `"content"` | The file's text content.                                     |
-| `Y.Map`  | `"meta"`    | Metadata about the file, currently containing the file path. |
+| `Y.Map`  | `"meta"`    | Metadata about the file (path, type).                        |
 
-#### The `content` Text
+##### The `content` Text
 
 - **Type**: `doc.getText('content')` / `doc.get_or_insert_text("content")`
 - **Data**: The entire text content of the file. Syncing this Yjs Text guarantees real-time collaborative text editing with conflict-free merging.
 
-#### The `meta` Map
+##### The `meta` Map
 
 - **Type**: `doc.getMap('meta')` / `doc.get_or_insert_map("meta")`
 - **Keys**:
-  - `"path"` (`string`) — The relative file path within the vault (e.g., `"notes/idea.md"` or `"journal/2024-01-15.md"`).
+  - `"path"` (`string`) — The relative file path within the vault (e.g., `"notes/idea.md"`).
+  - `"type"` (`string`) — `"text"` for text files (may be omitted for backward compatibility).
+
+#### Binary File Documents
+
+Binary files (images, PDFs, etc.) use a metadata-only CRDT document plus separate blob messages for content:
+
+| Yrs Type | Name     | Purpose                                                         |
+| -------- | -------- | --------------------------------------------------------------- |
+| `Y.Map`  | `"meta"` | Metadata about the file (path, type, blob hash).                |
+
+> **Note**: Binary documents do **not** have a `Y.Text("content")`. The binary data is transferred via `MSG_BLOB_UPDATE` messages, not through the CRDT.
+
+##### The `meta` Map (Binary)
+
+- **Keys**:
+  - `"path"` (`string`) — The relative file path within the vault (e.g., `"images/photo.png"`).
+  - `"type"` (`string`) — Always `"binary"` for binary files.
+  - `"blob_hash"` (`string`) — The SHA-256 hex hash of the file's binary content. Used for change detection and content-addressable storage.
+
+#### Binary File Synchronization Flow
+
+1. **Upload**: Client computes SHA-256 hash of the file, sets `meta.blob_hash` and `meta.type` in the CRDT, then sends a `MSG_BLOB_UPDATE` with the raw bytes.
+2. **Metadata broadcast**: The CRDT update (containing the new `blob_hash`) is broadcast to all clients via standard `MSG_UPDATE`.
+3. **Download**: Remote clients receive the metadata update, compare `blob_hash` with their local file, and send a `MSG_BLOB_REQUEST` if the hashes differ.
+4. **Conflict resolution**: Binary files use Last-Write-Wins (LWW) based on the CRDT timestamp of the `blob_hash` field. The latest writer's content wins.
 
 The `meta.path` field is critical for:
 
