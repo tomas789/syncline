@@ -430,8 +430,26 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                             let doc_id = msg.doc_id;
                             let blob_data = msg.payload;
 
-                            // Find the physical path for this UUID
-                            if let Some(rel_path) = local_state.path_map.get_path_for_uuid(&doc_id).map(|s| s.to_string()) {
+                            // Find the physical path for this UUID.
+                            // Primary: look up path_map (fast, in-memory).
+                            // Fallback: read meta.path from the persisted .bin doc
+                            // to handle the race where a BlobUpdate arrives before
+                            // the SyncStep2/Update that populates path_map.
+                            let rel_path = local_state.path_map.get_path_for_uuid(&doc_id).map(|s| s.to_string())
+                                .or_else(|| {
+                                    let state_path = local_state.get_state_path_for_uuid(&doc_id);
+                                    load_doc(&state_path).ok().and_then(|doc| {
+                                        let p = read_meta_path(&doc);
+                                        if let Some(ref path) = p {
+                                            // Populate path_map so future lookups succeed
+                                            local_state.path_map.insert(path.clone(), doc_id.clone());
+                                            let _ = local_state.path_map.save();
+                                        }
+                                        p
+                                    })
+                                });
+
+                            if let Some(rel_path) = rel_path {
                                 let phys_path = local_state.root_dir.join(&rel_path);
                                 if let Some(parent) = phys_path.parent() {
                                     let _ = fs::create_dir_all(parent);

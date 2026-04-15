@@ -18,7 +18,7 @@ pub fn get_available_port() -> u16 {
 
 pub async fn build_workspace() {
     let status = Command::new("cargo")
-        .args(["build", "--workspace"])
+        .args(["build", "-p", "syncline"])
         .status()
         .await
         .expect("cargo build failed");
@@ -835,4 +835,182 @@ async fn test_binary_and_text_mixed_sync() {
         fs::read(env.client_path(1).join("config.json")).unwrap(),
         vec![0x7B, 0x22, 0x6B, 0x65, 0x79, 0x22, 0x7D]
     );
+}
+
+// =============================================================================
+// UUID-named file regression test
+// =============================================================================
+
+/// Returns true if the string looks like a UUID (8-4-4-4-12 hex pattern).
+fn looks_like_uuid(s: &str) -> bool {
+    // Strip common extensions before checking
+    let stem = std::path::Path::new(s)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(s);
+    let parts: Vec<&str> = stem.split('-').collect();
+    parts.len() == 5
+        && parts[0].len() == 8
+        && parts[1].len() == 4
+        && parts[2].len() == 4
+        && parts[3].len() == 4
+        && parts[4].len() == 12
+        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Collect all user-visible filenames (excluding .syncline metadata) from a directory.
+fn collect_user_files(dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).min_depth(1) {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        if path_str.contains(".syncline") || path_str.contains(".git") {
+            continue;
+        }
+        if path.is_file() {
+            let rel = path.strip_prefix(dir).unwrap();
+            files.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    files
+}
+
+/// Sync-to-directory must produce files with their proper names, not with
+/// UUID-based names from the internal storage layer. This test creates text
+/// and binary files on Client 0 and verifies that Client 1's sync directory
+/// contains only properly-named files — no UUID artifacts.
+#[tokio::test]
+async fn test_no_uuid_named_files_in_sync_directory() {
+    let env = TestEnv::new(2).await;
+
+    // Create a mix of text and binary files on Client 0
+    fs::write(env.client_path(0).join("readme.md"), "# Hello").unwrap();
+    fs::write(env.client_path(0).join("notes.txt"), "some notes").unwrap();
+    fs::write(
+        env.client_path(0).join("photo.png"),
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    )
+    .unwrap();
+
+    // Wait for sync (binary files need extra time for blob upload/download)
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Verify convergence
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await,
+        "Clients should converge"
+    );
+
+    // Collect all user-visible files on Client 1
+    let client1_files = collect_user_files(env.client_path(1));
+
+    // Every file must have a proper name, not a UUID
+    for file in &client1_files {
+        assert!(
+            !looks_like_uuid(file),
+            "File '{}' on Client 1 looks like a UUID — sync-to-directory should use proper filenames from meta.path, not internal UUIDs",
+            file
+        );
+    }
+
+    // The expected files must exist with correct names
+    assert!(
+        client1_files.contains(&"readme.md".to_string()),
+        "readme.md should exist on Client 1, got: {:?}",
+        client1_files
+    );
+    assert!(
+        client1_files.contains(&"notes.txt".to_string()),
+        "notes.txt should exist on Client 1, got: {:?}",
+        client1_files
+    );
+    assert!(
+        client1_files.contains(&"photo.png".to_string()),
+        "photo.png should exist on Client 1, got: {:?}",
+        client1_files
+    );
+
+    // Verify content integrity
+    assert_eq!(
+        fs::read_to_string(env.client_path(1).join("readme.md")).unwrap(),
+        "# Hello"
+    );
+    assert_eq!(
+        fs::read_to_string(env.client_path(1).join("notes.txt")).unwrap(),
+        "some notes"
+    );
+    assert_eq!(
+        fs::read(env.client_path(1).join("photo.png")).unwrap(),
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+}
+
+/// A fresh client connecting to a server that already has data should
+/// receive files with proper names, not UUIDs. This tests the "cold start"
+/// sync-to-directory scenario where the client has no prior state.
+#[tokio::test]
+async fn test_fresh_client_receives_proper_filenames() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client A creates files and syncs them to the server
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    fs::write(dir_a.path().join("document.md"), "hello from A").unwrap();
+    fs::write(
+        dir_a.path().join("image.png"),
+        &[0x89, 0x50, 0x4E, 0x47, 0xDE, 0xAD],
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Kill client A — server retains the data
+    client_a.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client B connects fresh (empty directory, no .syncline state)
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "client-b").await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Verify Client B has files with proper names
+    let client_b_files = collect_user_files(dir_b.path());
+
+    for file in &client_b_files {
+        assert!(
+            !looks_like_uuid(file),
+            "Fresh client received UUID-named file '{}' — should have proper filename from meta.path",
+            file
+        );
+    }
+
+    assert!(
+        client_b_files.contains(&"document.md".to_string()),
+        "document.md should exist on fresh Client B, got: {:?}",
+        client_b_files
+    );
+    assert_eq!(
+        fs::read_to_string(dir_b.path().join("document.md")).unwrap(),
+        "hello from A"
+    );
+
+    assert!(
+        client_b_files.contains(&"image.png".to_string()),
+        "image.png should exist on fresh Client B, got: {:?}",
+        client_b_files
+    );
+    assert_eq!(
+        fs::read(dir_b.path().join("image.png")).unwrap(),
+        vec![0x89, 0x50, 0x4E, 0x47, 0xDE, 0xAD]
+    );
+
+    client_b.kill().await.unwrap();
+    server.kill().await.unwrap();
 }
