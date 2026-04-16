@@ -39,7 +39,16 @@ impl PathMap {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.file_path, json)?;
+
+        // Write to temp file, fsync, then atomic rename — same pattern as
+        // storage::save_doc to avoid half-written JSON on crash.
+        let tmp_path = self.file_path.with_extension("json.tmp");
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            std::io::Write::write_all(&mut file, json.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &self.file_path)?;
         Ok(())
     }
 
