@@ -940,9 +940,10 @@ mod tests {
     /// populated the CRDT with the latest server state. The diff treated
     /// the stale local file as authoritative, reverting remote edits.
     ///
-    /// **Fix**: On initial sync, if the CRDT already has content from the
-    /// server, the plugin writes the CRDT content to the local file instead
-    /// of pushing stale local content into the CRDT.
+    /// **Fix**: Persist CRDT state across sessions. On reconnect, load the
+    /// persisted state into the Doc before syncing. The diff then compares
+    /// the persisted state (last known synced content) vs local file,
+    /// producing only the delta (offline edits) — not a full revert.
     #[tokio::test]
     async fn test_initial_sync_should_not_revert_remote_edits() {
         let (port, _state) = setup_test_server().await;
@@ -1014,16 +1015,14 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // --- Phase 2: Client B connects fresh (simulating Obsidian mobile) ---
+        // --- Phase 2: Client B connects, syncs, persists CRDT state, then disconnects ---
+        //
+        // This simulates the Obsidian plugin's initial sync + state persistence.
 
         let (mut ws_b, _) = connect_async(&url).await.unwrap();
-
-        // Client B has a BRAND NEW Doc (no persisted CRDT state)
         let doc_b = Doc::new();
         let text_b = doc_b.get_or_insert_text("content");
-        assert_eq!(text_b.get_string(&doc_b.transact()), "", "Fresh doc is empty");
 
-        // Client B sends SyncStep1 with empty state vector
         let sv_b = doc_b.transact().state_vector().encode_v1();
         let sync_b =
             crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &sv_b);
@@ -1031,7 +1030,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Client B receives SyncStep2 with the full server state (includes A's edits)
+        // Receive SyncStep2 with full server state
         let result_b = tokio::time::timeout(Duration::from_millis(500), ws_b.next()).await;
         assert!(result_b.is_ok(), "Client B should receive SyncStep2");
         let ws_msg = result_b.unwrap().unwrap().unwrap();
@@ -1044,77 +1043,173 @@ mod tests {
             }
         }
 
-        // After SyncStep2, Client B's CRDT should have "Hello CRDT World"
-        let b_after_sync = text_b.get_string(&doc_b.transact());
         assert_eq!(
-            b_after_sync, "Hello CRDT World",
-            "Client B's CRDT should have the latest content after SyncStep2"
+            text_b.get_string(&doc_b.transact()),
+            "Hello CRDT World",
+            "Client B should have full content after initial sync"
         );
 
-        // --- Phase 3: BUG — Client B pushes stale local content ---
-        //
-        // The Obsidian plugin's addDocOnly callback reads the iPhone's local file
-        // (which still has "Hello World" — the old content before A's edit) and
-        // calls update(uuid, "Hello World"). This diffs "Hello CRDT World" →
-        // "Hello World", generating DELETE operations that revert A's edit.
-        //
-        // With the FIX, the plugin detects that the CRDT already has content
-        // from the server and writes the CRDT content to disk instead of pushing
-        // stale local content.
+        // Persist CRDT state (simulates saveCrdtState in the plugin)
+        let persisted_state =
+            doc_b.transact().encode_state_as_update_v1(&StateVector::default());
 
-        let stale_local_content = "Hello World"; // iPhone's local file (stale)
-        let remote_content = text_b.get_string(&doc_b.transact());
+        // Client B disconnects
+        let _ = ws_b.close(None).await;
+        drop(doc_b);
+        drop(text_b);
 
-        // FIX: If remote has content and differs from local, DON'T push local
-        // into the CRDT. Instead, use remote content (write to local disk file).
-        if remote_content.is_empty() {
-            // No remote content — safe to push local content (new file case)
-            let prev_sv_b = doc_b.transact().state_vector();
-            let diff = dissimilar::diff(&remote_content, stale_local_content);
-            let mut txn = doc_b.transact_mut();
+        // --- Phase 3: While Client B is offline, BOTH clients make edits ---
+
+        // Client A edits: "Hello CRDT World" → "Hello CRDT World - edited by A"
+        let prev_sv_a3 = doc_a.transact().state_vector();
+        {
+            let current = text_a.get_string(&doc_a.transact());
+            let new_content = format!("{} - edited by A", current);
+            let diff = dissimilar::diff(&current, &new_content);
+            let mut txn = doc_a.transact_mut();
             let mut cursor = 0u32;
             for chunk in diff {
                 match chunk {
                     dissimilar::Chunk::Equal(val) => cursor += val.len() as u32,
                     dissimilar::Chunk::Delete(val) => {
-                        text_b.remove_range(&mut txn, cursor, val.len() as u32);
+                        text_a.remove_range(&mut txn, cursor, val.len() as u32);
                     }
                     dissimilar::Chunk::Insert(val) => {
-                        text_b.insert(&mut txn, cursor, val);
+                        text_a.insert(&mut txn, cursor, val);
                         cursor += val.len() as u32;
                     }
                 }
             }
-            drop(txn);
-            let revert_update = doc_b.transact().encode_state_as_update_v1(&prev_sv_b);
-            let msg_b = crate::protocol::encode_message(
-                crate::protocol::MSG_UPDATE,
-                doc_id,
-                &revert_update,
-            );
-            ws_b.send(TungsteniteMessage::Binary(msg_b.into()))
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // else: remote has content, don't push stale local → no revert sent
+        let update_a3 = doc_a.transact().encode_state_as_update_v1(&prev_sv_a3);
+        let msg_a3 =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &update_a3);
+        ws_a.send(TungsteniteMessage::Binary(msg_a3.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Drain any messages Client A might receive
-        let _ = tokio::time::timeout(Duration::from_millis(300), ws_a.next()).await;
+        // Client B's local file is edited offline (iPhone user edits):
+        // "Hello CRDT World" → "Hello CRDT World - edited by B"
+        let local_file_content = "Hello CRDT World - edited by B";
 
-        // --- Phase 4: Verify Client A's content is preserved ---
-        // Client A's local CRDT should still be "Hello CRDT World"
-        let final_a = text_a.get_string(&doc_a.transact());
+        // --- Phase 4: Client B reconnects with persisted CRDT state ---
+        //
+        // This is the core of the fix: instead of creating Doc::new() (empty),
+        // load the persisted state first, THEN sync with the server.
+
+        let (mut ws_b2, _) = connect_async(&url).await.unwrap();
+
+        // Restore persisted CRDT state into a new Doc (simulates add_doc_with_state)
+        let doc_b2 = Doc::new();
+        let text_b2 = doc_b2.get_or_insert_text("content");
+        {
+            let u = Update::decode_v1(&persisted_state).unwrap();
+            let mut txn = doc_b2.transact_mut();
+            txn.apply_update(u);
+        }
         assert_eq!(
-            final_a, "Hello CRDT World",
-            "Client A's edits must NOT be reverted by Client B's stale initial sync"
+            text_b2.get_string(&doc_b2.transact()),
+            "Hello CRDT World",
+            "Restored doc should have the persisted content"
         );
 
-        // Client B should also have "Hello CRDT World" (from SyncStep2)
-        let final_b = text_b.get_string(&doc_b.transact());
+        // Step 1: Apply offline edits BEFORE syncing with server.
+        // Diff persisted content → local file content to capture B's offline edits.
+        // This happens immediately after loading persisted state, before SyncStep1.
+        let persisted_content = text_b2.get_string(&doc_b2.transact());
+        if persisted_content != local_file_content {
+            let diff = dissimilar::diff(&persisted_content, local_file_content);
+            let mut txn = doc_b2.transact_mut();
+            let mut cursor = 0u32;
+            for chunk in diff {
+                match chunk {
+                    dissimilar::Chunk::Equal(val) => cursor += val.len() as u32,
+                    dissimilar::Chunk::Delete(val) => {
+                        text_b2.remove_range(&mut txn, cursor, val.len() as u32);
+                    }
+                    dissimilar::Chunk::Insert(val) => {
+                        text_b2.insert(&mut txn, cursor, val);
+                        cursor += val.len() as u32;
+                    }
+                }
+            }
+        }
         assert_eq!(
-            final_b, "Hello CRDT World",
-            "Client B should have the merged content from the server"
+            text_b2.get_string(&doc_b2.transact()),
+            "Hello CRDT World - edited by B",
+            "After applying offline edits, doc should have B's changes"
+        );
+
+        // Step 2: Send SyncStep1 with the PERSISTED state vector (not empty!)
+        let sv_b2 = doc_b2.transact().state_vector().encode_v1();
+        let sync_b2 =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &sv_b2);
+        ws_b2
+            .send(TungsteniteMessage::Binary(sync_b2.into()))
+            .await
+            .unwrap();
+
+        // Also push full local state to server (includes offline edits)
+        let full_state = doc_b2
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let push_msg =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &full_state);
+        ws_b2
+            .send(TungsteniteMessage::Binary(push_msg.into()))
+            .await
+            .unwrap();
+
+        // Step 3: Receive SyncStep2 with A's offline edits — CRDT merges both
+        let result_b2 = tokio::time::timeout(Duration::from_millis(500), ws_b2.next()).await;
+        assert!(result_b2.is_ok(), "Client B should receive SyncStep2 with A's edits");
+        let ws_msg2 = result_b2.unwrap().unwrap().unwrap();
+        if let TungsteniteMessage::Binary(data) = ws_msg2 {
+            if let Some((_, _, payload)) = crate::protocol::decode_message(&data) {
+                if let Ok(u) = Update::decode_v1(payload) {
+                    let mut txn = doc_b2.transact_mut();
+                    txn.apply_update(u);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // --- Phase 5: Verify BOTH clients' edits are preserved ---
+
+        // Client B should have a merge of both offline edits.
+        // CRDT merge of concurrent " - edited by A" and " - edited by B"
+        // appended to "Hello CRDT World" will produce both suffixes
+        // (order depends on client IDs, but both must be present).
+        let final_b = text_b2.get_string(&doc_b2.transact());
+        assert!(
+            final_b.contains("edited by A") && final_b.contains("edited by B"),
+            "Client B should have BOTH offline edits merged. Got: {:?}",
+            final_b
+        );
+
+        // Client A receives B's offline edit via the server broadcast
+        let result_a = tokio::time::timeout(Duration::from_millis(500), ws_a.next()).await;
+        if let Ok(Some(Ok(TungsteniteMessage::Binary(data)))) = result_a {
+            if let Some((_, _, payload)) = crate::protocol::decode_message(&data) {
+                if let Ok(u) = Update::decode_v1(payload) {
+                    let mut txn = doc_a.transact_mut();
+                    txn.apply_update(u);
+                }
+            }
+        }
+
+        let final_a = text_a.get_string(&doc_a.transact());
+        assert!(
+            final_a.contains("edited by A") && final_a.contains("edited by B"),
+            "Client A should also have BOTH offline edits merged. Got: {:?}",
+            final_a
+        );
+
+        // Both clients converge to the same content
+        assert_eq!(
+            final_a, final_b,
+            "Both clients must converge to the same merged content"
         );
     }
 }
