@@ -18,8 +18,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use yrs::{Doc, GetString, StateVector, Text, Transact, Update, updates::decoder::Decode};
 
 use crate::protocol::{
-    MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_RESYNC, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
-    decode_message, encode_message,
+    MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_CHECKSUM, MSG_RESYNC, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2,
+    MSG_UPDATE, decode_message, encode_message,
 };
 
 type ChannelMap = Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>;
@@ -380,6 +380,67 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     }
                                     Ok(_) => {} // fully in sync, nothing to send
                                     Err(e) => tracing::error!("DB Error during resync: {}", e),
+                                }
+                            }
+                        }
+                        MSG_CHECKSUM => {
+                            // Client sends SHA256 hex digest of its text content.
+                            // Reconstruct the doc from DB and compare. On mismatch,
+                            // respond with a full SyncStep2 so the client converges.
+                            let client_hash = std::str::from_utf8(payload).unwrap_or("");
+                            if client_hash.is_empty() {
+                                tracing::debug!("Empty checksum for doc {}, ignoring", doc_id);
+                            } else {
+                                match state_clone
+                                    .db
+                                    .get_all_updates_since(doc_id, &StateVector::default())
+                                    .await
+                                {
+                                    Ok(full_update) if !full_update.is_empty() => {
+                                        // Rebuild the doc in memory and extract text content.
+                                        let tmp_doc = Doc::new();
+                                        if let Ok(update) = Update::decode_v1(&full_update) {
+                                            let mut txn = tmp_doc.transact_mut();
+                                            txn.apply_update(update);
+                                            drop(txn);
+
+                                            let text_ref = tmp_doc.get_or_insert_text("content");
+                                            let server_text =
+                                                text_ref.get_string(&tmp_doc.transact());
+                                            use sha2::{Digest, Sha256};
+                                            let server_hash =
+                                                format!("{:x}", Sha256::digest(server_text.as_bytes()));
+
+                                            if server_hash != client_hash {
+                                                tracing::warn!(
+                                                    "Checksum mismatch for doc {}: client={} server={}. Sending full state.",
+                                                    doc_id, client_hash, server_hash
+                                                );
+                                                let resp = encode_message(
+                                                    MSG_SYNC_STEP_2,
+                                                    doc_id,
+                                                    &full_update,
+                                                );
+                                                let _ = tx_socket_clone.send(resp);
+                                            } else {
+                                                tracing::debug!(
+                                                    "Checksum OK for doc {}: {}",
+                                                    doc_id,
+                                                    client_hash
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        // No data on server — nothing to compare.
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "DB error during checksum for doc {}: {}",
+                                            doc_id,
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1210,6 +1271,99 @@ mod tests {
         assert_eq!(
             final_a, final_b,
             "Both clients must converge to the same merged content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checksum_mismatch_triggers_sync() {
+        let (port, _state) = setup_test_server().await;
+
+        let (mut ws, _) =
+            connect_async(format!("ws://127.0.0.1:{}/sync", port))
+                .await
+                .unwrap();
+
+        let doc_id = "checksum_test_doc";
+
+        // Subscribe and upload initial content
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("content");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "Hello checksum");
+        }
+
+        let sv = doc.transact().state_vector().encode_v1();
+        let sync1_msg =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &sv);
+        ws.send(TungsteniteMessage::Binary(sync1_msg.into()))
+            .await
+            .unwrap();
+
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let update_msg =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &update);
+        ws.send(TungsteniteMessage::Binary(update_msg.into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain any pending messages (SyncStep2 from initial subscribe, index updates)
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+
+        // Send a WRONG checksum — should trigger a SyncStep2 response
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let checksum_msg = crate::protocol::encode_message(
+            crate::protocol::MSG_CHECKSUM,
+            doc_id,
+            wrong_hash.as_bytes(),
+        );
+        ws.send(TungsteniteMessage::Binary(checksum_msg.into()))
+            .await
+            .unwrap();
+
+        // We should receive a SyncStep2 with the full state
+        let response = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("Should receive response within 2s")
+            .expect("Stream should not end")
+            .expect("Should be a valid message");
+
+        if let TungsteniteMessage::Binary(data) = response {
+            let (msg_type, resp_doc_id, _payload) =
+                crate::protocol::decode_message(&data).expect("Should decode");
+            assert_eq!(msg_type, crate::protocol::MSG_SYNC_STEP_2);
+            assert_eq!(resp_doc_id, doc_id);
+        } else {
+            panic!("Expected binary message, got: {:?}", response);
+        }
+
+        // Now send the CORRECT checksum — should get no response
+        use sha2::{Digest, Sha256};
+        let correct_hash = format!("{:x}", Sha256::digest(b"Hello checksum"));
+        let checksum_msg = crate::protocol::encode_message(
+            crate::protocol::MSG_CHECKSUM,
+            doc_id,
+            correct_hash.as_bytes(),
+        );
+        ws.send(TungsteniteMessage::Binary(checksum_msg.into()))
+            .await
+            .unwrap();
+
+        // No response expected — timeout should fire
+        let no_response =
+            tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+        assert!(
+            no_response.is_err(),
+            "Should NOT receive a response when checksum matches"
         );
     }
 }

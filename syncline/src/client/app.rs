@@ -179,6 +179,9 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
         let mut resync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
         resync_interval.tick().await; // consume the immediate first tick
 
+        let mut checksum_interval = tokio::time::interval(tokio::time::Duration::from_secs(120));
+        checksum_interval.reset(); // skip immediate first tick
+
         loop {
             tokio::select! {
                 _ = resync_interval.tick() => {
@@ -509,7 +512,7 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                 warn!("Received blob for unknown UUID {}", doc_id);
                             }
                         }
-                        MsgType::SyncStep1 | MsgType::BlobRequest | MsgType::Resync => {}
+                        MsgType::SyncStep1 | MsgType::BlobRequest | MsgType::Resync | MsgType::Checksum => {}
                     }
                 }
 
@@ -794,6 +797,31 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                             }
                         }
                         Err(e) => error!("Watcher error: {:?}", e),
+                    }
+                }
+
+                _ = checksum_interval.tick() => {
+                    // Periodically send content checksums for all subscribed text docs
+                    // so the server can detect divergence and push corrections.
+                    for uuid in &subscribed_docs {
+                        if uuid == "__index__" { continue; }
+                        let state_path = local_state.get_state_path_for_uuid(uuid);
+                        if let Ok(doc) = load_doc(&state_path) {
+                            let meta_type = read_meta_type(&doc)
+                                .unwrap_or_else(|| "text".to_string());
+                            if meta_type != "text" { continue; }
+                            let text_ref = doc.get_or_insert_text("content");
+                            let content = text_ref.get_string(&doc.transact());
+                            let hash = sha256_hash(content.as_bytes());
+                            if let Err(e) = ws_tx.send(Message::new(
+                                MsgType::Checksum,
+                                uuid.clone(),
+                                hash.into_bytes(),
+                            )).await {
+                                error!("Failed to send checksum for {}: {:?}", uuid, e);
+                                break;
+                            }
+                        }
                     }
                 }
             }

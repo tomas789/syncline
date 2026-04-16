@@ -8,6 +8,9 @@ pub const MSG_BLOB_REQUEST: u8 = 5;
 /// this does NOT subscribe the client to the broadcast channel (it's already
 /// subscribed from the initial SyncStep1).
 pub const MSG_RESYNC: u8 = 6;
+/// Convergence checksum: client sends SHA256 of text content for a doc.
+/// If the server's content disagrees, it responds with a full SyncStep2.
+pub const MSG_CHECKSUM: u8 = 7;
 
 /// Maximum blob size in bytes (50 MB).
 pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;
