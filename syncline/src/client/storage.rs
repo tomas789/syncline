@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use yrs::ReadTxn;
 use yrs::Update;
@@ -7,6 +8,10 @@ use yrs::updates::decoder::Decode;
 use yrs::{Doc, StateVector, Transact};
 
 /// Serialize the entire document state to binary format.
+///
+/// Uses write-to-temp-then-rename for atomicity: if the process crashes
+/// mid-write, the original `.bin` file remains intact. Also calls `fsync`
+/// to ensure data reaches durable storage before renaming.
 pub fn save_doc(doc: &Doc, path: &Path) -> Result<()> {
     let txn = doc.transact();
     let update = txn.encode_state_as_update_v1(&StateVector::default());
@@ -16,7 +21,20 @@ pub fn save_doc(doc: &Doc, path: &Path) -> Result<()> {
         fs::create_dir_all(parent).context("Failed to create parent directories")?;
     }
 
-    fs::write(path, update).context("Failed to write document update to disk")?;
+    // Write to a temp file in the same directory, fsync, then rename.
+    // rename() is atomic on POSIX; on the same filesystem it's a single
+    // metadata operation that either succeeds fully or not at all.
+    let tmp_path = path.with_extension("bin.tmp");
+    {
+        let mut file =
+            fs::File::create(&tmp_path).context("Failed to create temp file for doc save")?;
+        file.write_all(&update)
+            .context("Failed to write doc state to temp file")?;
+        file.sync_all()
+            .context("Failed to fsync doc state")?;
+    }
+    fs::rename(&tmp_path, path).context("Failed to atomically rename temp file")?;
+
     Ok(())
 }
 
