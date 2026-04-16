@@ -236,8 +236,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             // Persist the update synchronously BEFORE broadcasting so that any
                             // concurrent SyncStep2 responses (triggered by a subscriber that just
                             // joined) always include the latest content.
+                            //
+                            // IMPORTANT: If DB persistence fails, we must NOT broadcast.
+                            // Broadcasting without persisting creates a split-brain: connected
+                            // clients see the update, but any client that (re)connects later
+                            // will never receive it via SyncStep2. The sending client retains
+                            // the update locally and will re-send it on next sync.
                             if let Err(e) = state_clone.db.save_update(doc_id, payload).await {
-                                tracing::error!("DB Save Error: {}", e);
+                                tracing::error!(
+                                    "DB Save Error for doc {}: {}. Update NOT broadcast — \
+                                     client will retry on next sync.",
+                                    doc_id,
+                                    e
+                                );
+                                continue; // skip broadcast
                             }
 
                             // Auto-create the channel if it doesn't exist yet. This handles
