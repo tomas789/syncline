@@ -590,31 +590,55 @@ async fn test_both_offline_same_name_conflict() {
 
     // B reconnects — detects conflict, renames its content
     let mut client_b2 = spawn_client_with_name(dir_b.path(), port, "client-b").await;
-    tokio::time::sleep(Duration::from_millis(8000)).await;
 
-    // B's shared.md should now have A's content
-    let shared_b = fs::read_to_string(dir_b.path().join("shared.md")).unwrap();
-    assert_eq!(
-        shared_b, "A's offline content",
-        "shared.md on B should be replaced with A's (server) content"
-    );
-
-    // B's conflict file should contain B's original content
+    // Wait until conflict resolution completes on B: shared.md has A's content
+    // and the conflict file exists with B's content.
     let conflict_b = dir_b.path().join("shared (client-b).md");
-    assert!(
-        conflict_b.exists(),
-        "Conflict file 'shared (client-b).md' should exist on B"
-    );
-    assert_eq!(fs::read_to_string(&conflict_b).unwrap(), "B's offline content");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let shared_ok = fs::read_to_string(dir_b.path().join("shared.md"))
+            .map(|c| c == "A's offline content")
+            .unwrap_or(false);
+        let conflict_ok = fs::read_to_string(&conflict_b)
+            .map(|c| c == "B's offline content")
+            .unwrap_or(false);
+        if shared_ok && conflict_ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Timed out waiting for conflict resolution on B. \
+             shared.md exists={} content={:?}, conflict file exists={} content={:?}, \
+             all files: {:?}",
+            dir_b.path().join("shared.md").exists(),
+            fs::read_to_string(dir_b.path().join("shared.md")).ok(),
+            conflict_b.exists(),
+            fs::read_to_string(&conflict_b).ok(),
+            fs::read_dir(dir_b.path())
+                .map(|rd| rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     // A should eventually receive the conflict file
-    tokio::time::sleep(Duration::from_millis(3000)).await;
     let conflict_a = dir_a.path().join("shared (client-b).md");
-    assert!(
-        conflict_a.exists(),
-        "Client A should receive the conflict file 'shared (client-b).md'"
-    );
-    assert_eq!(fs::read_to_string(&conflict_a).unwrap(), "B's offline content");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ok = fs::read_to_string(&conflict_a)
+            .map(|c| c == "B's offline content")
+            .unwrap_or(false);
+        if ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Timed out waiting for Client A to receive conflict file 'shared (client-b).md'"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     client_a2.kill().await.unwrap();
     client_b2.kill().await.unwrap();
