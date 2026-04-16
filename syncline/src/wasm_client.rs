@@ -10,8 +10,8 @@ use yrs::updates::encoder::Encode;
 use yrs::{Any, Doc, GetString, Map, Out, ReadTxn, StateVector, Subscription, Text, Transact, Update};
 
 use crate::protocol::{
-    decode_message, encode_message, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_SYNC_STEP_1,
-    MSG_SYNC_STEP_2, MSG_UPDATE,
+    decode_message, encode_message, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_RESYNC,
+    MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
 };
 
 struct DocState {
@@ -36,6 +36,7 @@ pub struct SynclineClient {
     closures: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>>,
     is_connected: Rc<RefCell<bool>>,
     index_callback: Rc<RefCell<Option<Function>>>,
+    resync_interval_id: Rc<RefCell<Option<i32>>>,
 }
 
 #[wasm_bindgen]
@@ -51,6 +52,7 @@ impl SynclineClient {
             closures: Rc::new(RefCell::new(Vec::new())),
             is_connected: Rc::new(RefCell::new(false)),
             index_callback: Rc::new(RefCell::new(None)),
+            resync_interval_id: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -194,8 +196,46 @@ impl SynclineClient {
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
         self.closures.borrow_mut().push(onclose);
 
-        self.ws = Some(ws);
+        self.ws = Some(ws.clone());
+
+        // Start periodic resync interval (every 60s)
+        self.stop_resync_interval();
+        let docs_resync = self.docs.clone();
+        let is_connected_resync = self.is_connected.clone();
+        let ws_resync = ws;
+        let resync_cb = Closure::wrap(Box::new(move || {
+            if !*is_connected_resync.borrow() {
+                return;
+            }
+            let docs = docs_resync.borrow();
+            for (doc_id, state) in docs.iter() {
+                let sv = state.doc.transact().state_vector().encode_v1();
+                let msg = encode_message(MSG_RESYNC, doc_id, &sv);
+                let array = Uint8Array::from(&msg[..]);
+                let _ = ws_resync.send_with_array_buffer_view(&array);
+            }
+        }) as Box<dyn FnMut()>);
+
+        let window = web_sys::window().unwrap();
+        let id = window
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                resync_cb.as_ref().unchecked_ref(),
+                60_000, // 60 seconds
+            )
+            .unwrap_or(-1);
+        *self.resync_interval_id.borrow_mut() = Some(id);
+        // Prevent the closure from being dropped (which would invalidate the callback)
+        resync_cb.forget();
+
         Ok(())
+    }
+
+    fn stop_resync_interval(&self) {
+        if let Some(id) = self.resync_interval_id.borrow_mut().take() {
+            if let Some(window) = web_sys::window() {
+                window.clear_interval_with_handle(id);
+            }
+        }
     }
 
     pub fn add_doc(&self, doc_id: String, callback: Function) -> Result<(), JsValue> {
@@ -582,6 +622,7 @@ impl SynclineClient {
     }
 
     pub fn disconnect(&mut self) {
+        self.stop_resync_interval();
         if let Some(ws) = self.ws.take() {
             ws.set_onopen(None);
             ws.set_onmessage(None);

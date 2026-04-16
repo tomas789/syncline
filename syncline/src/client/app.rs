@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
@@ -152,8 +152,28 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
             }
         }
 
+        // Periodic reconciliation: re-send state vectors to catch any updates
+        // lost due to broadcast receiver lag or transient network issues.
+        let mut resync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        resync_interval.tick().await; // consume the immediate first tick
+
         loop {
             tokio::select! {
+                _ = resync_interval.tick() => {
+                    let doc_ids: Vec<String> = subscribed_docs.iter().cloned().collect();
+                    for doc_id in doc_ids {
+                        let state_path = local_state.get_state_path_for_uuid(&doc_id);
+                        if let Ok(doc) = load_doc(&state_path) {
+                            let sv = doc.transact().state_vector().encode_v1();
+                            if let Err(e) = ws_tx.send(Message::new(MsgType::Resync, doc_id.clone(), sv)).await {
+                                error!("Failed to send resync for {}: {:?}", doc_id, e);
+                                break;
+                            }
+                        }
+                    }
+                    debug!("Periodic resync sent for {} docs", subscribed_docs.len());
+                }
+
                 app_msg = app_rx.recv() => {
                     let msg = match app_msg {
                         Some(m) => m,
@@ -463,7 +483,7 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                 warn!("Received blob for unknown UUID {}", doc_id);
                             }
                         }
-                        MsgType::SyncStep1 | MsgType::BlobRequest => {}
+                        MsgType::SyncStep1 | MsgType::BlobRequest | MsgType::Resync => {}
                     }
                 }
 
