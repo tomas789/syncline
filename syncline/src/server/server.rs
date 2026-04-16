@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use yrs::{Doc, GetString, StateVector, Text, Transact, Update, updates::decoder::Decode};
 
 use crate::protocol::{
-    MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
+    MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_RESYNC, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
     decode_message, encode_message,
 };
 
@@ -312,6 +312,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }
                                 Err(e) => {
                                     tracing::error!("DB blob load error: {}", e);
+                                }
+                            }
+                        }
+                        MSG_RESYNC => {
+                            // Periodic reconciliation: send SyncStep2 with any
+                            // missing updates, but do NOT create a new broadcast
+                            // subscription (the client is already subscribed from
+                            // the initial SyncStep1).
+                            tracing::debug!("Received RESYNC for doc: {}", doc_id);
+                            if let Ok(sv) = StateVector::decode_v1(payload) {
+                                match state_clone.db.get_all_updates_since(doc_id, &sv).await {
+                                    Ok(update) if !update.is_empty() => {
+                                        tracing::info!(
+                                            "Resync: sending {} bytes for doc {}",
+                                            update.len(),
+                                            doc_id
+                                        );
+                                        let resp = encode_message(MSG_SYNC_STEP_2, doc_id, &update);
+                                        let _ = tx_socket_clone.send(resp);
+                                    }
+                                    Ok(_) => {} // fully in sync, nothing to send
+                                    Err(e) => tracing::error!("DB Error during resync: {}", e),
                                 }
                             }
                         }
@@ -745,6 +767,115 @@ mod tests {
         assert_eq!(
             final_b, "Hello",
             "Client B should still be 'Hello' — stale diff was suppressed by ignoreChanges guard"
+        );
+    }
+
+    /// Test that MSG_RESYNC allows a client to catch up on missed updates
+    /// without creating duplicate broadcast subscriptions.
+    #[tokio::test]
+    async fn test_resync_catches_missed_updates() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let doc_id = "resync_test_doc";
+
+        // Client A subscribes and creates content
+        let (mut ws_a, _) = connect_async(&url).await.unwrap();
+        let doc_a = Doc::new();
+        let text_a = doc_a.get_or_insert_text("content");
+
+        // Subscribe via SyncStep1
+        let sv = doc_a.transact().state_vector().encode_v1();
+        let msg = encode_message(MSG_SYNC_STEP_1, doc_id, &sv);
+        ws_a.send(TungsteniteMessage::Binary(msg.into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), ws_a.next()).await;
+
+        // Client A writes content
+        let prev_sv = doc_a.transact().state_vector();
+        {
+            let mut txn = doc_a.transact_mut();
+            text_a.insert(&mut txn, 0, "Hello World");
+        }
+        let update = doc_a.transact().encode_state_as_update_v1(&prev_sv);
+        let msg = encode_message(MSG_UPDATE, doc_id, &update);
+        ws_a.send(TungsteniteMessage::Binary(msg.into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Client B subscribes (gets SyncStep2 with "Hello World")
+        let (mut ws_b, _) = connect_async(&url).await.unwrap();
+        let doc_b = Doc::new();
+        let text_b = doc_b.get_or_insert_text("content");
+
+        let sv_b = doc_b.transact().state_vector().encode_v1();
+        let msg = encode_message(MSG_SYNC_STEP_1, doc_id, &sv_b);
+        ws_b.send(TungsteniteMessage::Binary(msg.into())).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), ws_b.next()).await;
+        if let Ok(Some(Ok(TungsteniteMessage::Binary(data)))) = result {
+            if let Some((_, _, payload)) = decode_message(&data) {
+                if let Ok(u) = Update::decode_v1(payload) {
+                    let mut txn = doc_b.transact_mut();
+                    txn.apply_update(u);
+                }
+            }
+        }
+        assert_eq!(text_b.get_string(&doc_b.transact()), "Hello World");
+
+        // Client A makes another edit while Client B "misses" the broadcast
+        // (simulated by just not reading from ws_b for a while)
+        let prev_sv2 = doc_a.transact().state_vector();
+        {
+            let current = text_a.get_string(&doc_a.transact());
+            let new_content = format!("{} Updated", current);
+            let diff = dissimilar::diff(&current, &new_content);
+            let mut txn = doc_a.transact_mut();
+            let mut cursor = 0u32;
+            for chunk in diff {
+                match chunk {
+                    dissimilar::Chunk::Equal(val) => cursor += val.len() as u32,
+                    dissimilar::Chunk::Delete(val) => {
+                        text_a.remove_range(&mut txn, cursor, val.len() as u32);
+                    }
+                    dissimilar::Chunk::Insert(val) => {
+                        text_a.insert(&mut txn, cursor, val);
+                        cursor += val.len() as u32;
+                    }
+                }
+            }
+        }
+        let update2 = doc_a.transact().encode_state_as_update_v1(&prev_sv2);
+        let msg = encode_message(MSG_UPDATE, doc_id, &update2);
+        ws_a.send(TungsteniteMessage::Binary(msg.into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain the broadcast message that Client B would have received
+        // (in the real scenario, this could be lost due to lag)
+        let _ = tokio::time::timeout(Duration::from_millis(200), ws_b.next()).await;
+
+        // Now Client B sends MSG_RESYNC with its current state vector
+        let sv_resync = doc_b.transact().state_vector().encode_v1();
+        let resync_msg = encode_message(MSG_RESYNC, doc_id, &sv_resync);
+        ws_b.send(TungsteniteMessage::Binary(resync_msg.into())).await.unwrap();
+
+        // Client B should receive a SyncStep2 with the missing update
+        let result = tokio::time::timeout(Duration::from_millis(500), ws_b.next()).await;
+        assert!(result.is_ok(), "Client B should receive resync response");
+        let ws_msg = result.unwrap().unwrap().unwrap();
+        if let TungsteniteMessage::Binary(data) = ws_msg {
+            if let Some((msg_type, _, payload)) = decode_message(&data) {
+                assert_eq!(msg_type, MSG_SYNC_STEP_2, "Response should be SYNC_STEP_2");
+                if let Ok(u) = Update::decode_v1(payload) {
+                    let mut txn = doc_b.transact_mut();
+                    txn.apply_update(u);
+                }
+            }
+        }
+
+        // After resync, Client B should have the full content
+        assert_eq!(
+            text_b.get_string(&doc_b.transact()),
+            "Hello World Updated",
+            "Client B should catch up to the latest content via RESYNC"
         );
     }
 }
