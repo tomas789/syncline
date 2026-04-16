@@ -449,8 +449,22 @@ export default class SynclinePlugin extends Plugin {
           .then((content) => {
             const remoteContent = this.client?.get_text(uuid) || "";
 
-            // If local file is empty (e.g. iCloud stub) but remote has content, use remote.
-            if (content === "" && remoteContent !== "") {
+            if (content === remoteContent) {
+              // Already in sync — nothing to do.
+              return;
+            }
+
+            if (remoteContent !== "") {
+              // FIX: Remote already has content (from SyncStep2). Write it to
+              // the local file instead of pushing stale local content into the
+              // CRDT. Without this guard, update(uuid, content) diffs the
+              // remote state → stale local file, generating DELETE operations
+              // that revert other clients' edits.
+              //
+              // Trade-off: offline edits made on this device while the CRDT
+              // state was not persisted will be lost in favour of the server's
+              // merged state. Proper offline-edit support requires persisting
+              // the CRDT document across sessions (future work).
               this.ignoreChanges.add(file.path);
               this.app.vault
                 .modify(file, remoteContent)
@@ -458,25 +472,13 @@ export default class SynclinePlugin extends Plugin {
                   setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
                 })
                 .catch((error) => {
-                  console.error(`[Syncline] Error updating ${file.path} after initial merge:`, error);
+                  console.error(`[Syncline] Error updating ${file.path} after initial sync:`, error);
                 });
               return;
             }
 
+            // Remote is empty — this is a new file. Push local content.
             this.client?.update(uuid, content);
-
-            const merged = this.client?.get_text(uuid);
-            if (merged && merged !== content) {
-              this.ignoreChanges.add(file.path);
-              this.app.vault
-                .modify(file, merged)
-                .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
-                })
-                .catch((error) => {
-                  console.error(`[Syncline] Error updating ${file.path} after merge:`, error);
-                });
-            }
           })
           .catch((error) => {
             console.error(`[Syncline] Error reading ${file.path}:`, error);
