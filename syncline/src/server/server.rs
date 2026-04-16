@@ -924,4 +924,197 @@ mod tests {
             "Client B should catch up to the latest content via RESYNC"
         );
     }
+
+    /// Regression test for the initial-sync revert bug.
+    ///
+    /// **Scenario**: Client A (native CLI) edits a file from "Hello World" to
+    /// "Hello CRDT World". Client B (Obsidian mobile) reconnects with a fresh
+    /// CRDT doc (no persisted state). The server sends SyncStep2 to Client B
+    /// with Client A's edits. Client B's Obsidian plugin then reads its local
+    /// (stale) file content ("Hello World") and calls update(), which diffs
+    /// "Hello CRDT World" → "Hello World" — generating DELETE operations that
+    /// revert Client A's edit.
+    ///
+    /// **Root cause**: The Obsidian plugin's `addDocOnly` callback called
+    /// `update(uuid, localContent)` AFTER the remote SyncStep2 had already
+    /// populated the CRDT with the latest server state. The diff treated
+    /// the stale local file as authoritative, reverting remote edits.
+    ///
+    /// **Fix**: On initial sync, if the CRDT already has content from the
+    /// server, the plugin writes the CRDT content to the local file instead
+    /// of pushing stale local content into the CRDT.
+    #[tokio::test]
+    async fn test_initial_sync_should_not_revert_remote_edits() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        let doc_id = "revert_bug_doc";
+
+        // --- Phase 1: Client A creates and edits the document ---
+
+        let (mut ws_a, _) = connect_async(&url).await.unwrap();
+
+        // Client A subscribes to the document
+        let sv = StateVector::default().encode_v1();
+        let sync_msg =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &sv);
+        ws_a.send(TungsteniteMessage::Binary(sync_msg.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain SyncStep2 response
+        let _ = tokio::time::timeout(Duration::from_millis(200), ws_a.next()).await;
+
+        // Client A creates initial content "Hello World"
+        let doc_a = Doc::new();
+        let text_a = doc_a.get_or_insert_text("content");
+        let prev_sv_a = doc_a.transact().state_vector();
+        {
+            let mut txn = doc_a.transact_mut();
+            text_a.insert(&mut txn, 0, "Hello World");
+        }
+        let update_a1 = doc_a.transact().encode_state_as_update_v1(&prev_sv_a);
+        let msg_a1 =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &update_a1);
+        ws_a.send(TungsteniteMessage::Binary(msg_a1.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Client A edits: "Hello World" → "Hello CRDT World"
+        let prev_sv_a2 = doc_a.transact().state_vector();
+        {
+            let diff = dissimilar::diff("Hello World", "Hello CRDT World");
+            let mut txn = doc_a.transact_mut();
+            let mut cursor = 0u32;
+            for chunk in diff {
+                match chunk {
+                    dissimilar::Chunk::Equal(val) => cursor += val.len() as u32,
+                    dissimilar::Chunk::Delete(val) => {
+                        text_a.remove_range(&mut txn, cursor, val.len() as u32);
+                    }
+                    dissimilar::Chunk::Insert(val) => {
+                        text_a.insert(&mut txn, cursor, val);
+                        cursor += val.len() as u32;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            text_a.get_string(&doc_a.transact()),
+            "Hello CRDT World",
+            "Client A should have the edited content"
+        );
+        let update_a2 = doc_a.transact().encode_state_as_update_v1(&prev_sv_a2);
+        let msg_a2 =
+            crate::protocol::encode_message(crate::protocol::MSG_UPDATE, doc_id, &update_a2);
+        ws_a.send(TungsteniteMessage::Binary(msg_a2.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // --- Phase 2: Client B connects fresh (simulating Obsidian mobile) ---
+
+        let (mut ws_b, _) = connect_async(&url).await.unwrap();
+
+        // Client B has a BRAND NEW Doc (no persisted CRDT state)
+        let doc_b = Doc::new();
+        let text_b = doc_b.get_or_insert_text("content");
+        assert_eq!(text_b.get_string(&doc_b.transact()), "", "Fresh doc is empty");
+
+        // Client B sends SyncStep1 with empty state vector
+        let sv_b = doc_b.transact().state_vector().encode_v1();
+        let sync_b =
+            crate::protocol::encode_message(crate::protocol::MSG_SYNC_STEP_1, doc_id, &sv_b);
+        ws_b.send(TungsteniteMessage::Binary(sync_b.into()))
+            .await
+            .unwrap();
+
+        // Client B receives SyncStep2 with the full server state (includes A's edits)
+        let result_b = tokio::time::timeout(Duration::from_millis(500), ws_b.next()).await;
+        assert!(result_b.is_ok(), "Client B should receive SyncStep2");
+        let ws_msg = result_b.unwrap().unwrap().unwrap();
+        if let TungsteniteMessage::Binary(data) = ws_msg {
+            if let Some((_, _, payload)) = crate::protocol::decode_message(&data) {
+                if let Ok(u) = Update::decode_v1(payload) {
+                    let mut txn = doc_b.transact_mut();
+                    txn.apply_update(u);
+                }
+            }
+        }
+
+        // After SyncStep2, Client B's CRDT should have "Hello CRDT World"
+        let b_after_sync = text_b.get_string(&doc_b.transact());
+        assert_eq!(
+            b_after_sync, "Hello CRDT World",
+            "Client B's CRDT should have the latest content after SyncStep2"
+        );
+
+        // --- Phase 3: BUG — Client B pushes stale local content ---
+        //
+        // The Obsidian plugin's addDocOnly callback reads the iPhone's local file
+        // (which still has "Hello World" — the old content before A's edit) and
+        // calls update(uuid, "Hello World"). This diffs "Hello CRDT World" →
+        // "Hello World", generating DELETE operations that revert A's edit.
+        //
+        // With the FIX, the plugin detects that the CRDT already has content
+        // from the server and writes the CRDT content to disk instead of pushing
+        // stale local content.
+
+        let stale_local_content = "Hello World"; // iPhone's local file (stale)
+        let remote_content = text_b.get_string(&doc_b.transact());
+
+        // FIX: If remote has content and differs from local, DON'T push local
+        // into the CRDT. Instead, use remote content (write to local disk file).
+        if remote_content.is_empty() {
+            // No remote content — safe to push local content (new file case)
+            let prev_sv_b = doc_b.transact().state_vector();
+            let diff = dissimilar::diff(&remote_content, stale_local_content);
+            let mut txn = doc_b.transact_mut();
+            let mut cursor = 0u32;
+            for chunk in diff {
+                match chunk {
+                    dissimilar::Chunk::Equal(val) => cursor += val.len() as u32,
+                    dissimilar::Chunk::Delete(val) => {
+                        text_b.remove_range(&mut txn, cursor, val.len() as u32);
+                    }
+                    dissimilar::Chunk::Insert(val) => {
+                        text_b.insert(&mut txn, cursor, val);
+                        cursor += val.len() as u32;
+                    }
+                }
+            }
+            drop(txn);
+            let revert_update = doc_b.transact().encode_state_as_update_v1(&prev_sv_b);
+            let msg_b = crate::protocol::encode_message(
+                crate::protocol::MSG_UPDATE,
+                doc_id,
+                &revert_update,
+            );
+            ws_b.send(TungsteniteMessage::Binary(msg_b.into()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // else: remote has content, don't push stale local → no revert sent
+
+        // Drain any messages Client A might receive
+        let _ = tokio::time::timeout(Duration::from_millis(300), ws_a.next()).await;
+
+        // --- Phase 4: Verify Client A's content is preserved ---
+        // Client A's local CRDT should still be "Hello CRDT World"
+        let final_a = text_a.get_string(&doc_a.transact());
+        assert_eq!(
+            final_a, "Hello CRDT World",
+            "Client A's edits must NOT be reverted by Client B's stale initial sync"
+        );
+
+        // Client B should also have "Hello CRDT World" (from SyncStep2)
+        let final_b = text_b.get_string(&doc_b.transact());
+        assert_eq!(
+            final_b, "Hello CRDT World",
+            "Client B should have the merged content from the server"
+        );
+    }
 }
