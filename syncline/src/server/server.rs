@@ -172,8 +172,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             // (i.e. when this WebSocket connection ends).
                             let tx_fwd = tx_socket_clone.clone();
                             let doc_id_str = doc_id.to_string();
+                            let db_fwd = state_clone.db.clone();
                             tokio::spawn(async move {
                                 let mut rx = rx;
+                                // Tracks the client's approximate state vector.
+                                // On lag, we do a full catch-up from the DB using
+                                // an empty SV (sends everything), which is safe
+                                // because CRDT updates are idempotent.
                                 loop {
                                     tokio::select! {
                                         _ = tx_fwd.closed() => break,
@@ -193,14 +198,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 }
                                                 Err(broadcast::error::RecvError::Closed) => break,
                                                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                                                    // Even with a large buffer this can happen under
-                                                    // extreme load.  Log it; the receiver is
-                                                    // automatically advanced to the oldest available
-                                                    // message, so no explicit action is needed.
+                                                    // The receiver missed N messages. Instead of
+                                                    // silently skipping them, do a full catch-up
+                                                    // from the DB. This is safe because CRDT
+                                                    // updates are idempotent — re-applying already-
+                                                    // seen operations is a no-op.
                                                     tracing::warn!(
-                                                        "Broadcast receiver lagged by {} messages for doc {}",
+                                                        "Broadcast receiver lagged by {} messages for doc {}. \
+                                                         Triggering full catch-up from DB.",
                                                         n, doc_id_str
                                                     );
+                                                    match db_fwd.get_all_updates_since(
+                                                        &doc_id_str,
+                                                        &StateVector::default(),
+                                                    ).await {
+                                                        Ok(update) if !update.is_empty() => {
+                                                            let resp = encode_message(
+                                                                MSG_SYNC_STEP_2,
+                                                                &doc_id_str,
+                                                                &update,
+                                                            );
+                                                            if tx_fwd.send(resp).is_err() {
+                                                                break;
+                                                            }
+                                                            tracing::info!(
+                                                                "Sent full catch-up ({} bytes) for doc {} after lag",
+                                                                update.len(),
+                                                                doc_id_str
+                                                            );
+                                                        }
+                                                        Ok(_) => {} // DB empty, nothing to catch up
+                                                        Err(e) => {
+                                                            tracing::error!(
+                                                                "DB error during lag catch-up for {}: {}",
+                                                                doc_id_str, e
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
