@@ -3,6 +3,11 @@ pub const MSG_SYNC_STEP_2: u8 = 1;
 pub const MSG_UPDATE: u8 = 2;
 pub const MSG_BLOB_UPDATE: u8 = 4;
 pub const MSG_BLOB_REQUEST: u8 = 5;
+/// Periodic reconciliation: client sends its state vector; server responds
+/// with MSG_SYNC_STEP_2 containing any missing updates.  Unlike MSG_SYNC_STEP_1,
+/// this does NOT subscribe the client to the broadcast channel (it's already
+/// subscribed from the initial SyncStep1).
+pub const MSG_RESYNC: u8 = 6;
 
 /// Maximum blob size in bytes (50 MB).
 pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;

@@ -8,6 +8,7 @@ pub enum MsgType {
     Update = 0x02,
     BlobUpdate = 0x04,
     BlobRequest = 0x05,
+    Resync = 0x06,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -20,6 +21,7 @@ impl TryFrom<u8> for MsgType {
             0x02 => Ok(MsgType::Update),
             0x04 => Ok(MsgType::BlobUpdate),
             0x05 => Ok(MsgType::BlobRequest),
+            0x06 => Ok(MsgType::Resync),
             _ => Err(anyhow!("Invalid message type: {}", value)),
         }
     }
