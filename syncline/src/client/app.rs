@@ -96,9 +96,16 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
         // connected" from "both clients uploaded simultaneously."
         let mut initial_server_uuids: Option<HashSet<String>> = None;
 
-        // Phase 4: send MSG_SYNC_STEP_1 for __index__ and all known documents
+        // Phase 4: send MSG_SYNC_STEP_1 for all known content documents.
+        // Skip __index__ here — it is subscribed separately below with a
+        // fresh state vector.  Sending it from list_doc_ids first would race:
+        // the server may reply with an empty __index__ (content UUIDs not yet
+        // registered), causing the client to falsely delete local files.
         if let Ok(uuids) = local_state.list_doc_ids() {
             for uuid in uuids {
+                if uuid == "__index__" || uuid.starts_with("data/") && uuid.contains("__index__") {
+                    continue;
+                }
                 let state_path = local_state.get_state_path_for_uuid(&uuid);
                 if let Ok(doc) = load_doc(&state_path) {
                     let sv = doc.transact().state_vector().encode_v1();
@@ -227,10 +234,14 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                             );
                                         }
 
-                                        // Detect UUID removals from index → delete local files
+                                        // Detect UUID removals from index → delete local files.
+                                        // Never delete freshly-created UUIDs — they are local
+                                        // files that haven't been synced to the server yet and
+                                        // therefore won't appear in the server's __index__.
                                         let mut to_remove = Vec::new();
                                         for sub_uuid in &subscribed_docs {
                                             if sub_uuid == "__index__" { continue; }
+                                            if freshly_created.contains(sub_uuid.as_str()) { continue; }
                                             if !new_index_uuids.contains(sub_uuid.as_str()) {
                                                 to_remove.push(sub_uuid.clone());
                                             }
