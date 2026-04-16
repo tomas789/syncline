@@ -427,11 +427,16 @@ async fn test_filter_ignored_files() {
     fs::write(&binary0, "binary data").unwrap();
     fs::write(&hidden0, "secret text").unwrap();
 
+    // Wait for binary file to sync (may take longer on slow CI)
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if env.client_path(1).join("image.png").exists() { break; }
-        assert!(std::time::Instant::now() < deadline,
-            ".png file should be synced with binary file support");
+        if env.client_path(1).join("image.png").exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            ".png file should be synced with binary file support"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
