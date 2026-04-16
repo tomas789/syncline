@@ -40,6 +40,7 @@ interface WasmModule {
 interface SynclineClient {
   connect(): void;
   add_doc(doc_id: string, callback: () => void): void;
+  add_doc_with_state(doc_id: string, state: Uint8Array, callback: () => void): void;
   add_binary_doc(
     doc_id: string,
     callback: () => void,
@@ -47,6 +48,7 @@ interface SynclineClient {
   ): void;
   remove_doc(doc_id: string): void;
   get_text(doc_id: string): string | undefined;
+  get_doc_state(doc_id: string): Uint8Array | undefined;
   update(doc_id: string, content: string): void;
   set_text(doc_id: string, content: string): void;
   is_connected(): boolean;
@@ -202,6 +204,46 @@ export default class SynclinePlugin extends Plugin {
   }
 
   // ---------------------------------------------------------------------------
+  // CRDT state persistence
+  // ---------------------------------------------------------------------------
+
+  /** Directory inside the plugin config folder where CRDT states are stored. */
+  private get crdtDir(): string {
+    return `${this.app.vault.configDir}/plugins/syncline-obsidian/crdt`;
+  }
+
+  /** Persist the full CRDT state for a document so offline edits survive restarts. */
+  private async saveCrdtState(uuid: string): Promise<void> {
+    if (!this.client) return;
+    const state = this.client.get_doc_state(uuid);
+    if (!state) return;
+    const path = `${this.crdtDir}/${uuid}.bin`;
+    try {
+      // Ensure the crdt directory exists
+      if (!(await this.app.vault.adapter.exists(this.crdtDir))) {
+        await this.app.vault.adapter.mkdir(this.crdtDir);
+      }
+      await this.app.vault.adapter.writeBinary(path, state.buffer);
+    } catch (error) {
+      console.error(`[Syncline] Error saving CRDT state for ${uuid}:`, error);
+    }
+  }
+
+  /** Load persisted CRDT state for a document, or null if none exists. */
+  private async loadCrdtState(uuid: string): Promise<Uint8Array | null> {
+    const path = `${this.crdtDir}/${uuid}.bin`;
+    try {
+      if (await this.app.vault.adapter.exists(path)) {
+        const buffer = await this.app.vault.adapter.readBinary(path);
+        return new Uint8Array(buffer);
+      }
+    } catch (error) {
+      console.error(`[Syncline] Error loading CRDT state for ${uuid}:`, error);
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
   // Status / UI
   // ---------------------------------------------------------------------------
 
@@ -286,7 +328,7 @@ export default class SynclinePlugin extends Plugin {
           if (isBinaryFile(file)) {
             this.addBinaryDocOnly(file, uuid);
           } else {
-            this.addDocOnly(file, uuid);
+            void this.addDocOnly(file, uuid);
           }
         }
       }
@@ -403,7 +445,7 @@ export default class SynclinePlugin extends Plugin {
           const path = reverseMap[uuid];
           const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
           if (file instanceof TFile) {
-            this.addDocOnly(file, uuid);
+            void this.addDocOnly(file, uuid);
           } else {
             void this.createFileFromRemote(uuid);
           }
@@ -430,75 +472,82 @@ export default class SynclinePlugin extends Plugin {
   // Document management
   // ---------------------------------------------------------------------------
 
-  /** Subscribe to a doc by UUID. On first sync, push local content; thereafter handle remote updates. */
-  addDocOnly(file: TFile, uuid: string) {
+  /** Subscribe to a doc by UUID. On first sync, merge local + remote via CRDT; thereafter handle remote updates. */
+  async addDocOnly(file: TFile, uuid: string) {
     if (!this.client) return;
 
     let initialSyncDone = false;
-    let isMerging = false;
 
-    this.client.add_doc(uuid, () => {
+    // Load persisted CRDT state and local file content in parallel
+    const [persistedState, localContent] = await Promise.all([
+      this.loadCrdtState(uuid),
+      this.app.vault.read(file),
+    ]);
+
+    if (!this.client) return; // client may have been torn down during await
+
+    const onSync = () => {
       // Ensure meta.path is set so the CLI client (and other WASM clients) know the file's path
       this.client?.set_meta_path(uuid, file.path);
 
       if (!initialSyncDone) {
         initialSyncDone = true;
-        isMerging = true;
-        this.app.vault
-          .read(file)
-          .then((content) => {
-            const remoteContent = this.client?.get_text(uuid) || "";
 
-            if (content === remoteContent) {
-              // Already in sync — nothing to do.
-              return;
-            }
-
-            if (remoteContent !== "") {
-              // FIX: Remote already has content (from SyncStep2). Write it to
-              // the local file instead of pushing stale local content into the
-              // CRDT. Without this guard, update(uuid, content) diffs the
-              // remote state → stale local file, generating DELETE operations
-              // that revert other clients' edits.
-              //
-              // Trade-off: offline edits made on this device while the CRDT
-              // state was not persisted will be lost in favour of the server's
-              // merged state. Proper offline-edit support requires persisting
-              // the CRDT document across sessions (future work).
-              this.ignoreChanges.add(file.path);
-              this.app.vault
-                .modify(file, remoteContent)
-                .finally(() => {
-                  setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
-                })
-                .catch((error) => {
-                  console.error(`[Syncline] Error updating ${file.path} after initial sync:`, error);
-                });
-              return;
-            }
-
-            // Remote is empty — this is a new file. Push local content.
-            this.client?.update(uuid, content);
-          })
-          .catch((error) => {
-            console.error(`[Syncline] Error reading ${file.path}:`, error);
-          })
-          .finally(() => {
-            isMerging = false;
-            void this.onRemoteUpdate(uuid);
-          });
-      } else {
-        if (!isMerging) {
-          // FIX(Issue #6): Suppress the file-watcher IMMEDIATELY when CRDT
-          // is updated, BEFORE the async disk write in onRemoteUpdate().
-          // The TLA+ model proved that without this, there is a window
-          // where the watcher reads stale disk content and generates a
-          // spurious diff that deletes valid remote content.
+        // After SyncStep2 merges remote edits into our doc (which already
+        // contains our offline edits from step 2 below), write the fully
+        // merged result to disk.
+        const mergedContent = this.client?.get_text(uuid) || "";
+        if (mergedContent !== localContent) {
           this.ignoreChanges.add(file.path);
-          void this.onRemoteUpdate(uuid);
+          this.app.vault
+            .modify(file, mergedContent)
+            .finally(() => {
+              setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
+            })
+            .catch((error) => {
+              console.error(`[Syncline] Error updating ${file.path} after initial sync:`, error);
+            });
         }
+
+        // Persist the merged CRDT state
+        void this.saveCrdtState(uuid);
+      } else {
+        // FIX(Issue #6): Suppress the file-watcher IMMEDIATELY when CRDT
+        // is updated, BEFORE the async disk write in onRemoteUpdate().
+        this.ignoreChanges.add(file.path);
+        void this.onRemoteUpdate(uuid).then(() => this.saveCrdtState(uuid));
       }
-    });
+    };
+
+    if (persistedState) {
+      // We have prior CRDT state — load it so the doc starts with full history.
+      // add_doc_with_state applies the state before registering the observer,
+      // so historical operations are not re-broadcast.
+      this.client.add_doc_with_state(uuid, persistedState, onSync);
+
+      // Apply offline edits IMMEDIATELY, before SyncStep2 arrives.
+      // The diff is against the persisted CRDT content (not post-merge),
+      // so it produces only the delta from offline file edits. When
+      // SyncStep2 later merges remote operations, both sets of edits
+      // coexist in the CRDT — no data loss.
+      const persistedContent = this.client.get_text(uuid) || "";
+      if (persistedContent !== localContent) {
+        this.client.update(uuid, localContent);
+      }
+    } else {
+      // First time syncing this doc (or state was lost). Use plain add_doc.
+      // Push local content after sync completes (handled in onSync callback
+      // only if the remote CRDT is empty — new file case).
+      this.client.add_doc(uuid, onSync);
+
+      // For a brand-new doc with no persisted state and no remote content,
+      // push local content now. If remote has content (from SyncStep2),
+      // the callback will write it to disk.
+      const remoteContent = this.client.get_text(uuid) || "";
+      if (remoteContent === "" && localContent !== "") {
+        this.client.update(uuid, localContent);
+      }
+    }
   }
 
   /** Subscribe to a binary doc by UUID. Handles blob upload/download for non-text files. */
@@ -782,6 +831,8 @@ export default class SynclinePlugin extends Plugin {
         const crdtContent = this.client.get_text(uuid);
         if (crdtContent === content) return;
         this.client.update(uuid, content);
+        // Persist CRDT state so offline edits survive plugin restarts
+        void this.saveCrdtState(uuid);
       } catch (error) {
         console.error("[Syncline] Error syncing:", error);
       }

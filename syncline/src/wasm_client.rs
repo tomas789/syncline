@@ -391,6 +391,100 @@ impl SynclineClient {
         }
     }
 
+    /// Add a text document initialized from persisted CRDT state.
+    ///
+    /// Unlike `add_doc`, this loads a previously-saved CRDT state before
+    /// registering the observer, so the observer won't broadcast the
+    /// historical state back to the server.  On connect it sends SyncStep1
+    /// (to pull any remote changes) plus the full local state as MSG_UPDATE
+    /// (to push any offline edits the server hasn't seen yet).
+    pub fn add_doc_with_state(
+        &self,
+        doc_id: String,
+        state: &[u8],
+        callback: Function,
+    ) -> Result<(), JsValue> {
+        let doc = Doc::new();
+
+        // Apply persisted state BEFORE registering the observer so
+        // we don't broadcast the entire history as outgoing updates.
+        if !state.is_empty() {
+            let update = Update::decode_v1(state)
+                .map_err(|e| JsValue::from_str(&format!("Invalid CRDT state: {e}")))?;
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update);
+        }
+
+        let is_receiving = Rc::new(RefCell::new(false));
+
+        let ws_clone = self.ws.clone();
+        let doc_id_clone = doc_id.clone();
+        let is_receiving_clone = is_receiving.clone();
+        let is_connected_send = self.is_connected.clone();
+
+        let sub = doc
+            .observe_update_v1(move |_, event| {
+                if *is_receiving_clone.borrow() {
+                    return;
+                }
+                if !*is_connected_send.borrow() {
+                    return;
+                }
+                if let Some(ref ws) = ws_clone {
+                    let msg = encode_message(MSG_UPDATE, &doc_id_clone, &event.update);
+                    let array = Uint8Array::from(&msg[..]);
+                    let _ = ws.send_with_array_buffer_view(&array);
+                }
+            })
+            .map_err(|_| JsValue::from_str("Failed to subscribe to doc"))?;
+
+        self.docs.borrow_mut().insert(
+            doc_id.clone(),
+            DocState {
+                doc: doc.clone(),
+                callback,
+                blob_callback: None,
+                _sub: sub,
+                is_receiving,
+                doc_type: DocType::Text,
+            },
+        );
+
+        if *self.is_connected.borrow() {
+            if let Some(ref ws) = self.ws {
+                // Pull remote changes
+                let sv = doc.transact().state_vector().encode_v1();
+                let msg = encode_message(MSG_SYNC_STEP_1, &doc_id, &sv);
+                let array = Uint8Array::from(&msg[..]);
+                ws.send_with_array_buffer_view(&array)?;
+
+                // Push local state (includes any offline edits)
+                let txn = doc.transact();
+                let update = txn.encode_state_as_update_v1(&StateVector::default());
+                if !update.is_empty() {
+                    let msg = encode_message(MSG_UPDATE, &doc_id, &update);
+                    let array = Uint8Array::from(&msg[..]);
+                    ws.send_with_array_buffer_view(&array)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Export the full CRDT state of a document for persistence.
+    ///
+    /// Returns a `Uint8Array` containing the encoded state that can be
+    /// passed back to `add_doc_with_state` in a future session.
+    pub fn get_doc_state(&self, doc_id: &str) -> Option<Uint8Array> {
+        let docs = self.docs.borrow();
+        docs.get(doc_id).map(|state| {
+            let txn = state.doc.transact();
+            let update = txn.encode_state_as_update_v1(&StateVector::default());
+            Uint8Array::from(&update[..])
+        })
+    }
+
     pub fn remove_doc(&self, doc_id: &str) {
         self.docs.borrow_mut().remove(doc_id);
     }
