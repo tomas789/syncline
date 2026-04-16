@@ -133,29 +133,44 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
         }
         subscribed_docs.insert("__index__".to_string());
 
-        // Broadcast offline changes (first connection only; None on reconnects)
-        let offline_changes = pending_offline_changes.take().unwrap_or_default();
-        for (uuid, update) in offline_changes {
-            if let Err(e) = ws_tx
-                .send(Message::new(MsgType::Update, uuid.clone(), update))
-                .await
-            {
-                error!("Failed to broadcast offline update for {}: {:?}", uuid, e);
-            } else {
-                info!("Broadcasted offline changes for {}", uuid);
+        // Broadcast offline changes. Only clear after ALL sends succeed so
+        // that a mid-send disconnect doesn't lose undelivered changes.
+        if let Some(ref changes) = pending_offline_changes {
+            let mut all_sent = true;
+            for (uuid, update) in changes {
+                if let Err(e) = ws_tx
+                    .send(Message::new(MsgType::Update, uuid.clone(), update.clone()))
+                    .await
+                {
+                    error!("Failed to broadcast offline update for {}: {:?}", uuid, e);
+                    all_sent = false;
+                    break; // connection likely dead; retry on next reconnect
+                } else {
+                    info!("Broadcasted offline changes for {}", uuid);
+                }
+            }
+            if all_sent {
+                pending_offline_changes = None;
             }
         }
 
-        // Upload pending blobs (first connection only)
-        let blob_changes = pending_blob_changes.take().unwrap_or_default();
-        for blob in blob_changes {
-            if let Err(e) = ws_tx
-                .send(Message::new(MsgType::BlobUpdate, blob.uuid.clone(), blob.data))
-                .await
-            {
-                error!("Failed to upload blob for {}: {:?}", blob.uuid, e);
-            } else {
-                info!("Uploaded blob for {} (hash: {})", blob.uuid, blob.hash);
+        // Upload pending blobs. Same retry logic as offline changes.
+        if let Some(ref blobs) = pending_blob_changes {
+            let mut all_sent = true;
+            for blob in blobs {
+                if let Err(e) = ws_tx
+                    .send(Message::new(MsgType::BlobUpdate, blob.uuid.clone(), blob.data.clone()))
+                    .await
+                {
+                    error!("Failed to upload blob for {}: {:?}", blob.uuid, e);
+                    all_sent = false;
+                    break;
+                } else {
+                    info!("Uploaded blob for {} (hash: {})", blob.uuid, blob.hash);
+                }
+            }
+            if all_sent {
+                pending_blob_changes = None;
             }
         }
 
