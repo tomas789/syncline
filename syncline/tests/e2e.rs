@@ -1064,3 +1064,249 @@ async fn test_fresh_client_receives_proper_filenames() {
     client_b.kill().await.unwrap();
     server.kill().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3.5 — CLI-level integration tests
+//
+// These exercise the operator-facing CLI surface introduced in phases 3.1
+// (`migrate`) and 3.4 (`verify`) rather than the protocol library directly.
+// They round-trip through the same binary an operator would run, so they
+// catch regressions in CLI wiring (arg parsing, exit codes, stdout logging)
+// that unit tests can't.
+// ---------------------------------------------------------------------------
+
+async fn run_verify_cli(dir: &Path, port: u16, timeout_secs: u64) -> std::process::ExitStatus {
+    Command::new(syncline_bin())
+        .arg("verify")
+        .arg("--folder")
+        .arg(dir)
+        .arg("--timeout-secs")
+        .arg(timeout_secs.to_string())
+        .env("SYNCLINE_URL", format!("ws://127.0.0.1:{}/sync", port))
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .expect("failed to run verify CLI")
+}
+
+async fn run_migrate_cli(dir: &Path) -> std::process::ExitStatus {
+    Command::new(syncline_bin())
+        .arg("migrate")
+        .arg("--folder")
+        .arg(dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .expect("failed to run migrate CLI")
+}
+
+/// Write one Yrs-encoded v0 snapshot into `.syncline/data/<uuid>.bin`,
+/// mirroring the pre-v1 on-disk layout: Y.Map "meta" with `path`/`type`
+/// plus Y.Text "content" with the body.
+fn seed_v0_text_snapshot(data_dir: &Path, rel_path: &str, body: &str) {
+    use yrs::{Doc, ReadTxn, StateVector, Text};
+
+    let doc = Doc::new();
+    {
+        let meta = doc.get_or_insert_map("meta");
+        let mut txn = doc.transact_mut();
+        meta.insert(&mut txn, "path", rel_path);
+        meta.insert(&mut txn, "type", "text");
+    }
+    {
+        let t = doc.get_or_insert_text("content");
+        let mut txn = doc.transact_mut();
+        t.insert(&mut txn, 0, body);
+    }
+    let bytes = {
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&StateVector::default())
+    };
+    fs::create_dir_all(data_dir).unwrap();
+    let file_path = data_dir.join(format!("{}.bin", uuid::Uuid::new_v4()));
+    fs::write(&file_path, bytes).unwrap();
+}
+
+/// After two clients sync a file, `syncline verify` on each vault must
+/// report convergence (exit 0). Happy-path operator check.
+#[tokio::test]
+async fn test_verify_cli_converged_after_sync() {
+    let mut env = TestEnv::new(2).await;
+
+    fs::write(env.client_path(0).join("doc.md"), "converged body").unwrap();
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await);
+
+    // Stop clients so verify has exclusive access to the manifest on disk
+    // (and there is no race with a concurrent save_manifest rewriting it).
+    for c in env.clients.iter_mut() {
+        c.kill().await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for idx in 0..2 {
+        let status = run_verify_cli(env.client_path(idx), env.port, 3).await;
+        assert!(
+            status.success(),
+            "verify on client {} after sync should exit 0, got {:?}",
+            idx,
+            status.code()
+        );
+    }
+}
+
+/// A fresh vault with never-synced local state must fail verify against
+/// a server that already holds content — divergence → non-zero exit.
+#[tokio::test]
+async fn test_verify_cli_diverges_for_fresh_vault() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Seed the server with content via a real client.
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "client-a").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fs::write(dir_a.path().join("server-only.md"), "on the server").unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    client_a.kill().await.unwrap();
+
+    // Fresh vault, never synced: empty projection vs. populated server.
+    let dir_fresh = TempDir::new().unwrap();
+    let status = run_verify_cli(dir_fresh.path(), port, 3).await;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "verify on a fresh vault vs populated server should exit 1, got {:?}",
+        status.code()
+    );
+
+    server.kill().await.unwrap();
+}
+
+/// Full operator journey: seed a v0 vault on disk, run `syncline
+/// migrate`, then `syncline sync` (which should be idempotent wrt the
+/// already-migrated layout), and finally `syncline verify` to confirm
+/// convergence with the server.
+#[tokio::test]
+async fn test_migrate_sync_verify_cycle() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Stage a v0-layout vault. Real v0 vaults had both user-facing
+    // files on disk *and* `.syncline/data/<uuid>.bin` Yrs snapshots
+    // carrying the CRDT metadata; the migrator reads the snapshots
+    // and trusts the on-disk files to already match.
+    let vault = TempDir::new().unwrap();
+    let v0_data = vault.path().join(".syncline/data");
+    seed_v0_text_snapshot(&v0_data, "alpha.md", "alpha body");
+    seed_v0_text_snapshot(&v0_data, "beta.md", "beta body");
+    fs::write(vault.path().join("alpha.md"), "alpha body").unwrap();
+    fs::write(vault.path().join("beta.md"), "beta body").unwrap();
+
+    // 1. Migrate — rewrites .syncline/ into v1 layout. Migrate does not
+    //    materialise user-facing files on its own; that happens when the
+    //    sync client reconciles the projection to disk.
+    let migrate_status = run_migrate_cli(vault.path()).await;
+    assert!(migrate_status.success(), "migrate CLI must exit 0");
+    assert!(vault.path().join(".syncline/version").exists());
+    assert!(vault.path().join(".syncline/manifest.bin").exists());
+    assert!(vault.path().join(".syncline/data.v0.bak").exists());
+    assert!(!vault.path().join(".syncline/data").exists());
+
+    // 2. Sync to the server. The client's reconcile loop materialises the
+    //    migrated entries onto disk *and* pushes the manifest upstream.
+    let mut client = spawn_client(vault.path(), port).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    client.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        fs::read_to_string(vault.path().join("alpha.md")).unwrap(),
+        "alpha body"
+    );
+    assert_eq!(
+        fs::read_to_string(vault.path().join("beta.md")).unwrap(),
+        "beta body"
+    );
+
+    // 3. Verify — must converge with the server.
+    let verify_status = run_verify_cli(vault.path(), port, 3).await;
+    assert!(
+        verify_status.success(),
+        "verify after migrate+sync must exit 0, got {:?}",
+        verify_status.code()
+    );
+
+    server.kill().await.unwrap();
+}
+
+/// Content-addressed blob storage: two clients that independently write
+/// identical binary bytes at different paths must converge to the same
+/// blob hash in `.syncline/blobs/`. A correct CAS layer stores the
+/// bytes once per unique hash, so both clients reuse the same on-disk
+/// blob file.
+#[tokio::test]
+async fn test_binary_blob_cas_dedup_across_clients() {
+    let env = TestEnv::new(2).await;
+
+    let payload: Vec<u8> = (0..=255u8).collect();
+    fs::write(env.client_path(0).join("one.png"), &payload).unwrap();
+    fs::write(env.client_path(1).join("two.png"), &payload).unwrap();
+
+    // Poll for both files arriving on the opposite client.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let a_has_b = env.client_path(0).join("two.png").exists();
+        let b_has_a = env.client_path(1).join("one.png").exists();
+        if a_has_b && b_has_a {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "binary files did not cross-sync within 15s"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Hash of the payload — CAS filename is the hex SHA-256.
+    let hash = syncline::v1::hash_hex(&payload);
+    // Blob store layout: .syncline/blobs/<aa>/<bb>/<full-hash>.
+    let expected_rel = Path::new("blobs")
+        .join(&hash[0..2])
+        .join(&hash[2..4])
+        .join(&hash);
+
+    for idx in 0..2 {
+        let blob_path = env.client_path(idx).join(".syncline").join(&expected_rel);
+        assert!(
+            blob_path.exists(),
+            "client {} missing expected blob at {}",
+            idx,
+            blob_path.display()
+        );
+        let stored = fs::read(&blob_path).unwrap();
+        assert_eq!(stored, payload, "client {} blob content mismatch", idx);
+    }
+
+    // And the payload under both user paths is identical on both sides.
+    for idx in 0..2 {
+        assert_eq!(
+            fs::read(env.client_path(idx).join("one.png")).unwrap(),
+            payload
+        );
+        assert_eq!(
+            fs::read(env.client_path(idx).join("two.png")).unwrap(),
+            payload
+        );
+    }
+}

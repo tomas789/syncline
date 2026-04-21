@@ -30,7 +30,7 @@ use crate::v1::ids::Lamport;
 use crate::v1::manifest::Manifest;
 use crate::v1::sync::{
     decode_version_handshake, encode_version_handshake, handle_manifest_payload,
-    handle_verify_payload, split_manifest_payload,
+    handle_verify_payload, manifest_step1_payload, split_manifest_payload,
 };
 use axum::{
     Router,
@@ -293,6 +293,16 @@ async fn handle_manifest_sync(
             // STEP_1 arrived — respond with STEP_2 to just this client.
             // No persistence, no broadcast (STEP_2 is peer-directed).
             let frame = encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &response_payload);
+            let _ = tx_out.send(frame);
+
+            // Second half of the bidirectional Yrs sync handshake: send
+            // our own STEP_1 so the client replies with a STEP_2
+            // carrying whatever *we* are missing. Without this follow-up
+            // the exchange is one-directional — a populated client
+            // connecting to an empty server (e.g. post-`syncline migrate`)
+            // would never push its state upstream.
+            let our_step1 = manifest_step1_payload(&manifest);
+            let frame = encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &our_step1);
             let _ = tx_out.send(frame);
         }
         Ok(None) => {
@@ -673,15 +683,18 @@ mod tests {
         let _ = recv_bin(&mut b).await;
 
         // Both subscribe via STEP_1 so they're registered in the
-        // manifest broadcast channel. Each then drains the STEP_2 the
-        // server sends back.
+        // manifest broadcast channel. The server replies with STEP_2
+        // *and* its own STEP_1 (bidirectional handshake), both of which
+        // need draining before we can observe broadcasts.
         let empty_p =
             manifest_step1_payload(&Manifest::new(ActorId::new()));
         let sub_frame =
             encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &empty_p);
         send_bin(&mut a, sub_frame.clone()).await;
         let _ = recv_bin(&mut a).await;
+        let _ = recv_bin(&mut a).await;
         send_bin(&mut b, sub_frame).await;
+        let _ = recv_bin(&mut b).await;
         let _ = recv_bin(&mut b).await;
 
         // A creates a node; encodes its update as MANIFEST_UPDATE and
