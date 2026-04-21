@@ -28,13 +28,15 @@
 //!   - conflict-copy path suffixing
 
 use crate::protocol::{
-    MANIFEST_DOC_ID, MSG_MANIFEST_SYNC, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION,
-    V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
+    MANIFEST_DOC_ID, MAX_BLOB_SIZE, MSG_BLOB_UPDATE, MSG_MANIFEST_SYNC, MSG_SYNC_STEP_1,
+    MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION, V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR,
+    decode_message, encode_message,
 };
+use crate::v1::blob_store::{BlobStore, hash_hex};
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
 use crate::v1::ids::{ActorId, Lamport, NodeId};
 use crate::v1::manifest::{Manifest, NodeKind};
-use crate::v1::projection::project;
+use crate::v1::projection::{Projection, project};
 use crate::v1::sync::{
     decode_version_handshake, encode_manifest_update, encode_version_handshake,
     handle_manifest_payload, manifest_step1_payload,
@@ -98,10 +100,11 @@ pub async fn run_client(
     // state persists across transport hiccups.
     let mut manifest = load_manifest(&syncline_dir, actor)?;
     let mut content = ContentStore::new(syncline_dir.join("content"));
+    let blobs = BlobStore::new(syncline_dir.join("blobs"));
 
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&url, &mut manifest, &mut content, &folder, &syncline_dir).await {
+        match run_session(&url, &mut manifest, &mut content, &blobs, &folder, &syncline_dir).await {
             Ok(()) => {
                 // Graceful close (server shutdown). Retry after base
                 // backoff; this is not a hard error.
@@ -126,6 +129,7 @@ async fn run_session(
     url: &str,
     manifest: &mut Manifest,
     content: &mut ContentStore,
+    blobs: &BlobStore,
     folder: &Path,
     syncline_dir: &Path,
 ) -> Result<()> {
@@ -201,6 +205,7 @@ async fn run_session(
         syncline_dir,
         manifest,
         content,
+        blobs,
         &mut write,
         &mut content_subscribed,
     )
@@ -320,6 +325,7 @@ async fn run_session(
                     syncline_dir,
                     manifest,
                     content,
+                    blobs,
                     &mut write,
                     &mut content_subscribed,
                 )
@@ -377,6 +383,7 @@ async fn scan_once(
     syncline_dir: &Path,
     manifest: &mut Manifest,
     content: &mut ContentStore,
+    blobs: &BlobStore,
     write: &mut WsSink,
     subscribed: &mut HashSet<NodeId>,
 ) -> Result<()> {
@@ -388,8 +395,12 @@ async fn scan_once(
     let proj = project(manifest);
 
     let mut pending_content: Vec<(NodeId, Vec<u8>)> = Vec::new();
+    // Binary uploads batched until after the walk. (hash_hex, bytes).
+    let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_files = 0usize;
     let mut modified_files = 0usize;
+    let mut new_binary = 0usize;
+    let mut modified_binary = 0usize;
 
     for dent in WalkDir::new(folder)
         .follow_links(false)
@@ -420,7 +431,44 @@ async fn scan_once(
             .unwrap_or("")
             .to_ascii_lowercase();
         if !TEXT_EXTS.contains(&ext.as_str()) {
-            // Binary: upload path lands in 3.3c.
+            // Binary path: read bytes, hash, CAS-stash locally, and
+            // create/update the manifest entry. Actual upload is batched
+            // and sent at the end of the walk.
+            let meta = match fs::metadata(abs) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("skip unreadable metadata {}: {}", rel_str, e);
+                    continue;
+                }
+            };
+            if meta.len() as usize > MAX_BLOB_SIZE {
+                warn!(
+                    "skipping {} ({} bytes > MAX_BLOB_SIZE {})",
+                    rel_str, meta.len(), MAX_BLOB_SIZE
+                );
+                continue;
+            }
+            let bytes = match fs::read(abs) {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!("skip unreadable {}: {}", rel_str, e);
+                    continue;
+                }
+            };
+            match process_binary_file(&rel_str, &bytes, &proj, manifest, blobs)? {
+                BinaryScanOutcome::Unchanged => {}
+                BinaryScanOutcome::Skipped(reason) => {
+                    debug!("binary {} skipped: {}", rel_str, reason);
+                }
+                BinaryScanOutcome::Created { hash } => {
+                    new_binary += 1;
+                    pending_blobs.push((hash, bytes));
+                }
+                BinaryScanOutcome::Rehashed { hash } => {
+                    modified_binary += 1;
+                    pending_blobs.push((hash, bytes));
+                }
+            }
             continue;
         }
 
@@ -460,6 +508,16 @@ async fn scan_once(
         }
     }
 
+    // Blobs first, so when the server rebroadcasts the manifest to other
+    // peers they can resolve hashes that would otherwise 404.
+    for (hash, bytes) in pending_blobs {
+        let frame = encode_message(MSG_BLOB_UPDATE, &hash, &bytes);
+        write
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .context("send blob update from scanner")?;
+    }
+
     let post_sv = manifest.doc().transact().state_vector();
     if post_sv != pre_sv {
         let update_bytes = {
@@ -483,10 +541,13 @@ async fn scan_once(
             .context("send content update from scanner")?;
     }
 
-    if new_files + modified_files > 0 {
+    if new_files + modified_files + new_binary + modified_binary > 0 {
         info!(
             new_files,
-            modified_files, "scanner pushed local changes to server"
+            modified_files,
+            new_binary,
+            modified_binary,
+            "scanner pushed local changes to server"
         );
     }
 
@@ -494,6 +555,76 @@ async fn scan_once(
     // server-side edits that may already be in flight for that doc id.
     subscribe_new_text_content(write, manifest, content, subscribed).await?;
     Ok(())
+}
+
+/// Outcome of scanning a single binary file on disk. Pure enough to
+/// unit-test against a fake manifest + temp-dir BlobStore.
+#[derive(Debug)]
+enum BinaryScanOutcome {
+    /// Manifest already has a Binary entry at this path with this hash —
+    /// nothing to upload, nothing to record.
+    Unchanged,
+    /// New path: manifest gained a `Binary` entry; bytes were stashed in
+    /// the local blob store and should be uploaded.
+    Created { hash: String },
+    /// Existing binary path's on-disk content changed: manifest hash
+    /// bumped; bytes were stashed locally and should be uploaded.
+    Rehashed { hash: String },
+    /// A local manifest entry exists at this path but is not `Binary`
+    /// (e.g. Text) — or creation fell through with a path-level error.
+    /// We refuse to clobber the kind. Caller logs and moves on.
+    Skipped(&'static str),
+}
+
+/// Core per-binary-file logic, factored out so tests can drive it
+/// without a `WsSink`. The caller is responsible for:
+///   * reading `bytes` off disk
+///   * enforcing `MAX_BLOB_SIZE`
+///   * issuing the `MSG_BLOB_UPDATE` frame when we return `Created` /
+///     `Rehashed`
+///
+/// This helper hashes the bytes, CAS-stashes them in `blobs` (idempotent),
+/// then reconciles against the current manifest projection:
+///   * no existing entry at `rel_path` → `create_binary`, emit `Created`
+///   * existing Binary entry with the same hash → `Unchanged`
+///   * existing Binary entry with a different hash → `set_blob_hash`,
+///     emit `Rehashed`
+///   * existing Text/Directory entry at that path → `Skipped("kind")`
+fn process_binary_file(
+    rel_path: &str,
+    bytes: &[u8],
+    proj: &Projection,
+    manifest: &mut Manifest,
+    blobs: &BlobStore,
+) -> Result<BinaryScanOutcome> {
+    let hash = hash_hex(bytes);
+    let size = bytes.len() as u64;
+
+    // Stash locally first — idempotent, and guarantees that if we
+    // record the hash in the manifest we actually have the blob to
+    // serve to any peer that asks.
+    blobs
+        .insert_bytes(bytes)
+        .with_context(|| format!("stashing blob for {}", rel_path))?;
+
+    match proj.by_path.get(rel_path) {
+        None => match crate::v1::ops::create_binary(manifest, rel_path, &hash, size) {
+            Ok(_) => Ok(BinaryScanOutcome::Created { hash }),
+            Err(e) => {
+                debug!("create_binary({:?}) failed: {}", rel_path, e);
+                Ok(BinaryScanOutcome::Skipped("create_binary_failed"))
+            }
+        },
+        Some(existing) if existing.kind == NodeKind::Binary => {
+            if existing.blob_hash.as_deref() == Some(hash.as_str()) {
+                Ok(BinaryScanOutcome::Unchanged)
+            } else {
+                manifest.set_blob_hash(existing.id, &hash, size);
+                Ok(BinaryScanOutcome::Rehashed { hash })
+            }
+        }
+        Some(_) => Ok(BinaryScanOutcome::Skipped("kind_mismatch")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,5 +1236,114 @@ mod tests {
             fs::read_dir(folder).unwrap().next().is_none(),
             "no files should be created for an unprojected node"
         );
+    }
+
+    // --- Phase 3.3c.2: outbound binary handling ------------------------------
+
+    fn fresh_blob_store() -> (tempfile::TempDir, BlobStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bs = BlobStore::new(tmp.path().to_path_buf());
+        (tmp, bs)
+    }
+
+    #[test]
+    fn process_binary_creates_manifest_entry_and_stashes_blob() {
+        let mut m = Manifest::new(ActorId::new());
+        let proj = project(&m);
+        let (_tmp, bs) = fresh_blob_store();
+        let bytes = b"\x89PNG\r\n\x1a\npretend png";
+
+        let outcome = process_binary_file("img/pic.png", bytes, &proj, &mut m, &bs).unwrap();
+        let expected = hash_hex(bytes);
+
+        match outcome {
+            BinaryScanOutcome::Created { hash } => assert_eq!(hash, expected),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        assert!(bs.has(&expected), "blob must be in local store");
+
+        // Manifest now has a Binary entry at that path with matching hash + size.
+        let proj2 = project(&m);
+        let entry = proj2
+            .by_path
+            .get("img/pic.png")
+            .expect("projection should include img/pic.png");
+        assert_eq!(entry.kind, NodeKind::Binary);
+        assert_eq!(entry.blob_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn process_binary_unchanged_when_hash_matches() {
+        let mut m = Manifest::new(ActorId::new());
+        let (_tmp, bs) = fresh_blob_store();
+        let bytes = b"same png bytes";
+        let h = hash_hex(bytes);
+        crate::v1::ops::create_binary(&mut m, "a.png", &h, bytes.len() as u64).unwrap();
+        bs.insert_bytes(bytes).unwrap();
+
+        let proj = project(&m);
+        let outcome = process_binary_file("a.png", bytes, &proj, &mut m, &bs).unwrap();
+        assert!(matches!(outcome, BinaryScanOutcome::Unchanged));
+    }
+
+    #[test]
+    fn process_binary_rehashes_on_content_change() {
+        let mut m = Manifest::new(ActorId::new());
+        let (_tmp, bs) = fresh_blob_store();
+        let old = b"old png bytes";
+        let h_old = hash_hex(old);
+        crate::v1::ops::create_binary(&mut m, "a.png", &h_old, old.len() as u64).unwrap();
+        bs.insert_bytes(old).unwrap();
+
+        let new = b"new png bytes, different length and content";
+        let h_new = hash_hex(new);
+        let proj = project(&m);
+        let outcome = process_binary_file("a.png", new, &proj, &mut m, &bs).unwrap();
+
+        match outcome {
+            BinaryScanOutcome::Rehashed { hash } => assert_eq!(hash, h_new),
+            other => panic!("expected Rehashed, got {other:?}"),
+        }
+        assert!(bs.has(&h_new), "new blob must be stashed");
+        let proj2 = project(&m);
+        assert_eq!(
+            proj2.by_path["a.png"].blob_hash.as_deref(),
+            Some(h_new.as_str()),
+            "manifest hash must point to the new blob"
+        );
+    }
+
+    #[test]
+    fn process_binary_skips_on_kind_mismatch() {
+        let mut m = Manifest::new(ActorId::new());
+        // A Text entry already exists at `ambiguous` — hostile local state.
+        crate::v1::ops::create_text(&mut m, "ambiguous", 0).unwrap();
+        let (_tmp, bs) = fresh_blob_store();
+        let proj = project(&m);
+
+        let outcome = process_binary_file("ambiguous", b"blob", &proj, &mut m, &bs).unwrap();
+        match outcome {
+            BinaryScanOutcome::Skipped(reason) => assert_eq!(reason, "kind_mismatch"),
+            other => panic!("expected Skipped(kind_mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_binary_is_idempotent_across_repeat_calls() {
+        let mut m = Manifest::new(ActorId::new());
+        let (_tmp, bs) = fresh_blob_store();
+        let bytes = b"payload";
+
+        let proj = project(&m);
+        let first = process_binary_file("x.bin", bytes, &proj, &mut m, &bs).unwrap();
+        assert!(matches!(first, BinaryScanOutcome::Created { .. }));
+        let n_after_first = m.live_entries().len();
+
+        // A second scan with the same bytes must be a no-op: no duplicate
+        // manifest entry, no state change.
+        let proj2 = project(&m);
+        let second = process_binary_file("x.bin", bytes, &proj2, &mut m, &bs).unwrap();
+        assert!(matches!(second, BinaryScanOutcome::Unchanged));
+        assert_eq!(m.live_entries().len(), n_after_first);
     }
 }
