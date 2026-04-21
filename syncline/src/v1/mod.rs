@@ -17,6 +17,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+pub mod blob_store;
 pub mod disk;
 pub mod ids;
 pub mod manifest;
@@ -25,6 +26,7 @@ pub mod ops;
 pub mod projection;
 pub mod sync;
 
+pub use blob_store::{hash_hex, BlobStore};
 pub use disk::{migrate_vault_on_disk, read_or_create_actor_id, read_vault_version, MigrationReport};
 pub use ids::{ActorId, Lamport, NodeId};
 pub use manifest::{Manifest, NodeEntry, NodeKind};
