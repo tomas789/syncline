@@ -717,4 +717,55 @@ mod tests {
             "server should have persisted the manifest update"
         );
     }
+
+    #[tokio::test]
+    async fn v1_blob_upload_then_request_roundtrip() {
+        // Pins the 3.3c contract: a v1 client uploads a blob addressed
+        // by its own hex hash, and a later MSG_BLOB_REQUEST for that hash
+        // returns the original bytes.
+        let (port, state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let (mut ws, _) = connect_async(url).await.unwrap();
+
+        // Handshake.
+        send_bin(
+            &mut ws,
+            encode_message(
+                MSG_VERSION,
+                MANIFEST_DOC_ID,
+                &encode_version_handshake(),
+            ),
+        )
+        .await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Upload: doc_id = hash_hex, payload = bytes. The server derives
+        // the storage key from the payload itself, so whatever doc_id we
+        // use is purely for routing — v1 clients use the hash for both.
+        let bytes: &[u8] = b"\x89PNG\r\n\x1a\nhello binary";
+        use sha2::{Digest, Sha256};
+        let hash_hex = format!("{:x}", Sha256::digest(bytes));
+        send_bin(
+            &mut ws,
+            encode_message(MSG_BLOB_UPDATE, &hash_hex, bytes),
+        )
+        .await;
+
+        // Give the server a beat to persist before we query.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored = state.db.load_blob(&hash_hex).await.unwrap();
+        assert_eq!(stored.as_deref(), Some(bytes));
+
+        // Request: payload = hash_hex as utf8 (server's current contract).
+        send_bin(
+            &mut ws,
+            encode_message(MSG_BLOB_REQUEST, &hash_hex, hash_hex.as_bytes()),
+        )
+        .await;
+        let resp = recv_bin(&mut ws).await;
+        let (t, d, payload) = decode_message(&resp).unwrap();
+        assert_eq!(t, MSG_BLOB_UPDATE);
+        assert_eq!(d, hash_hex);
+        assert_eq!(payload, bytes);
+    }
 }
