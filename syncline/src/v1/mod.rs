@@ -21,8 +21,14 @@ pub mod ids;
 pub mod manifest;
 pub mod migration;
 pub mod projection;
+pub mod sync;
 
 pub use ids::{ActorId, Lamport, NodeId};
 pub use manifest::{Manifest, NodeEntry, NodeKind};
 pub use migration::{migrate_v0_vault, Migration};
 pub use projection::{ProjectedEntry, Projection};
+pub use sync::{
+    decode_version_handshake, encode_manifest_step1, encode_manifest_step2,
+    encode_manifest_update, encode_version_handshake, handle_manifest_payload,
+    manifest_step1_payload, manifest_step2_payload, split_manifest_payload,
+};

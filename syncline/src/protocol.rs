@@ -12,6 +12,36 @@ pub const MSG_RESYNC: u8 = 6;
 /// If the server's content disagrees, it responds with a full SyncStep2.
 pub const MSG_CHECKSUM: u8 = 7;
 
+// ---------------------------------------------------------------------------
+// v1 message types (see docs/DESIGN_DOC_V1.md §4)
+// ---------------------------------------------------------------------------
+
+/// v1: manifest-scoped SyncStep1/SyncStep2/Update. Payload layout mirrors
+/// the v0 per-doc sync frames, but the doc_id field in the outer framing
+/// is always [`MANIFEST_DOC_ID`] and the payload begins with an inner
+/// sub-type byte from [`MANIFEST_STEP_1`] / [`MANIFEST_STEP_2`] /
+/// [`MANIFEST_UPDATE`].
+pub const MSG_MANIFEST_SYNC: u8 = 0x20;
+/// v1: convergence heartbeat — SHA-256 over the projected namespace
+/// (§4.4.1). Mismatch triggers a full manifest SyncStep1.
+pub const MSG_MANIFEST_VERIFY: u8 = 0x21;
+/// v1: protocol version handshake. Must be the first frame on a v1
+/// session. Payload is `[u8 major][u8 minor]`.
+pub const MSG_VERSION: u8 = 0xF0;
+
+/// Reserved doc-id used as the outer `doc_id` field in every v1
+/// manifest-sync frame.
+pub const MANIFEST_DOC_ID: &str = "__manifest__";
+
+/// Sub-type byte prefixing `MSG_MANIFEST_SYNC` payloads.
+pub const MANIFEST_STEP_1: u8 = 0;
+pub const MANIFEST_STEP_2: u8 = 1;
+pub const MANIFEST_UPDATE: u8 = 2;
+
+/// Current v1 protocol version.
+pub const V1_PROTOCOL_MAJOR: u8 = 1;
+pub const V1_PROTOCOL_MINOR: u8 = 0;
+
 /// Maximum blob size in bytes (50 MB).
 pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;
 
