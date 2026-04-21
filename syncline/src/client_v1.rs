@@ -29,8 +29,8 @@
 
 use crate::protocol::{
     MANIFEST_DOC_ID, MAX_BLOB_SIZE, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_MANIFEST_SYNC,
-    MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION, V1_PROTOCOL_MAJOR,
-    V1_PROTOCOL_MINOR, decode_message, encode_message,
+    MSG_MANIFEST_VERIFY, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION,
+    V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
 use crate::client::watcher::DebouncedWatcher;
 use crate::v1::blob_store::{BlobStore, hash_hex};
@@ -39,8 +39,8 @@ use crate::v1::ids::{ActorId, Lamport, NodeId};
 use crate::v1::manifest::{Manifest, NodeKind};
 use crate::v1::projection::{Projection, project};
 use crate::v1::sync::{
-    decode_version_handshake, encode_manifest_update, encode_version_handshake,
-    handle_manifest_payload, manifest_step1_payload,
+    decode_version_handshake, encode_manifest_update, encode_verify_payload,
+    encode_version_handshake, handle_manifest_payload, manifest_step1_payload, projection_hash,
 };
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
@@ -124,6 +124,109 @@ pub async fn run_client(
                 error!(attempt, delay_ms = delay, "session failed: {e:?}");
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
+        }
+    }
+}
+
+/// Entry point for `syncline verify`. One-shot diagnostic: connect,
+/// handshake, send the local projection hash, and report whether the
+/// server agrees.
+///
+/// Protocol (§4.4.1): the server replies with `MSG_MANIFEST_SYNC`
+/// carrying a `MANIFEST_STEP_1` payload when hashes disagree, and
+/// stays silent when they match. We treat any `MSG_MANIFEST_SYNC`
+/// frame on `MANIFEST_DOC_ID` within `timeout` as divergence; elapsed
+/// silence as convergence. Returns `Ok(true)` on convergence,
+/// `Ok(false)` on divergence, `Err` on transport or handshake failure.
+pub async fn run_verify(folder: PathBuf, url: String, timeout: Duration) -> Result<bool> {
+    banner(&folder, &url);
+
+    let _ = tokio::task::spawn_blocking({
+        let folder = folder.clone();
+        move || migrate_vault_on_disk(&folder)
+    })
+    .await??;
+
+    let syncline_dir = folder.join(".syncline");
+    let actor = read_or_create_actor_id(&syncline_dir)?;
+    let manifest = load_manifest(&syncline_dir, actor)?;
+    let local_hash = projection_hash(&manifest);
+
+    info!("connecting to {}", url);
+    let (ws, _) = connect_async(&url).await.context("ws connect")?;
+    let (mut write, mut read) = ws.split();
+
+    let hs = encode_message(MSG_VERSION, MANIFEST_DOC_ID, &encode_version_handshake());
+    write
+        .send(WsMessage::Binary(hs.into()))
+        .await
+        .context("send version handshake")?;
+
+    let first = match read.next().await {
+        Some(Ok(WsMessage::Binary(b))) => b,
+        Some(Ok(WsMessage::Close(_))) | None => {
+            anyhow::bail!("server closed during handshake — likely non-v1 server");
+        }
+        Some(Ok(other)) => anyhow::bail!("unexpected frame during handshake: {other:?}"),
+        Some(Err(e)) => anyhow::bail!("transport error during handshake: {e}"),
+    };
+    let (t, d, payload) = decode_message(&first)
+        .ok_or_else(|| anyhow::anyhow!("malformed handshake reply frame"))?;
+    if t != MSG_VERSION || d != MANIFEST_DOC_ID {
+        anyhow::bail!("server did not reply with MSG_VERSION (got msg_type {t:#x})");
+    }
+    let Some((major, minor)) = decode_version_handshake(payload) else {
+        anyhow::bail!("server handshake payload is malformed");
+    };
+    if major != V1_PROTOCOL_MAJOR {
+        anyhow::bail!(
+            "server protocol {}.{} incompatible with client {}.{}",
+            major,
+            minor,
+            V1_PROTOCOL_MAJOR,
+            V1_PROTOCOL_MINOR
+        );
+    }
+    info!("v1 handshake OK (server {}.{})", major, minor);
+
+    let verify_frame = encode_message(
+        MSG_MANIFEST_VERIFY,
+        MANIFEST_DOC_ID,
+        &encode_verify_payload(&local_hash),
+    );
+    write
+        .send(WsMessage::Binary(verify_frame.into()))
+        .await
+        .context("send verify")?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(true);
+        }
+        match tokio::time::timeout(remaining, read.next()).await {
+            Err(_) => return Ok(true),
+            Ok(None) => anyhow::bail!("server dropped connection during verify"),
+            Ok(Some(Err(e))) => anyhow::bail!("ws read error during verify: {e}"),
+            Ok(Some(Ok(WsMessage::Binary(b)))) => {
+                let Some((msg_type, doc_id, _payload)) = decode_message(&b) else {
+                    warn!("dropping malformed frame during verify");
+                    continue;
+                };
+                if doc_id == MANIFEST_DOC_ID && msg_type == MSG_MANIFEST_SYNC {
+                    return Ok(false);
+                }
+                debug!(
+                    "ignoring frame during verify: msg_type={:#x} doc_id={}",
+                    msg_type, doc_id
+                );
+            }
+            Ok(Some(Ok(WsMessage::Close(_)))) => {
+                anyhow::bail!("server closed connection during verify");
+            }
+            Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => continue,
+            Ok(Some(Ok(_))) => continue,
         }
     }
 }

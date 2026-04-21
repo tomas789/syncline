@@ -58,6 +58,37 @@ enum Commands {
         #[arg(long)]
         log_file: Option<PathBuf>,
     },
+    /// Check whether a local vault agrees with the server's manifest.
+    /// Sends a single MSG_MANIFEST_VERIFY frame with the local
+    /// projection hash (§4.4.1) and reports convergence or divergence.
+    /// Exits 0 on match, 1 on mismatch.
+    Verify {
+        /// Folder to verify.
+        #[arg(short, long, default_value = ".")]
+        folder: PathBuf,
+
+        /// URL of the Syncline server.
+        #[arg(
+            short,
+            long,
+            default_value = "ws://127.0.0.1:3030/sync",
+            env = "SYNCLINE_URL"
+        )]
+        url: String,
+
+        /// How long to wait for the server to signal divergence.
+        /// Silence past this window is read as convergence.
+        #[arg(short = 't', long, default_value_t = 5)]
+        timeout_secs: u64,
+
+        /// Log level (error, warn, info, debug, trace)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+
+        /// Optional file to redirect logs to
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
     /// Start the Syncline Client to sync a folder
     Sync {
         /// Folder to watch and sync
@@ -99,6 +130,11 @@ async fn main() -> anyhow::Result<()> {
             ..
         } => (log_level, log_file),
         Commands::Migrate {
+            log_level,
+            log_file,
+            ..
+        } => (log_level, log_file),
+        Commands::Verify {
             log_level,
             log_file,
             ..
@@ -188,6 +224,21 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(
                     "v0 data preserved at .syncline/data.v0.bak; version marker written."
                 );
+            }
+        }
+        Commands::Verify { folder, url, timeout_secs, .. } => {
+            use colored::Colorize;
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            let converged =
+                syncline::client_v1::run_verify(folder, url, timeout).await?;
+            if converged {
+                tracing::info!("{} Vaults converged.", "✅".green());
+            } else {
+                tracing::warn!(
+                    "{} Vaults diverged — run `syncline sync` to reconcile.",
+                    "⚠️".yellow()
+                );
+                std::process::exit(1);
             }
         }
         Commands::Sync { folder, url, name, .. } => {
