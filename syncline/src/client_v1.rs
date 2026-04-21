@@ -32,6 +32,7 @@ use crate::protocol::{
     MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION, V1_PROTOCOL_MAJOR,
     V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
+use crate::client::watcher::DebouncedWatcher;
 use crate::v1::blob_store::{BlobStore, hash_hex};
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
 use crate::v1::ids::{ActorId, Lamport, NodeId};
@@ -64,6 +65,11 @@ type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_CAP_MS: u64 = 30_000;
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// Debounce window for the inotify/fsevents watcher. Batches the flurry
+/// of events that an editor save-dance produces (Obsidian writes a
+/// `.tmp`, fsyncs, renames over the target; multi-event under the hood)
+/// into a single scan trigger.
+const DEBOUNCE_MS: u64 = 500;
 const TEXT_EXTS: &[&str] = &["md", "txt"];
 
 /// Entry point for `syncline sync`. Blocks for the lifetime of the
@@ -200,6 +206,29 @@ async fn run_session(
     // first *scheduled* scan is SCAN_INTERVAL from now. The explicit
     // initial scan below covers startup.
     scan_timer.tick().await;
+
+    // --- Filesystem watcher (3.3d) -----------------------------------------
+    // Debounced notify watcher: the OS produces multi-event bursts for an
+    // editor save (tmp-write → fsync → rename), so we coalesce them over
+    // DEBOUNCE_MS before triggering a scan. The 5 s polling timer above
+    // stays in place as a fallback for platforms where notify is unreliable
+    // (network mounts, some VM filesystems, fsevents quirks).
+    let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<
+        std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>,
+    >(16);
+    let mut watcher = match DebouncedWatcher::new(watcher_tx, Duration::from_millis(DEBOUNCE_MS)) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            warn!("filesystem watcher unavailable, falling back to polling: {e:?}");
+            None
+        }
+    };
+    if let Some(w) = watcher.as_mut() {
+        if let Err(e) = w.watch(folder) {
+            warn!("watcher.watch({}) failed: {e:?}", folder.display());
+            watcher = None;
+        }
+    }
 
     // Initial scan: push local additions/edits to the server as soon as
     // the session is up. Subsequent scans run on the 5 s timer.
@@ -369,6 +398,40 @@ async fn run_session(
                 .await
                 {
                     warn!("periodic scan failed: {e:?}");
+                }
+            }
+            batch_opt = watcher_rx.recv(), if watcher.is_some() => {
+                match batch_opt {
+                    Some(Ok(events)) => {
+                        if !batch_wants_scan(&events, syncline_dir) {
+                            debug!(
+                                "watcher batch of {} events all inside .syncline/; ignoring",
+                                events.len()
+                            );
+                            continue;
+                        }
+                        debug!("watcher batch of {} events triggering scan", events.len());
+                        if let Err(e) = scan_once(
+                            folder,
+                            syncline_dir,
+                            manifest,
+                            content,
+                            blobs,
+                            &mut write,
+                            &mut content_subscribed,
+                        )
+                        .await
+                        {
+                            warn!("watcher-driven scan failed: {e:?}");
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!("watcher reported error: {e:?}");
+                    }
+                    None => {
+                        warn!("watcher channel closed; falling back to polling");
+                        watcher = None;
+                    }
                 }
             }
         }
@@ -1063,6 +1126,37 @@ fn reconcile_projection_to_disk(
     Ok(())
 }
 
+/// Decide whether a debounced-watcher batch should trigger `scan_once`.
+///
+/// The watcher is rooted at the vault directory (recursive), so it also
+/// fires for our own writes into `.syncline/` — manifest persists, content
+/// subdoc writes, blob CAS inserts. Those would cause a scan-triggers-
+/// write-triggers-scan loop if we didn't filter them out.
+///
+/// Policy: trigger a scan iff at least one event refers to a path *outside*
+/// `.syncline/`. A batch whose events are entirely inside `.syncline/` is
+/// our own noise and ignored.
+///
+/// The component-level `.syncline` check is on top of a plain prefix check
+/// so that mixed relative/canonical paths (notify may canonicalise on some
+/// platforms) are still classified correctly.
+fn batch_wants_scan(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    syncline_dir: &Path,
+) -> bool {
+    events
+        .iter()
+        .any(|e| !path_is_inside_syncline(&e.path, syncline_dir))
+}
+
+fn path_is_inside_syncline(path: &Path, syncline_dir: &Path) -> bool {
+    if path.starts_with(syncline_dir) {
+        return true;
+    }
+    path.components()
+        .any(|c| c.as_os_str() == ".syncline")
+}
+
 /// Defensive check: projection paths are meant to be vault-relative, but
 /// a malicious or buggy peer could produce something like `../etc/passwd`.
 /// Refuse absolute paths and any `..` segment before we hand the string
@@ -1529,6 +1623,60 @@ mod tests {
         let h = hash_hex(&bytes);
         assert!(handle_inbound_blob(&h, &bytes, &blobs).is_err());
         assert!(!blobs.has(&h));
+    }
+
+    // --- Phase 3.3d: notify-driven scan trigger -------------------------------
+
+    fn debounced(path: &str) -> notify_debouncer_mini::DebouncedEvent {
+        notify_debouncer_mini::DebouncedEvent::new(
+            PathBuf::from(path),
+            notify_debouncer_mini::DebouncedEventKind::Any,
+        )
+    }
+
+    #[test]
+    fn batch_wants_scan_fires_on_vault_file_events() {
+        let vault = Path::new("/vault");
+        let syncline = vault.join(".syncline");
+        let batch = vec![
+            debounced("/vault/notes/hello.md"),
+            debounced("/vault/.syncline/manifest.bin"),
+        ];
+        assert!(batch_wants_scan(&batch, &syncline));
+    }
+
+    #[test]
+    fn batch_wants_scan_ignores_pure_internal_batches() {
+        let vault = Path::new("/vault");
+        let syncline = vault.join(".syncline");
+        // Manifest persist + content subdoc write + blob CAS insert —
+        // all three are our own writes.
+        let batch = vec![
+            debounced("/vault/.syncline/manifest.bin"),
+            debounced("/vault/.syncline/content/abc.bin"),
+            debounced("/vault/.syncline/blobs/ab/cd/deadbeef"),
+        ];
+        assert!(!batch_wants_scan(&batch, &syncline));
+    }
+
+    #[test]
+    fn batch_wants_scan_handles_empty_batch() {
+        let syncline = Path::new("/vault/.syncline");
+        assert!(!batch_wants_scan(&[], syncline));
+    }
+
+    #[test]
+    fn batch_wants_scan_recognises_syncline_via_component_fallback() {
+        // Watcher hands us a canonicalised absolute path while
+        // `syncline_dir` is still relative (as it is when the CLI is
+        // invoked with `--folder .`). Prefix check alone would miss this,
+        // so we also check for a `.syncline` path component.
+        let rel_syncline = Path::new(".syncline");
+        let batch = vec![debounced("/home/user/vault/.syncline/manifest.bin")];
+        assert!(!batch_wants_scan(&batch, rel_syncline));
+
+        let batch2 = vec![debounced("/home/user/vault/notes/a.md")];
+        assert!(batch_wants_scan(&batch2, rel_syncline));
     }
 
     #[test]
