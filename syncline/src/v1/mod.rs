@@ -19,8 +19,10 @@
 
 pub mod ids;
 pub mod manifest;
+pub mod migration;
 pub mod projection;
 
 pub use ids::{ActorId, Lamport, NodeId};
 pub use manifest::{Manifest, NodeEntry, NodeKind};
+pub use migration::{migrate_v0_vault, Migration};
 pub use projection::{ProjectedEntry, Projection};
