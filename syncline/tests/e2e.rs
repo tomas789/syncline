@@ -16,6 +16,23 @@ pub fn get_available_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Find a v1 conflict sibling for `<stem>.<ext>` at the top level of
+/// `dir`. v1 names collisions as `<stem>.conflict-<actor8>-<lamp>-<id8>.<ext>`
+/// — see `projection::conflict_path`. Returns the first match found
+/// (tests create at most one conflict at a time).
+fn find_conflict_sibling(dir: &Path, stem: &str, ext: &str) -> Option<PathBuf> {
+    let prefix = format!("{stem}.conflict-");
+    let suffix = format!(".{ext}");
+    let read = fs::read_dir(dir).ok()?;
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(&suffix) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 pub async fn build_workspace() {
     let status = Command::new("cargo")
         .args(["build", "-p", "syncline"])
@@ -296,20 +313,27 @@ async fn test_single_client_flow() {
     fs::write(&path, "hello world").unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Yrs cache should exist — with UUID-based naming the .bin filename is a UUID,
-    // so just verify at least one .bin file was created in the data directory.
-    let data_dir = env.client_path(0).join(".syncline/data");
-    let has_bin = fs::read_dir(&data_dir)
+    // v1 vault layout: a manifest.bin at the vault root and per-text-node
+    // subdoc at .syncline/content/<node-id>.bin. test.md is a text file,
+    // so we should see both pieces of state after the first sync.
+    let syncline_dir = env.client_path(0).join(".syncline");
+    assert!(
+        syncline_dir.join("manifest.bin").is_file(),
+        ".syncline/manifest.bin should exist after syncing test.md"
+    );
+    let content_dir = syncline_dir.join("content");
+    let has_content_subdoc = fs::read_dir(&content_dir)
         .into_iter()
         .flatten()
         .any(|e| {
             e.ok()
-                .map(|e| {
-                    e.path().extension().and_then(|s| s.to_str()) == Some("bin")
-                })
+                .map(|e| e.path().extension().and_then(|s| s.to_str()) == Some("bin"))
                 .unwrap_or(false)
         });
-    assert!(has_bin, "A .bin file should exist in .syncline/data/ after syncing test.md");
+    assert!(
+        has_content_subdoc,
+        "A per-text-node subdoc should exist in .syncline/content/ after syncing test.md"
+    );
 
     // Update
     fs::write(&path, "hello modified").unwrap();
@@ -519,12 +543,11 @@ async fn test_pre_existing_directory_conflict() {
         "note.md should have server content (A's content)"
     );
 
-    // "note (client-b).md" should exist on B with B's original content
-    let conflict_path_b = dir_b.path().join("note (client-b).md");
-    assert!(
-        conflict_path_b.exists(),
-        "Conflict file 'note (client-b).md' should exist in dir_b"
-    );
+    // A conflict sibling of the form `note.conflict-<actor8>-<lamp>-<id8>.md`
+    // should exist on B with B's original content. v1 naming (see
+    // projection::conflict_path) is deterministic across peers.
+    let conflict_path_b = find_conflict_sibling(dir_b.path(), "note", "md")
+        .expect("Conflict sibling for note.md should exist in dir_b");
     assert_eq!(
         fs::read_to_string(&conflict_path_b).unwrap(),
         "content from B",
@@ -535,11 +558,8 @@ async fn test_pre_existing_directory_conflict() {
     let mut client_a2 = spawn_client_with_name(dir_a.path(), port, "client-a").await;
     tokio::time::sleep(Duration::from_millis(4000)).await;
 
-    let conflict_path_a = dir_a.path().join("note (client-b).md");
-    assert!(
-        conflict_path_a.exists(),
-        "Client A should receive the conflict file 'note (client-b).md'"
-    );
+    let conflict_path_a = find_conflict_sibling(dir_a.path(), "note", "md")
+        .expect("Client A should receive the conflict sibling for note.md");
     assert_eq!(
         fs::read_to_string(&conflict_path_a).unwrap(),
         "content from B"
@@ -577,20 +597,18 @@ async fn test_both_offline_same_name_conflict() {
     fs::write(dir_b.path().join("shared.md"), "B's offline content").unwrap();
 
     // A reconnects first — its content becomes server truth.
-    // Wait until A has synced (state dir contains more than just __index__)
-    // before starting B, to ensure B sees A's UUID in initial_server_uuids.
+    // Wait until A has synced (v1 content subdoc materialised on disk)
+    // before starting B, to ensure B observes A's manifest entry.
     let mut client_a2 = spawn_client_with_name(dir_a.path(), port, "client-a").await;
-    let state_dir = dir_a.path().join(".syncline").join("data");
+    let content_dir = dir_a.path().join(".syncline").join("content");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if state_dir.exists() {
-            let count = fs::read_dir(&state_dir)
-                .map(|rd| rd.filter_map(|e| e.ok()).count())
-                .unwrap_or(0);
-            // __index__.bin + at least one doc .bin = 2+ files
-            if count >= 2 {
-                break;
-            }
+        let has_subdoc = fs::read_dir(&content_dir)
+            .map(|rd| rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("bin")))
+            .unwrap_or(false);
+        if has_subdoc {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -603,14 +621,14 @@ async fn test_both_offline_same_name_conflict() {
     let mut client_b2 = spawn_client_with_name(dir_b.path(), port, "client-b").await;
 
     // Wait until conflict resolution completes on B: shared.md has A's content
-    // and the conflict file exists with B's content.
-    let conflict_b = dir_b.path().join("shared (client-b).md");
+    // and a conflict sibling (v1 naming) exists with B's content.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let shared_ok = fs::read_to_string(dir_b.path().join("shared.md"))
             .map(|c| c == "A's offline content")
             .unwrap_or(false);
-        let conflict_ok = fs::read_to_string(&conflict_b)
+        let conflict_ok = find_conflict_sibling(dir_b.path(), "shared", "md")
+            .and_then(|p| fs::read_to_string(p).ok())
             .map(|c| c == "B's offline content")
             .unwrap_or(false);
         if shared_ok && conflict_ok {
@@ -619,12 +637,9 @@ async fn test_both_offline_same_name_conflict() {
         assert!(
             std::time::Instant::now() < deadline,
             "Timed out waiting for conflict resolution on B. \
-             shared.md exists={} content={:?}, conflict file exists={} content={:?}, \
-             all files: {:?}",
+             shared.md exists={} content={:?}, all files: {:?}",
             dir_b.path().join("shared.md").exists(),
             fs::read_to_string(dir_b.path().join("shared.md")).ok(),
-            conflict_b.exists(),
-            fs::read_to_string(&conflict_b).ok(),
             fs::read_dir(dir_b.path())
                 .map(|rd| rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
@@ -635,10 +650,10 @@ async fn test_both_offline_same_name_conflict() {
     }
 
     // A should eventually receive the conflict file
-    let conflict_a = dir_a.path().join("shared (client-b).md");
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let ok = fs::read_to_string(&conflict_a)
+        let ok = find_conflict_sibling(dir_a.path(), "shared", "md")
+            .and_then(|p| fs::read_to_string(p).ok())
             .map(|c| c == "B's offline content")
             .unwrap_or(false);
         if ok {
@@ -646,7 +661,7 @@ async fn test_both_offline_same_name_conflict() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "Timed out waiting for Client A to receive conflict file 'shared (client-b).md'"
+            "Timed out waiting for Client A to receive conflict sibling of shared.md"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
