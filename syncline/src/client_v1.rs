@@ -9,13 +9,16 @@
 //!   - idempotent on-disk v1 vault layout via v1::disk
 //!   - initial MANIFEST_SYNC STEP_1, apply returned STEP_2
 //!   - apply incoming MANIFEST_UPDATE frames, persist manifest to disk
+//!   - conservative projection → filesystem reconcile (create-only):
+//!     mkdir missing dirs, touch missing text files as empty placeholders,
+//!     skip binaries (blob fetch lands in 3.3c), never delete anything
 //!   - reconnect loop with exponential-ish backoff
 //!
 //! Out of scope here, added in follow-up commits on release/v1:
 //!   - polling / filesystem watcher → local change detection
-//!   - content subdoc sync (per-text-node)
+//!   - content subdoc sync (per-text-node) → populates empty placeholders
 //!   - blob upload / download
-//!   - reconcile projection → filesystem
+//!   - deletion of files that have no live manifest entry
 //!   - conflict-copy path suffixing
 
 use crate::protocol::{
@@ -24,7 +27,8 @@ use crate::protocol::{
 };
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
 use crate::v1::ids::{ActorId, Lamport};
-use crate::v1::manifest::Manifest;
+use crate::v1::manifest::{Manifest, NodeKind};
+use crate::v1::projection::project;
 use crate::v1::sync::{
     decode_version_handshake, encode_version_handshake, handle_manifest_payload,
     manifest_step1_payload,
@@ -77,7 +81,7 @@ pub async fn run_client(
 
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&url, &mut manifest, &syncline_dir).await {
+        match run_session(&url, &mut manifest, &folder, &syncline_dir).await {
             Ok(()) => {
                 // Graceful close (server shutdown). Retry after base
                 // backoff; this is not a hard error.
@@ -101,6 +105,7 @@ pub async fn run_client(
 async fn run_session(
     url: &str,
     manifest: &mut Manifest,
+    folder: &Path,
     syncline_dir: &Path,
 ) -> Result<()> {
     info!("connecting to {}", url);
@@ -209,6 +214,12 @@ async fn run_session(
                 if let Err(e) = save_manifest(syncline_dir, manifest) {
                     error!("persisting manifest: {e}");
                 }
+                // Conservative reconcile: only create missing entries
+                // (dirs + empty text placeholders). Never deletes, never
+                // overwrites. Full content lands in 3.3b/3.3c.
+                if let Err(e) = reconcile_projection_to_disk(folder, manifest) {
+                    error!("reconciling projection: {e}");
+                }
             }
             other => {
                 debug!("ignoring manifest doc frame msg_type={:#x}", other);
@@ -250,6 +261,94 @@ fn save_manifest(syncline_dir: &Path, manifest: &Manifest) -> Result<()> {
     }
     fs::rename(&tmp, &path).context("rename manifest tmp")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Projection → disk reconcile (create-only, Phase 3.3a subset)
+// ---------------------------------------------------------------------------
+
+/// Walk the manifest projection and create any missing entries on disk.
+///
+/// Rules, intentionally conservative for 3.3a:
+///   * Parent directory chain for every projected path is `mkdir_p`ed.
+///   * Missing **Text** files get created as empty placeholders — their
+///     real content arrives in 3.3b via content subdoc sync.
+///   * Missing **Binary** files are **skipped**; blob fetch is 3.3c.
+///   * Existing files are never overwritten (no truncation, no rewrite).
+///   * Files on disk that are *not* in the projection are **not deleted**
+///     — team-lead explicitly asked for create-only during the first
+///     pass so unsynced local state doesn't get clobbered.
+fn reconcile_projection_to_disk(folder: &Path, manifest: &Manifest) -> Result<()> {
+    let proj = project(manifest);
+    let mut created_dirs = 0usize;
+    let mut created_text = 0usize;
+    let mut skipped_binary = 0usize;
+
+    for (path, entry) in &proj.by_path {
+        if is_unsafe_relative_path(path) {
+            warn!("skipping unsafe projection path {:?}", path);
+            continue;
+        }
+        let full = folder.join(path);
+        if let Some(parent) = full.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("mkdir -p {} for projected {:?}", parent.display(), path)
+                })?;
+                created_dirs += 1;
+            }
+        }
+        match entry.kind {
+            NodeKind::Text => {
+                if !full.exists() {
+                    fs::File::create(&full).with_context(|| {
+                        format!("create empty text placeholder {}", full.display())
+                    })?;
+                    created_text += 1;
+                }
+            }
+            NodeKind::Binary => {
+                if !full.exists() {
+                    skipped_binary += 1;
+                }
+            }
+            NodeKind::Directory => {
+                // Emergent — directories never appear in projection.by_path.
+            }
+        }
+    }
+
+    if created_dirs + created_text + skipped_binary > 0 {
+        info!(
+            created_dirs,
+            created_text_placeholders = created_text,
+            skipped_binary_pending_3_3c = skipped_binary,
+            "reconciled projection → disk"
+        );
+    }
+    Ok(())
+}
+
+/// Defensive check: projection paths are meant to be vault-relative, but
+/// a malicious or buggy peer could produce something like `../etc/passwd`.
+/// Refuse absolute paths and any `..` segment before we hand the string
+/// to `folder.join`.
+fn is_unsafe_relative_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return true;
+    }
+    p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -317,5 +416,61 @@ mod tests {
         let syncline_dir = dir.path().join(".syncline");
         let m = load_manifest(&syncline_dir, ActorId::new()).unwrap();
         assert!(m.live_entries().is_empty());
+    }
+
+    #[test]
+    fn reconcile_creates_dirs_and_text_placeholders_skips_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+
+        let actor = ActorId::new();
+        let mut m = Manifest::new(actor);
+        crate::v1::ops::create_text(&mut m, "top.md", 0).unwrap();
+        crate::v1::ops::create_text(&mut m, "notes/deep/sub.md", 0).unwrap();
+        crate::v1::ops::create_binary(&mut m, "img/pic.png", "deadbeef", 1024).unwrap();
+
+        reconcile_projection_to_disk(folder, &m).unwrap();
+
+        assert!(folder.join("top.md").exists(), "top.md should exist");
+        assert_eq!(
+            fs::metadata(folder.join("top.md")).unwrap().len(),
+            0,
+            "text placeholder must be empty"
+        );
+        assert!(folder.join("notes/deep").is_dir(), "nested dirs mkdir_p'd");
+        assert!(folder.join("notes/deep/sub.md").exists());
+        assert!(folder.join("img").is_dir(), "binary parent dir still created");
+        assert!(
+            !folder.join("img/pic.png").exists(),
+            "binary file NOT materialised until 3.3c"
+        );
+    }
+
+    #[test]
+    fn reconcile_never_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+
+        let local_bytes = b"local user edits - must not be clobbered";
+        fs::write(folder.join("diary.md"), local_bytes).unwrap();
+
+        let actor = ActorId::new();
+        let mut m = Manifest::new(actor);
+        crate::v1::ops::create_text(&mut m, "diary.md", 0).unwrap();
+
+        reconcile_projection_to_disk(folder, &m).unwrap();
+
+        let on_disk = fs::read(folder.join("diary.md")).unwrap();
+        assert_eq!(on_disk, local_bytes, "reconcile clobbered local edits");
+    }
+
+    #[test]
+    fn reconcile_rejects_unsafe_paths() {
+        assert!(is_unsafe_relative_path(""));
+        assert!(is_unsafe_relative_path("/etc/passwd"));
+        assert!(is_unsafe_relative_path("../escape"));
+        assert!(is_unsafe_relative_path("a/../b"));
+        assert!(!is_unsafe_relative_path("a/b/c.md"));
+        assert!(!is_unsafe_relative_path("file.md"));
     }
 }
