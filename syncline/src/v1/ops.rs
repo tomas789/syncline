@@ -28,6 +28,19 @@ pub fn create_text(manifest: &mut Manifest, path: &str, size: u64) -> Result<Nod
     create_at_path(manifest, path, NodeKind::Text, None, size)
 }
 
+/// Create a text entry at `path` even when another live entry already
+/// projects there. Used by the scanner during bootstrap to record a
+/// local file that shares a path with a remote manifest entry whose
+/// content we have not yet observed: projection will resolve the
+/// resulting collision deterministically via conflict suffixes.
+pub fn create_text_allowing_collision(
+    manifest: &mut Manifest,
+    path: &str,
+    size: u64,
+) -> Result<NodeId> {
+    create_at_path_allowing_collision(manifest, path, NodeKind::Text, None, size)
+}
+
 /// Create a fresh binary entry at `path` with its CAS blob hash.
 pub fn create_binary(
     manifest: &mut Manifest,
@@ -134,6 +147,24 @@ fn create_at_path(
         if proj.by_path.contains_key(path) {
             return Err(anyhow!("path {:?} already exists", path));
         }
+    }
+    let (parent_path, leaf) = split_path(path);
+    if leaf.is_empty() {
+        return Err(anyhow!("path {:?} has empty leaf", path));
+    }
+    let parent = ensure_parent_chain(manifest, parent_path)?;
+    Ok(manifest.create_node(leaf, parent, kind, blob_hash, size))
+}
+
+fn create_at_path_allowing_collision(
+    manifest: &mut Manifest,
+    path: &str,
+    kind: NodeKind,
+    blob_hash: Option<&str>,
+    size: u64,
+) -> Result<NodeId> {
+    if path.is_empty() {
+        return Err(anyhow!("empty path"));
     }
     let (parent_path, leaf) = split_path(path);
     if leaf.is_empty() {

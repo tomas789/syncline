@@ -150,6 +150,11 @@ async fn run_session(
     // Tracks blob hashes for which we've already sent MSG_BLOB_REQUEST
     // this session. Cleared on reconnect.
     let mut requested_blobs: HashSet<String> = HashSet::new();
+    // NodeId → last disk path we materialised. Lets reconcile detect
+    // remote deletes / renames by diffing against a fresh projection:
+    // any id in here whose projection entry is gone (or path changed)
+    // has its stale disk file removed.
+    let mut on_disk: HashMap<NodeId, String> = HashMap::new();
 
     // --- Version handshake (step 1) -----------------------------------------
     let hs = encode_message(
@@ -230,33 +235,14 @@ async fn run_session(
         }
     }
 
-    // Initial scan: push local additions/edits to the server as soon as
-    // the session is up. Subsequent scans run on the 5 s timer.
-    if let Err(e) = scan_once(
-        folder,
-        syncline_dir,
-        manifest,
-        content,
-        blobs,
-        &mut write,
-        &mut content_subscribed,
-    )
-    .await
-    {
-        warn!("initial scan failed: {e:?}");
-    }
-
-    // Cover the case where a previous session left behind a manifest
-    // referring to blobs we never fully fetched — or already have locally.
-    // Materialise whatever we can, and request anything still missing.
-    if let Err(e) = reconcile_projection_to_disk(folder, manifest, blobs) {
-        warn!("initial reconcile failed: {e:?}");
-    }
-    if let Err(e) =
-        request_missing_blobs(&mut write, manifest, blobs, &mut requested_blobs).await
-    {
-        warn!("initial blob requests failed: {e:?}");
-    }
+    // Bootstrap tracking: the first scan is deferred until the server
+    // responds to our STEP_1 with its STEP_2 so we observe any remote
+    // manifest entries (and their lamport stamps) *before* we record
+    // local files as new nodes. Without this delay, two peers creating
+    // the same path independently would both record lamport=1 and the
+    // projection tiebreak would pick a winner by actor UUID, which is
+    // unobservable to users — server-first semantics must prevail.
+    let mut did_initial_scan = false;
 
     loop {
         tokio::select! {
@@ -287,7 +273,13 @@ async fn run_session(
                         warn!("inbound blob rejected: {e:?}");
                         continue;
                     }
-                    if let Err(e) = reconcile_projection_to_disk(folder, manifest, blobs) {
+                    if let Err(e) = reconcile_projection_to_disk(
+                        folder,
+                        manifest,
+                        blobs,
+                        &mut on_disk,
+                        Some(content),
+                    ) {
                         error!("reconcile after blob arrival: {e}");
                     }
                     continue;
@@ -321,9 +313,37 @@ async fn run_session(
                             if let Err(e) = save_manifest(syncline_dir, manifest) {
                                 error!("persisting manifest: {e}");
                             }
-                            if let Err(e) =
-                                reconcile_projection_to_disk(folder, manifest, blobs)
-                            {
+                            // First manifest response from the server: we
+                            // now have authoritative remote state, so
+                            // it's safe to scan local files and decide
+                            // what's new vs. a same-path collision.
+                            // Deletion-detection inside scan_once is
+                            // gated on `has_persisted` / `has_blob`, so
+                            // purely-remote entries we've never observed
+                            // won't be falsely tombstoned.
+                            if !did_initial_scan {
+                                did_initial_scan = true;
+                                if let Err(e) = scan_once(
+                                    folder,
+                                    syncline_dir,
+                                    manifest,
+                                    content,
+                                    blobs,
+                                    &mut write,
+                                    &mut content_subscribed,
+                                )
+                                .await
+                                {
+                                    warn!("initial scan failed: {e:?}");
+                                }
+                            }
+                            if let Err(e) = reconcile_projection_to_disk(
+                                folder,
+                                manifest,
+                                blobs,
+                                &mut on_disk,
+                                Some(content),
+                            ) {
                                 error!("reconciling projection: {e}");
                             }
                             if let Err(e) = subscribe_new_text_content(
@@ -422,6 +442,12 @@ async fn run_session(
                 debug!("dropping frame for unknown doc_id={}", doc_id);
             }
             _ = scan_timer.tick() => {
+                if !did_initial_scan {
+                    // Manifest STEP_2 hasn't arrived yet — holding off
+                    // any scan avoids recording local files as new
+                    // nodes before we know what the server already has.
+                    continue;
+                }
                 if let Err(e) = scan_once(
                     folder,
                     syncline_dir,
@@ -444,6 +470,10 @@ async fn run_session(
                                 "watcher batch of {} events all inside .syncline/; ignoring",
                                 events.len()
                             );
+                            continue;
+                        }
+                        if !did_initial_scan {
+                            debug!("deferring watcher-driven scan until manifest bootstrap");
                             continue;
                         }
                         debug!("watcher batch of {} events triggering scan", events.len());
@@ -537,6 +567,9 @@ async fn scan_once(
     let mut modified_files = 0usize;
     let mut new_binary = 0usize;
     let mut modified_binary = 0usize;
+    // Paths we saw during this walk (rel_str form). After the walk we
+    // diff against `proj.by_path` to detect local deletions.
+    let mut visited_rel: HashSet<String> = HashSet::new();
 
     for dent in WalkDir::new(folder)
         .follow_links(false)
@@ -561,6 +594,7 @@ async fn scan_once(
         if is_unsafe_relative_path(&rel_str) {
             continue;
         }
+        visited_rel.insert(rel_str.clone());
         let ext = rel
             .extension()
             .and_then(|e| e.to_str())
@@ -616,19 +650,49 @@ async fn scan_once(
             }
         };
 
-        if let Some(existing) = proj.by_path.get(&rel_str) {
-            if existing.kind != NodeKind::Text {
-                continue;
-            }
+        // Adopt an existing same-path manifest entry if either (a) we have
+        // its content subdoc persisted locally — normal steady-state —
+        // or (b) the on-disk body is empty, which matches the placeholder
+        // reconcile puts down for a remote entry whose content hasn't
+        // landed yet. Adopting in (b) is a safe no-op because
+        // `replace_text` short-circuits on identical bodies, so we won't
+        // upload an empty string as a "modification".
+        let adopt_existing = proj
+            .by_path
+            .get(&rel_str)
+            .filter(|e| e.kind == NodeKind::Text)
+            .filter(|e| content.has_persisted(e.id) || body.is_empty());
+        if let Some(existing) = adopt_existing {
             if let Some(update) = content.replace_text(existing.id, &body)? {
                 content.persist(existing.id)?;
                 manifest.record_modify(existing.id);
                 pending_content.push((existing.id, update));
                 modified_files += 1;
             }
+        } else if proj
+            .by_path
+            .get(&rel_str)
+            .map(|e| e.kind != NodeKind::Text)
+            .unwrap_or(false)
+        {
+            // Same-path remote node of a different kind (Binary/Directory).
+            // Don't touch it — projection will surface any collision on
+            // the next pass if the user also dropped a text file there.
+            continue;
         } else {
+            // Either truly new, or a same-path remote text node whose
+            // content subdoc we have not observed yet. In the latter
+            // case we must not overwrite the remote's content — we
+            // record a fresh node and let projection's conflict suffix
+            // rule give the loser a unique name.
             let size = body.len() as u64;
-            match crate::v1::ops::create_text(manifest, &rel_str, size) {
+            let collides = proj.by_path.contains_key(&rel_str);
+            let create_result = if collides {
+                crate::v1::ops::create_text_allowing_collision(manifest, &rel_str, size)
+            } else {
+                crate::v1::ops::create_text(manifest, &rel_str, size)
+            };
+            match create_result {
                 Ok(nid) => {
                     // Seed the brand-new subdoc via `replace_text` (empty → body).
                     if let Some(update) = content.replace_text(nid, &body)? {
@@ -641,6 +705,44 @@ async fn scan_once(
                     debug!("create_text({:?}) skipped: {}", rel_str, e);
                 }
             }
+        }
+    }
+
+    // Local deletions: any live projection entry whose disk path wasn't
+    // visited by the walk. Reconcile always materialises text entries as
+    // placeholders, so a missing text file can only mean "the user
+    // deleted it". For binary entries we additionally require that we
+    // have the blob locally — otherwise absence means "remote blob
+    // hasn't landed yet", not a delete. Directory nodes are emergent
+    // and never appear in `by_path`.
+    let mut deleted_files = 0usize;
+    let deletion_candidates: Vec<(NodeId, NodeKind, Option<String>, String)> = proj
+        .by_path
+        .iter()
+        .filter(|(path, _)| !visited_rel.contains(path.as_str()))
+        .map(|(path, entry)| (entry.id, entry.kind, entry.blob_hash.clone(), path.clone()))
+        .collect();
+    for (id, kind, blob_hash, path) in deletion_candidates {
+        match kind {
+            NodeKind::Text => {
+                // Only treat a missing on-disk file as a local delete
+                // if we've observed this node's content at least once
+                // (i.e. have a persisted subdoc). Otherwise this is a
+                // remote-only entry we have yet to materialise, not a
+                // user-driven deletion.
+                if content.has_persisted(id) && manifest.delete(id) {
+                    debug!(node = ?id, %path, "local text delete detected");
+                    deleted_files += 1;
+                }
+            }
+            NodeKind::Binary => {
+                let have_blob = blob_hash.as_deref().map(|h| blobs.has(h)).unwrap_or(false);
+                if have_blob && manifest.delete(id) {
+                    debug!(node = ?id, %path, "local binary delete detected");
+                    deleted_files += 1;
+                }
+            }
+            NodeKind::Directory => {}
         }
     }
 
@@ -677,12 +779,13 @@ async fn scan_once(
             .context("send content update from scanner")?;
     }
 
-    if new_files + modified_files + new_binary + modified_binary > 0 {
+    if new_files + modified_files + new_binary + modified_binary + deleted_files > 0 {
         info!(
             new_files,
             modified_files,
             new_binary,
             modified_binary,
+            deleted_files,
             "scanner pushed local changes to server"
         );
     }
@@ -785,6 +888,15 @@ impl ContentStore {
 
     fn content_file(content_dir: &Path, node_id: NodeId) -> PathBuf {
         content_dir.join(format!("{}.bin", node_id.to_string_hyphenated()))
+    }
+
+    /// True iff a persisted content subdoc exists on disk for this node.
+    /// Used during scan to avoid adopting (and overwriting) a manifest
+    /// entry whose content we have never observed — that situation means
+    /// a same-path collision with a remote peer, which should produce a
+    /// new sibling node, not silently rewrite the remote's content.
+    fn has_persisted(&self, node_id: NodeId) -> bool {
+        Self::content_file(&self.content_dir, node_id).is_file()
     }
 
     /// Loads the subdoc for `node_id` from disk if present, otherwise
@@ -1075,7 +1187,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Walk the manifest projection and create any missing entries on disk.
 ///
-/// Rules, intentionally conservative:
+/// Rules:
 ///   * Parent directory chain for every projected path is `mkdir_p`ed.
 ///   * Missing **Text** files get created as empty placeholders — their
 ///     real content arrives via content subdoc sync (Phase 3.3b).
@@ -1084,16 +1196,76 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 ///     request is fired separately by `request_missing_blobs`; the next
 ///     reconcile (triggered when the blob arrives) will materialize
 ///     the file.
-///   * Existing files are never overwritten (no truncation, no rewrite).
-///   * Files on disk that are *not* in the projection are **not deleted**
-///     — team-lead explicitly asked for create-only during the first
-///     pass so unsynced local state doesn't get clobbered.
+///   * Binary bytes-on-disk ≠ manifest hash → see 3.3e: LWW + conflict
+///     sibling.
+///   * Nodes that disappeared from the projection since the previous
+///     reconcile (i.e. a remote delete) have their last-known disk path
+///     removed. Same for renamed nodes — the old path is removed so the
+///     node only exists under its new projected path.
+///   * Text files whose projection entry still exists are left untouched
+///     (content is maintained by the subdoc sync path).
+///
+/// `on_disk` tracks `NodeId → last materialised path` across reconcile
+/// invocations for this session. It starts empty; entries get added as
+/// we materialise / observe files on disk, and removed when we delete
+/// stale paths.
+///
+/// `content` is consulted when creating a text placeholder: if we
+/// already have a non-empty subdoc body (e.g. seeded from the user's
+/// local file in `scan_once`, or carried over from a previous session),
+/// we write that body instead of an empty placeholder. This is what
+/// preserves bytes across a same-path collision — the losing-side
+/// NodeId's content reaches its conflict-sibling path on the very first
+/// reconcile that projects it there, without needing an extra STEP_2
+/// round-trip.
 fn reconcile_projection_to_disk(
     folder: &Path,
     manifest: &Manifest,
     blobs: &BlobStore,
+    on_disk: &mut HashMap<NodeId, String>,
+    content: Option<&ContentStore>,
 ) -> Result<()> {
     let proj = project(manifest);
+
+    // Apply remote deletions / renames first: any NodeId we previously
+    // materialised that is either gone from the projection or now lives
+    // at a different path gets its old disk path removed. fs::remove_file
+    // tolerates races (file already gone) — we only log at debug.
+    let mut removed_stale = 0usize;
+    let stale: Vec<(NodeId, String)> = on_disk
+        .iter()
+        .filter_map(|(id, old_path)| {
+            let still_here = proj
+                .by_id
+                .get(id)
+                .map(|e| e.path == *old_path)
+                .unwrap_or(false);
+            if still_here {
+                None
+            } else {
+                Some((*id, old_path.clone()))
+            }
+        })
+        .collect();
+    for (id, old_path) in stale {
+        let full = folder.join(&old_path);
+        match fs::remove_file(&full) {
+            Ok(()) => {
+                debug!(node = ?id, path = %old_path, "removed stale disk path");
+                removed_stale += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    node = ?id,
+                    path = %old_path,
+                    "failed to remove stale disk path: {e}"
+                );
+            }
+        }
+        on_disk.remove(&id);
+    }
+
     let mut created_dirs = 0usize;
     let mut created_text = 0usize;
     let mut created_binary = 0usize;
@@ -1117,9 +1289,25 @@ fn reconcile_projection_to_disk(
         match entry.kind {
             NodeKind::Text => {
                 if !full.exists() {
-                    fs::File::create(&full).with_context(|| {
-                        format!("create empty text placeholder {}", full.display())
-                    })?;
+                    // Use any subdoc content we already have so the
+                    // placeholder isn't empty when we're materialising a
+                    // conflict sibling whose bytes we ingested locally.
+                    // Missing / not-loaded / empty subdoc → empty file.
+                    let seed = content
+                        .and_then(|c| c.current_text(entry.id))
+                        .unwrap_or_default();
+                    if seed.is_empty() {
+                        fs::File::create(&full).with_context(|| {
+                            format!("create empty text placeholder {}", full.display())
+                        })?;
+                    } else {
+                        atomic_write(&full, seed.as_bytes()).with_context(|| {
+                            format!(
+                                "seed text placeholder {} with cached subdoc body",
+                                full.display()
+                            )
+                        })?;
+                    }
                     created_text += 1;
                 }
             }
@@ -1193,13 +1381,37 @@ fn reconcile_projection_to_disk(
         }
     }
 
-    if created_dirs + created_text + created_binary + pending_binary + conflicts_created > 0 {
+    // Refresh on_disk from current projection: any entry whose file
+    // exists on disk (whether we just created it or it was already
+    // there) is a candidate for future stale-path cleanup. Pending
+    // binaries (no blob yet) are NOT tracked — they don't exist on
+    // disk, so nothing to clean.
+    on_disk.clear();
+    for (id, entry) in &proj.by_id {
+        if matches!(entry.kind, NodeKind::Directory) {
+            continue;
+        }
+        let full = folder.join(&entry.path);
+        if full.is_file() {
+            on_disk.insert(*id, entry.path.clone());
+        }
+    }
+
+    if created_dirs
+        + created_text
+        + created_binary
+        + pending_binary
+        + conflicts_created
+        + removed_stale
+        > 0
+    {
         info!(
             created_dirs,
             created_text_placeholders = created_text,
             created_binary,
             pending_binary,
             conflicts_created,
+            removed_stale,
             "reconciled projection → disk"
         );
     }
@@ -1291,6 +1503,21 @@ fn fold_disk_drift_into_content(
     let full = folder.join(&entry.path);
     if !full.exists() {
         return Ok(None);
+    }
+    // Guard against folding pre-existing bytes that belong to a
+    // sibling collision node the scanner just created. If this node
+    // was authored by a different actor and we've never persisted
+    // its subdoc, the on-disk bytes are not "drift from this node's
+    // CRDT" — the server will send us the authoritative content via
+    // STEP_2 and `flush_content_to_disk` will write it out.
+    if !content.has_persisted(node_id) {
+        let created_by_us = manifest
+            .get_entry(node_id)
+            .map(|e| e.created_by == manifest.actor())
+            .unwrap_or(false);
+        if !created_by_us {
+            return Ok(None);
+        }
     }
     let disk = match fs::read_to_string(&full) {
         Ok(s) => s,
@@ -1445,7 +1672,7 @@ mod tests {
         // Binary present in manifest but blob is NOT in the local store.
         crate::v1::ops::create_binary(&mut m, "img/pic.png", "deadbeef", 1024).unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         assert!(folder.join("top.md").exists(), "top.md should exist");
         assert_eq!(
@@ -1474,7 +1701,7 @@ mod tests {
         crate::v1::ops::create_binary(&mut m, "img/pic.png", &hash, bytes.len() as u64)
             .unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         let on_disk = fs::read(folder.join("img/pic.png")).unwrap();
         assert_eq!(on_disk, bytes);
@@ -1493,7 +1720,7 @@ mod tests {
         let mut m = Manifest::new(actor);
         crate::v1::ops::create_text(&mut m, "diary.md", 0).unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         let on_disk = fs::read(folder.join("diary.md")).unwrap();
         assert_eq!(on_disk, local_bytes, "reconcile clobbered local edits");
@@ -1516,7 +1743,7 @@ mod tests {
         let mut m = Manifest::new(ActorId::new());
         crate::v1::ops::create_binary(&mut m, "img.bin", "deadbeef", 123).unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         let on_disk = fs::read(folder.join("img.bin")).unwrap();
         assert_eq!(on_disk, local_bytes, "must not touch disk without remote blob");
@@ -1898,7 +2125,7 @@ mod tests {
         )
         .unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         // Canonical path now holds the remote bytes.
         let on_disk = fs::read(folder.join("img.bin")).unwrap();
@@ -1934,7 +2161,7 @@ mod tests {
         let mut m = Manifest::new(ActorId::new());
         crate::v1::ops::create_binary(&mut m, "img.bin", &hash, bytes.len() as u64).unwrap();
 
-        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
         let entries: Vec<String> = fs::read_dir(folder)
             .unwrap()

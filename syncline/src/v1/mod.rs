@@ -32,8 +32,8 @@ pub use ids::{ActorId, Lamport, NodeId};
 pub use manifest::{Manifest, NodeEntry, NodeKind};
 pub use migration::{migrate_v0_vault, Migration};
 pub use ops::{
-    create_binary, create_text, delete as delete_path, record_modify_binary, record_modify_text,
-    rename,
+    create_binary, create_text, create_text_allowing_collision, delete as delete_path,
+    record_modify_binary, record_modify_text, rename,
 };
 pub use projection::{ProjectedEntry, Projection};
 pub use sync::{
