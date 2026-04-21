@@ -43,6 +43,21 @@ enum Commands {
         #[arg(long)]
         log_file: Option<PathBuf>,
     },
+    /// Migrate a v0 vault on disk to the v1 manifest layout.
+    /// Idempotent — safe to run on an already-migrated vault.
+    Migrate {
+        /// Folder containing the `.syncline/` directory to migrate.
+        #[arg(short, long, default_value = ".")]
+        folder: PathBuf,
+
+        /// Log level (error, warn, info, debug, trace)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+
+        /// Optional file to redirect logs to
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
     /// Start the Syncline Client to sync a folder
     Sync {
         /// Folder to watch and sync
@@ -79,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (log_level, log_file) = match &cli.command {
         Commands::Server {
+            log_level,
+            log_file,
+            ..
+        } => (log_level, log_file),
+        Commands::Migrate {
             log_level,
             log_file,
             ..
@@ -131,6 +151,44 @@ async fn main() -> anyhow::Result<()> {
 
             let db = syncline::server::db::Db::new(&connection_string).await?;
             syncline::server::server::run_server(db, port).await?;
+        }
+        Commands::Migrate { folder, .. } => {
+            use colored::Colorize;
+            tracing::info!(
+                "{} Migrating vault at {} to v1 layout…",
+                "📦".cyan(),
+                folder.display()
+            );
+            let report = tokio::task::spawn_blocking(move || {
+                syncline::v1::migrate_vault_on_disk(&folder)
+            })
+            .await??;
+
+            if report.already_migrated {
+                tracing::info!(
+                    "{} Vault at {} already reports version 1 — nothing to do.",
+                    "✅".green(),
+                    report.vault_root.display()
+                );
+            } else {
+                tracing::info!(
+                    "{} Migrated {} text files, {} binary files, {} directories (actor {}).",
+                    "✅".green(),
+                    report.text_files,
+                    report.binary_files,
+                    report.directories,
+                    report.actor_id
+                );
+                if !report.warnings.is_empty() {
+                    tracing::warn!("{} {} warnings during migration:", "⚠️".yellow(), report.warnings.len());
+                    for w in &report.warnings {
+                        tracing::warn!("  - {}", w);
+                    }
+                }
+                tracing::info!(
+                    "v0 data preserved at .syncline/data.v0.bak; version marker written."
+                );
+            }
         }
         Commands::Sync { folder, url, name, .. } => {
             syncline::client::app::run_client(folder, url, name).await?;
