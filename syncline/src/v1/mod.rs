@@ -33,7 +33,8 @@ pub use ops::{
 };
 pub use projection::{ProjectedEntry, Projection};
 pub use sync::{
-    decode_version_handshake, encode_manifest_step1, encode_manifest_step2,
-    encode_manifest_update, encode_version_handshake, handle_manifest_payload,
-    manifest_step1_payload, manifest_step2_payload, split_manifest_payload,
+    decode_verify_payload, decode_version_handshake, encode_manifest_step1,
+    encode_manifest_step2, encode_manifest_update, encode_verify_payload,
+    encode_version_handshake, handle_manifest_payload, handle_verify_payload,
+    manifest_step1_payload, manifest_step2_payload, projection_hash, split_manifest_payload,
 };

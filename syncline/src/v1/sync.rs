@@ -26,9 +26,11 @@
 //! handshake frame.
 
 use super::manifest::Manifest;
+use super::projection::project;
 use crate::protocol::{
     MANIFEST_STEP_1, MANIFEST_STEP_2, MANIFEST_UPDATE, V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR,
 };
+use sha2::{Digest, Sha256};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{ReadTxn, StateVector, Transact};
@@ -129,6 +131,77 @@ pub fn handle_manifest_payload(
             "unknown manifest sync sub-type {:#x}",
             other
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convergence verification (MSG_MANIFEST_VERIFY — §4.4.1)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 over the canonical projection of `manifest`. Two peers that
+/// project to the same set of user-visible files produce an identical
+/// hash; divergent tombstones that never surface in the projection do
+/// **not** cause a mismatch.
+///
+/// Canonical form: projected entries sorted by path, each encoded as
+/// `path || 0x00 || node-id(hyphenated) || 0x00 || kind || 0x00 ||
+/// blob-hash-or-empty || 0x00 || size(u64 BE) || 0x00`. The
+/// zero-byte separators prevent `"a" + "bc"` from colliding with
+/// `"ab" + "c"`.
+pub fn projection_hash(manifest: &Manifest) -> [u8; 32] {
+    let proj = project(manifest);
+    let mut entries: Vec<_> = proj.by_path.iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+
+    let mut hasher = Sha256::new();
+    for (path, entry) in entries {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.id.to_string_hyphenated().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.kind.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.blob_hash.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.size.to_be_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.finalize().into()
+}
+
+/// Encode the payload for a `MSG_MANIFEST_VERIFY` frame: just the
+/// 32-byte projection hash.
+pub fn encode_verify_payload(hash: &[u8; 32]) -> Vec<u8> {
+    hash.to_vec()
+}
+
+/// Decode a `MSG_MANIFEST_VERIFY` payload into its 32-byte hash.
+pub fn decode_verify_payload(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(payload);
+    Some(out)
+}
+
+/// Handle an incoming `MSG_MANIFEST_VERIFY` payload. If the remote
+/// hash matches the local projection hash, returns `Ok(None)`
+/// (convergence confirmed). If they disagree, returns
+/// `Ok(Some(manifest_sync_payload))` — a `MANIFEST_STEP_1` payload
+/// ready to be wrapped in a `MSG_MANIFEST_SYNC` frame to force a
+/// full re-sync.
+pub fn handle_verify_payload(
+    manifest: &Manifest,
+    payload: &[u8],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let remote = decode_verify_payload(payload)
+        .ok_or_else(|| anyhow::anyhow!("malformed MSG_MANIFEST_VERIFY payload"))?;
+    let local = projection_hash(manifest);
+    if local == remote {
+        Ok(None)
+    } else {
+        Ok(Some(manifest_step1_payload(manifest)))
     }
 }
 
@@ -361,6 +434,150 @@ mod tests {
         handle_manifest_payload(&mut m2, p).unwrap();
 
         assert!(m2.get_entry(id).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Convergence verification (MSG_MANIFEST_VERIFY)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn projection_hash_is_deterministic() {
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        m1.create_node("b.md", None, NodeKind::Text, None, 20);
+        let h1 = projection_hash(&m1);
+        let h2 = projection_hash(&m1);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn projection_hash_differs_when_content_differs() {
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        let h1 = projection_hash(&m1);
+
+        let mut m2 = Manifest::new(ActorId::new());
+        m2.create_node("a.md", None, NodeKind::Text, None, 11);
+        let h2 = projection_hash(&m2);
+
+        assert_ne!(h1, h2, "size difference must affect projection hash");
+    }
+
+    #[test]
+    fn projection_hash_matches_after_full_sync() {
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        m1.create_node("b.md", None, NodeKind::Text, None, 20);
+
+        let mut m2 = Manifest::new(ActorId::new());
+        m2.create_node("c.md", None, NodeKind::Text, None, 30);
+
+        // Full bidirectional sync via the manifest protocol.
+        let s1 = manifest_step1_payload(&m1);
+        let s2 = manifest_step1_payload(&m2);
+        let r1 = handle_manifest_payload(&mut m2, &s1).unwrap().unwrap();
+        let r2 = handle_manifest_payload(&mut m1, &s2).unwrap().unwrap();
+        handle_manifest_payload(&mut m1, &r1).unwrap();
+        handle_manifest_payload(&mut m2, &r2).unwrap();
+
+        assert_eq!(
+            projection_hash(&m1),
+            projection_hash(&m2),
+            "post-sync peers must agree on projection hash"
+        );
+    }
+
+    #[test]
+    fn verify_payload_roundtrip() {
+        let m = Manifest::new(ActorId::new());
+        let h = projection_hash(&m);
+        let payload = encode_verify_payload(&h);
+        assert_eq!(payload.len(), 32);
+        let decoded = decode_verify_payload(&payload).unwrap();
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn verify_payload_rejects_wrong_length() {
+        assert!(decode_verify_payload(&[]).is_none());
+        assert!(decode_verify_payload(&[0u8; 31]).is_none());
+        assert!(decode_verify_payload(&[0u8; 33]).is_none());
+    }
+
+    #[test]
+    fn handle_verify_on_match_returns_none() {
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 0);
+        let mut m2 = Manifest::new(ActorId::new());
+        // Seed m2 with the same state.
+        m2.apply_update(&m1.encode_state_as_update()).unwrap();
+
+        let remote_hash = projection_hash(&m2);
+        let payload = encode_verify_payload(&remote_hash);
+        let resp = handle_verify_payload(&m1, &payload).unwrap();
+        assert!(resp.is_none(), "matching hashes must not trigger re-sync");
+    }
+
+    #[test]
+    fn handle_verify_on_mismatch_returns_step1() {
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 0);
+        let mut m2 = Manifest::new(ActorId::new());
+        m2.create_node("different.md", None, NodeKind::Text, None, 0);
+
+        let remote_hash = projection_hash(&m2);
+        let payload = encode_verify_payload(&remote_hash);
+        let resp = handle_verify_payload(&m1, &payload)
+            .unwrap()
+            .expect("mismatch must trigger a sync");
+        // The returned payload is a MANIFEST_STEP_1 ready to wrap.
+        let (sub, _inner) = split_manifest_payload(&resp).unwrap();
+        assert_eq!(sub, MANIFEST_STEP_1);
+    }
+
+    #[test]
+    fn handle_verify_rejects_malformed_payload() {
+        let m = Manifest::new(ActorId::new());
+        assert!(handle_verify_payload(&m, &[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn verify_then_sync_converges_mismatched_peers() {
+        // Simulates the full §4.4.1 flow: a heartbeat VERIFY is sent,
+        // the receiver notices divergence, returns a SyncStep1, the
+        // originator then responds with a SyncStep2, and both peers
+        // should now share a matching projection hash.
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        let mut m2 = Manifest::new(ActorId::new());
+        m2.create_node("b.md", None, NodeKind::Text, None, 20);
+
+        // m2 heartbeats its projection hash to m1.
+        let verify_payload = encode_verify_payload(&projection_hash(&m2));
+        let step1_from_m1 = handle_verify_payload(&m1, &verify_payload)
+            .unwrap()
+            .expect("hashes should diverge");
+
+        // m2 receives m1's step1, replies with step2 of what m1 is
+        // missing from m2's state. m1 applies — m1 is now a superset.
+        let step2_for_m1 = handle_manifest_payload(&mut m2, &step1_from_m1)
+            .unwrap()
+            .unwrap();
+        handle_manifest_payload(&mut m1, &step2_for_m1).unwrap();
+
+        // Second leg: m2 still lacks "a.md". m2 sends its own step1
+        // so m1 can respond with what m2 is missing.
+        let step1_from_m2 = manifest_step1_payload(&m2);
+        let step2_for_m2 = handle_manifest_payload(&mut m1, &step1_from_m2)
+            .unwrap()
+            .unwrap();
+        handle_manifest_payload(&mut m2, &step2_for_m2).unwrap();
+
+        assert_eq!(
+            projection_hash(&m1),
+            projection_hash(&m2),
+            "peers must converge after VERIFY-driven re-sync"
+        );
     }
 
     /// Smoke test: NodeId parsing sanity (catches accidental formatting
