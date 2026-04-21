@@ -357,6 +357,42 @@ async fn run_session(
                 if let Some(node_id) = parse_content_doc_id(doc_id) {
                     match msg_type {
                         MSG_SYNC_STEP_2 | MSG_UPDATE => {
+                            // Fold any local disk drift into the CRDT
+                            // first so the incoming remote update merges
+                            // against it (via Yrs) rather than letting
+                            // the subsequent flush clobber unsaved local
+                            // edits. The drift delta we generate here
+                            // also needs broadcasting so the server and
+                            // other peers see the user's local work.
+                            match fold_disk_drift_into_content(
+                                folder, manifest, content, node_id,
+                            ) {
+                                Ok(Some(delta)) => {
+                                    let frame = encode_message(
+                                        MSG_UPDATE,
+                                        &content_doc_id(node_id),
+                                        &delta,
+                                    );
+                                    if let Err(e) =
+                                        write.send(WsMessage::Binary(frame.into())).await
+                                    {
+                                        anyhow::bail!(
+                                            "forward disk-drift delta for {:?}: {e}",
+                                            node_id
+                                        );
+                                    }
+                                    if let Err(e) = content.persist(node_id) {
+                                        error!(
+                                            "persist after drift fold for {:?}: {e}",
+                                            node_id
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    error!("fold disk drift for {:?}: {e}", node_id);
+                                }
+                            }
                             if let Err(e) = content.apply_update(node_id, payload) {
                                 error!("apply content update for {:?}: {e}", node_id);
                                 continue;
@@ -1062,6 +1098,7 @@ fn reconcile_projection_to_disk(
     let mut created_text = 0usize;
     let mut created_binary = 0usize;
     let mut pending_binary = 0usize;
+    let mut conflicts_created = 0usize;
 
     for (path, entry) in &proj.by_path {
         if is_unsafe_relative_path(path) {
@@ -1087,15 +1124,57 @@ fn reconcile_projection_to_disk(
                 }
             }
             NodeKind::Binary => {
-                if full.exists() {
-                    continue;
-                }
                 let Some(hash) = entry.blob_hash.as_deref() else {
                     // A Binary entry with no hash is a manifest-level
                     // bug on the emitting peer; nothing we can write.
                     debug!("binary {:?} has no blob_hash, skipping", path);
                     continue;
                 };
+                if full.exists() {
+                    let local_bytes = fs::read(&full)
+                        .with_context(|| format!("read local {}", full.display()))?;
+                    let local_hash = hash_hex(&local_bytes);
+                    if local_hash == hash {
+                        continue;
+                    }
+                    if !blobs.has(hash) {
+                        // Remote blob not fetched yet; keep local bytes
+                        // in place and handle the conflict atomically on
+                        // a later reconcile (once the blob arrives).
+                        pending_binary += 1;
+                        continue;
+                    }
+                    // Disk diverged from manifest and we have the remote
+                    // version. LWW: remote wins (we reach this branch
+                    // only after a remote manifest update landed). Save
+                    // local bytes as a conflict sibling so nothing gets
+                    // silently clobbered.
+                    blobs.insert_bytes(&local_bytes).with_context(|| {
+                        format!("stash conflict bytes for {:?}", path)
+                    })?;
+                    let actor_short = manifest.actor().short();
+                    let conflict_rel =
+                        conflict_sibling_path(path, &actor_short, &today_ymd());
+                    let conflict_full = folder.join(&conflict_rel);
+                    atomic_write(&conflict_full, &local_bytes).with_context(|| {
+                        format!("write conflict copy {}", conflict_full.display())
+                    })?;
+                    let remote_bytes = blobs.read(hash).with_context(|| {
+                        format!("read remote blob {} for {:?}", hash, path)
+                    })?;
+                    atomic_write(&full, &remote_bytes).with_context(|| {
+                        format!("overwrite with remote {}", full.display())
+                    })?;
+                    warn!(
+                        path = %path,
+                        conflict_copy = %conflict_rel,
+                        local_hash = %local_hash,
+                        remote_hash = %hash,
+                        "binary conflict: local bytes preserved, remote applied"
+                    );
+                    conflicts_created += 1;
+                    continue;
+                }
                 if !blobs.has(hash) {
                     pending_binary += 1;
                     continue;
@@ -1114,16 +1193,123 @@ fn reconcile_projection_to_disk(
         }
     }
 
-    if created_dirs + created_text + created_binary + pending_binary > 0 {
+    if created_dirs + created_text + created_binary + pending_binary + conflicts_created > 0 {
         info!(
             created_dirs,
             created_text_placeholders = created_text,
             created_binary,
             pending_binary,
+            conflicts_created,
             "reconciled projection → disk"
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local-disk conflict handling (Phase 3.3e)
+// ---------------------------------------------------------------------------
+
+/// Build the conflict-sibling path for a vault-relative file path.
+///
+/// Shape: `<stem> (conflict <YYYY-MM-DD> <actor8>).<ext>` inside the same
+/// directory as the original. Extension-less files get no trailing dot.
+/// The suffix carries the actor id short form and the current day so
+/// multiple conflicts on the same file — whether from different peers or
+/// from a restart-induced re-detection — don't collide.
+fn conflict_sibling_path(path: &str, actor_short: &str, date_ymd: &str) -> String {
+    let last_slash = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let dir_prefix = &path[..last_slash];
+    let last = &path[last_slash..];
+    let (stem, ext) = match last.rfind('.') {
+        // Hidden files like ".env" have no stem → keep the full name.
+        Some(dot) if dot > 0 => (&last[..dot], Some(&last[dot + 1..])),
+        _ => (last, None),
+    };
+    match ext {
+        Some(ext) => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short}).{ext}"),
+        None => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short})"),
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) for embedding in conflict filenames. Falls back to
+/// the epoch if the clock is broken, which we accept — the suffix still
+/// serves its uniqueness purpose thanks to the actor id.
+fn today_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Howard Hinnant's `civil_from_days` — UNIX day number → (year, month, day).
+/// Exists so we don't have to pull in `chrono` or `time` just for a
+/// filename stamp. Valid for any Gregorian date in `i64` range.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+/// Pre-merge disk drift for a text node before applying an incoming remote
+/// content update. If the user's on-disk file differs from our in-memory
+/// CRDT body, fold those local edits into the CRDT via `replace_text`.
+/// The remote update that arrives next gets merged against the combined
+/// state by Yrs, so local edits survive without a conflict copy.
+///
+/// Returns `Ok(Some(delta))` if we produced a local-side update that the
+/// caller should broadcast to the server so other peers see the drift
+/// too; `Ok(None)` if disk and CRDT already agreed (or the node is not
+/// materialisable).
+fn fold_disk_drift_into_content(
+    folder: &Path,
+    manifest: &Manifest,
+    content: &mut ContentStore,
+    node_id: NodeId,
+) -> Result<Option<Vec<u8>>> {
+    let proj = project(manifest);
+    let Some(entry) = proj.by_id.get(&node_id) else {
+        return Ok(None);
+    };
+    if entry.kind != NodeKind::Text {
+        return Ok(None);
+    }
+    if is_unsafe_relative_path(&entry.path) {
+        return Ok(None);
+    }
+    let full = folder.join(&entry.path);
+    if !full.exists() {
+        return Ok(None);
+    }
+    let disk = match fs::read_to_string(&full) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("fold_disk_drift: can't read {}: {}", full.display(), e);
+            return Ok(None);
+        }
+    };
+    let crdt_body = content.current_text(node_id).unwrap_or_default();
+    if disk == crdt_body {
+        return Ok(None);
+    }
+    debug!(
+        path = %entry.path,
+        disk_bytes = disk.len(),
+        crdt_bytes = crdt_body.len(),
+        "folding on-disk drift into CRDT before remote apply"
+    );
+    content.replace_text(node_id, &disk)
 }
 
 /// Decide whether a debounced-watcher batch should trigger `scan_once`.
@@ -1314,25 +1500,34 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_never_overwrites_existing_binary_file() {
+    fn reconcile_defers_binary_when_local_differs_and_remote_blob_missing() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path();
         let (_bs_tmp, blobs) = fresh_blob_store();
 
-        // Local bytes on disk disagree with the manifest+blob content.
+        // Disk has a different version from the manifest, and the
+        // remote blob is NOT in the local store yet. We must preserve
+        // local bytes untouched — the conflict copy is created only
+        // when we also have the remote blob available to atomically
+        // swap in.
         let local_bytes = b"local binary - keep me";
         fs::write(folder.join("img.bin"), local_bytes).unwrap();
 
-        let remote_bytes = b"remote binary";
-        let hash = blobs.insert_bytes(remote_bytes).unwrap();
         let mut m = Manifest::new(ActorId::new());
-        crate::v1::ops::create_binary(&mut m, "img.bin", &hash, remote_bytes.len() as u64)
-            .unwrap();
+        crate::v1::ops::create_binary(&mut m, "img.bin", "deadbeef", 123).unwrap();
 
         reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
 
         let on_disk = fs::read(folder.join("img.bin")).unwrap();
-        assert_eq!(on_disk, local_bytes, "binary reconcile clobbered local file");
+        assert_eq!(on_disk, local_bytes, "must not touch disk without remote blob");
+        let siblings: Vec<_> = fs::read_dir(folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            !siblings.iter().any(|n| n.contains("conflict")),
+            "no conflict copy should be created without remote blob: {siblings:?}"
+        );
     }
 
     #[test]
@@ -1623,6 +1818,196 @@ mod tests {
         let h = hash_hex(&bytes);
         assert!(handle_inbound_blob(&h, &bytes, &blobs).is_err());
         assert!(!blobs.has(&h));
+    }
+
+    // --- Phase 3.3e: conflict handling -------------------------------------
+
+    #[test]
+    fn conflict_sibling_path_with_extension() {
+        assert_eq!(
+            conflict_sibling_path("notes/hi.md", "abcd1234", "2026-04-21"),
+            "notes/hi (conflict 2026-04-21 abcd1234).md"
+        );
+    }
+
+    #[test]
+    fn conflict_sibling_path_no_extension() {
+        assert_eq!(
+            conflict_sibling_path("README", "abcd1234", "2026-04-21"),
+            "README (conflict 2026-04-21 abcd1234)"
+        );
+    }
+
+    #[test]
+    fn conflict_sibling_path_nested() {
+        assert_eq!(
+            conflict_sibling_path("a/b/c/file.bin", "ffff0000", "2026-04-21"),
+            "a/b/c/file (conflict 2026-04-21 ffff0000).bin"
+        );
+    }
+
+    #[test]
+    fn conflict_sibling_path_hidden_file_has_no_stem_split() {
+        // `.env` is a single-segment name starting with a dot; treating
+        // the whole thing as the stem avoids producing ` (conflict …).env`
+        // without a leading stem.
+        let got = conflict_sibling_path(".env", "aaaa1111", "2026-04-21");
+        assert_eq!(got, ".env (conflict 2026-04-21 aaaa1111)");
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        // 2000-01-01 — well-known leap-century boundary.
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+        // 2000-02-29 must decode as the real Feb 29 (not Mar 1).
+        assert_eq!(civil_from_days(11016), (2000, 2, 29));
+        // 2026-04-21 sanity check (today in the project timeline).
+        assert_eq!(civil_from_days(20564), (2026, 4, 21));
+    }
+
+    #[test]
+    fn today_ymd_is_ten_chars_with_hyphens() {
+        let s = today_ymd();
+        assert_eq!(s.len(), 10);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+    }
+
+    #[test]
+    fn reconcile_creates_binary_conflict_copy_when_disk_drifts() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+
+        // User edited the binary locally. Manifest meanwhile moved to
+        // a different version, and the remote blob is available.
+        let local_bytes = b"local edits - must be preserved";
+        fs::write(folder.join("img.bin"), local_bytes).unwrap();
+
+        let remote_bytes = b"remote bytes that won LWW";
+        let remote_hash = blobs.insert_bytes(remote_bytes).unwrap();
+        let mut m = Manifest::new(ActorId::new());
+        crate::v1::ops::create_binary(
+            &mut m,
+            "img.bin",
+            &remote_hash,
+            remote_bytes.len() as u64,
+        )
+        .unwrap();
+
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+
+        // Canonical path now holds the remote bytes.
+        let on_disk = fs::read(folder.join("img.bin")).unwrap();
+        assert_eq!(on_disk, remote_bytes, "remote should have won at canonical path");
+
+        // A conflict sibling must exist, containing the original local bytes.
+        let entries: Vec<String> = fs::read_dir(folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let conflict_name = entries
+            .iter()
+            .find(|n| n.contains("(conflict ") && n.ends_with(".bin"))
+            .unwrap_or_else(|| panic!("no conflict sibling in {entries:?}"));
+        let conflict_bytes = fs::read(folder.join(conflict_name)).unwrap();
+        assert_eq!(conflict_bytes, local_bytes, "local bytes lost");
+
+        // Local bytes should also have been stashed in the CAS so the
+        // user can never truly lose them even if they delete the sibling.
+        assert!(blobs.has(&hash_hex(local_bytes)));
+    }
+
+    #[test]
+    fn reconcile_noop_when_local_binary_already_matches_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+
+        let bytes = b"canonical bytes everywhere";
+        let hash = blobs.insert_bytes(bytes).unwrap();
+        fs::write(folder.join("img.bin"), bytes).unwrap();
+
+        let mut m = Manifest::new(ActorId::new());
+        crate::v1::ops::create_binary(&mut m, "img.bin", &hash, bytes.len() as u64).unwrap();
+
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+
+        let entries: Vec<String> = fs::read_dir(folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains("conflict")),
+            "no conflict copy when hashes already match: {entries:?}"
+        );
+        let on_disk = fs::read(folder.join("img.bin")).unwrap();
+        assert_eq!(on_disk, bytes);
+    }
+
+    #[test]
+    fn fold_disk_drift_emits_delta_when_disk_ahead_of_crdt() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+
+        let mut m = Manifest::new(ActorId::new());
+        let nid = crate::v1::ops::create_text(&mut m, "notes/hi.md", 0).unwrap();
+
+        // CRDT starts empty. Disk has local edits.
+        fs::create_dir_all(folder.join("notes")).unwrap();
+        fs::write(folder.join("notes/hi.md"), "local edits on disk").unwrap();
+
+        let mut store = ContentStore::new(folder.join(".syncline/content"));
+
+        let delta = fold_disk_drift_into_content(folder, &m, &mut store, nid).unwrap();
+        let delta = delta.expect("disk drift should produce a delta");
+
+        // Applying the delta to a fresh peer converges to the disk text.
+        let peer = Doc::new();
+        let t = peer.get_or_insert_text("text");
+        peer.transact_mut()
+            .apply_update(Update::decode_v1(&delta).unwrap());
+        assert_eq!(t.get_string(&peer.transact()), "local edits on disk");
+
+        // CRDT now reflects the disk state.
+        assert_eq!(
+            store.current_text(nid).as_deref(),
+            Some("local edits on disk")
+        );
+    }
+
+    #[test]
+    fn fold_disk_drift_noop_when_crdt_matches_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+
+        let mut m = Manifest::new(ActorId::new());
+        let nid = crate::v1::ops::create_text(&mut m, "hi.md", 0).unwrap();
+
+        fs::write(folder.join("hi.md"), "same body").unwrap();
+        let mut store = ContentStore::new(folder.join(".syncline/content"));
+        // Seed CRDT with the same body.
+        store.replace_text(nid, "same body").unwrap();
+
+        let out = fold_disk_drift_into_content(folder, &m, &mut store, nid).unwrap();
+        assert!(out.is_none(), "no delta expected when disk == CRDT");
+    }
+
+    #[test]
+    fn fold_disk_drift_noop_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+
+        let mut m = Manifest::new(ActorId::new());
+        let nid = crate::v1::ops::create_text(&mut m, "ghost.md", 0).unwrap();
+        let mut store = ContentStore::new(folder.join(".syncline/content"));
+
+        // ghost.md was never materialised on disk → nothing to fold.
+        let out = fold_disk_drift_into_content(folder, &m, &mut store, nid).unwrap();
+        assert!(out.is_none());
     }
 
     // --- Phase 3.3d: notify-driven scan trigger -------------------------------
