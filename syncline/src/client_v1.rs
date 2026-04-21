@@ -28,9 +28,9 @@
 //!   - conflict-copy path suffixing
 
 use crate::protocol::{
-    MANIFEST_DOC_ID, MAX_BLOB_SIZE, MSG_BLOB_UPDATE, MSG_MANIFEST_SYNC, MSG_SYNC_STEP_1,
-    MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION, V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR,
-    decode_message, encode_message,
+    MANIFEST_DOC_ID, MAX_BLOB_SIZE, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_MANIFEST_SYNC,
+    MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION, V1_PROTOCOL_MAJOR,
+    V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
 use crate::v1::blob_store::{BlobStore, hash_hex};
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
@@ -141,6 +141,9 @@ async fn run_session(
     // Prevents spamming the server after every manifest apply while still
     // letting us pick up newly-created entries immediately.
     let mut content_subscribed: HashSet<NodeId> = HashSet::new();
+    // Tracks blob hashes for which we've already sent MSG_BLOB_REQUEST
+    // this session. Cleared on reconnect.
+    let mut requested_blobs: HashSet<String> = HashSet::new();
 
     // --- Version handshake (step 1) -----------------------------------------
     let hs = encode_message(
@@ -214,6 +217,18 @@ async fn run_session(
         warn!("initial scan failed: {e:?}");
     }
 
+    // Cover the case where a previous session left behind a manifest
+    // referring to blobs we never fully fetched — or already have locally.
+    // Materialise whatever we can, and request anything still missing.
+    if let Err(e) = reconcile_projection_to_disk(folder, manifest, blobs) {
+        warn!("initial reconcile failed: {e:?}");
+    }
+    if let Err(e) =
+        request_missing_blobs(&mut write, manifest, blobs, &mut requested_blobs).await
+    {
+        warn!("initial blob requests failed: {e:?}");
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -238,6 +253,16 @@ async fn run_session(
                     warn!("dropping malformed frame");
                     continue;
                 };
+                if msg_type == MSG_BLOB_UPDATE {
+                    if let Err(e) = handle_inbound_blob(doc_id, payload, blobs) {
+                        warn!("inbound blob rejected: {e:?}");
+                        continue;
+                    }
+                    if let Err(e) = reconcile_projection_to_disk(folder, manifest, blobs) {
+                        error!("reconcile after blob arrival: {e}");
+                    }
+                    continue;
+                }
                 if doc_id == MANIFEST_DOC_ID {
                     match msg_type {
                         MSG_MANIFEST_SYNC => {
@@ -267,7 +292,9 @@ async fn run_session(
                             if let Err(e) = save_manifest(syncline_dir, manifest) {
                                 error!("persisting manifest: {e}");
                             }
-                            if let Err(e) = reconcile_projection_to_disk(folder, manifest) {
+                            if let Err(e) =
+                                reconcile_projection_to_disk(folder, manifest, blobs)
+                            {
                                 error!("reconciling projection: {e}");
                             }
                             if let Err(e) = subscribe_new_text_content(
@@ -279,6 +306,16 @@ async fn run_session(
                             .await
                             {
                                 anyhow::bail!("content STEP_1 broadcast: {e}");
+                            }
+                            if let Err(e) = request_missing_blobs(
+                                &mut write,
+                                manifest,
+                                blobs,
+                                &mut requested_blobs,
+                            )
+                            .await
+                            {
+                                anyhow::bail!("blob request broadcast: {e}");
                             }
                         }
                         other => {
@@ -781,6 +818,68 @@ fn parse_content_doc_id(doc_id: &str) -> Option<NodeId> {
     NodeId::parse_str(rest)
 }
 
+/// Process an inbound `MSG_BLOB_UPDATE`. `doc_id` is the hex hash the
+/// server echoes back on a request reply; `payload` is the blob bytes.
+/// We verify the hash before trusting the write — a corrupted blob
+/// never touches the store.
+fn handle_inbound_blob(doc_id: &str, payload: &[u8], blobs: &BlobStore) -> Result<()> {
+    if payload.len() > MAX_BLOB_SIZE {
+        anyhow::bail!(
+            "inbound blob {} is {} bytes, exceeds MAX_BLOB_SIZE {}",
+            doc_id,
+            payload.len(),
+            MAX_BLOB_SIZE
+        );
+    }
+    blobs.insert_verified(doc_id, payload).with_context(|| {
+        format!("verifying inbound blob {} ({} bytes)", doc_id, payload.len())
+    })?;
+    debug!(
+        blob_hash = doc_id,
+        bytes = payload.len(),
+        "stored inbound blob"
+    );
+    Ok(())
+}
+
+/// For each live Binary entry in the manifest projection whose blob we
+/// don't yet have locally and haven't already requested this session,
+/// send a `MSG_BLOB_REQUEST`. The server replies with `MSG_BLOB_UPDATE`
+/// over the same connection.
+async fn request_missing_blobs(
+    write: &mut WsSink,
+    manifest: &Manifest,
+    blobs: &BlobStore,
+    requested: &mut HashSet<String>,
+) -> Result<()> {
+    let proj = project(manifest);
+    let mut sent = 0usize;
+    for entry in proj.by_path.values() {
+        if entry.kind != NodeKind::Binary {
+            continue;
+        }
+        let Some(hash) = entry.blob_hash.as_deref() else {
+            continue;
+        };
+        if blobs.has(hash) || requested.contains(hash) {
+            continue;
+        }
+        // Server's handle_blob_request parses the payload as utf8 hash.
+        // We echo the hash in doc_id too so the reply is self-identifying.
+        let frame = encode_message(MSG_BLOB_REQUEST, hash, hash.as_bytes());
+        write
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .context("send blob request")?;
+        requested.insert(hash.to_string());
+        sent += 1;
+    }
+    if sent > 0 {
+        debug!("sent {} MSG_BLOB_REQUEST frames", sent);
+    }
+    Ok(())
+}
+
 /// For every live Text entry in the manifest projection not yet tracked
 /// in `subscribed`, send a content `MSG_SYNC_STEP_1`. The server replies
 /// with `MSG_SYNC_STEP_2` carrying any updates we're missing.
@@ -877,20 +976,29 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Walk the manifest projection and create any missing entries on disk.
 ///
-/// Rules, intentionally conservative for 3.3a:
+/// Rules, intentionally conservative:
 ///   * Parent directory chain for every projected path is `mkdir_p`ed.
 ///   * Missing **Text** files get created as empty placeholders — their
-///     real content arrives in 3.3b via content subdoc sync.
-///   * Missing **Binary** files are **skipped**; blob fetch is 3.3c.
+///     real content arrives via content subdoc sync (Phase 3.3b).
+///   * Missing **Binary** files are written IFF the referenced blob is
+///     present in the local CAS store; otherwise we log and defer. The
+///     request is fired separately by `request_missing_blobs`; the next
+///     reconcile (triggered when the blob arrives) will materialize
+///     the file.
 ///   * Existing files are never overwritten (no truncation, no rewrite).
 ///   * Files on disk that are *not* in the projection are **not deleted**
 ///     — team-lead explicitly asked for create-only during the first
 ///     pass so unsynced local state doesn't get clobbered.
-fn reconcile_projection_to_disk(folder: &Path, manifest: &Manifest) -> Result<()> {
+fn reconcile_projection_to_disk(
+    folder: &Path,
+    manifest: &Manifest,
+    blobs: &BlobStore,
+) -> Result<()> {
     let proj = project(manifest);
     let mut created_dirs = 0usize;
     let mut created_text = 0usize;
-    let mut skipped_binary = 0usize;
+    let mut created_binary = 0usize;
+    let mut pending_binary = 0usize;
 
     for (path, entry) in &proj.by_path {
         if is_unsafe_relative_path(path) {
@@ -916,9 +1024,26 @@ fn reconcile_projection_to_disk(folder: &Path, manifest: &Manifest) -> Result<()
                 }
             }
             NodeKind::Binary => {
-                if !full.exists() {
-                    skipped_binary += 1;
+                if full.exists() {
+                    continue;
                 }
+                let Some(hash) = entry.blob_hash.as_deref() else {
+                    // A Binary entry with no hash is a manifest-level
+                    // bug on the emitting peer; nothing we can write.
+                    debug!("binary {:?} has no blob_hash, skipping", path);
+                    continue;
+                };
+                if !blobs.has(hash) {
+                    pending_binary += 1;
+                    continue;
+                }
+                let bytes = blobs
+                    .read(hash)
+                    .with_context(|| format!("read blob {} for {:?}", hash, path))?;
+                atomic_write(&full, &bytes).with_context(|| {
+                    format!("materialize binary {} from blob {}", full.display(), hash)
+                })?;
+                created_binary += 1;
             }
             NodeKind::Directory => {
                 // Emergent — directories never appear in projection.by_path.
@@ -926,11 +1051,12 @@ fn reconcile_projection_to_disk(folder: &Path, manifest: &Manifest) -> Result<()
         }
     }
 
-    if created_dirs + created_text + skipped_binary > 0 {
+    if created_dirs + created_text + created_binary + pending_binary > 0 {
         info!(
             created_dirs,
             created_text_placeholders = created_text,
-            skipped_binary_pending_3_3c = skipped_binary,
+            created_binary,
+            pending_binary,
             "reconciled projection → disk"
         );
     }
@@ -1027,17 +1153,19 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_creates_dirs_and_text_placeholders_skips_binary() {
+    fn reconcile_creates_dirs_and_text_placeholders_defers_binary_without_blob() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
 
         let actor = ActorId::new();
         let mut m = Manifest::new(actor);
         crate::v1::ops::create_text(&mut m, "top.md", 0).unwrap();
         crate::v1::ops::create_text(&mut m, "notes/deep/sub.md", 0).unwrap();
+        // Binary present in manifest but blob is NOT in the local store.
         crate::v1::ops::create_binary(&mut m, "img/pic.png", "deadbeef", 1024).unwrap();
 
-        reconcile_projection_to_disk(folder, &m).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
 
         assert!(folder.join("top.md").exists(), "top.md should exist");
         assert_eq!(
@@ -1050,14 +1178,33 @@ mod tests {
         assert!(folder.join("img").is_dir(), "binary parent dir still created");
         assert!(
             !folder.join("img/pic.png").exists(),
-            "binary file NOT materialised until 3.3c"
+            "binary file NOT materialised without the blob"
         );
+    }
+
+    #[test]
+    fn reconcile_materialises_binary_when_blob_is_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+        let bytes = b"\x89PNG\r\n\x1a\npretend png";
+        let hash = blobs.insert_bytes(bytes).unwrap();
+
+        let mut m = Manifest::new(ActorId::new());
+        crate::v1::ops::create_binary(&mut m, "img/pic.png", &hash, bytes.len() as u64)
+            .unwrap();
+
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+
+        let on_disk = fs::read(folder.join("img/pic.png")).unwrap();
+        assert_eq!(on_disk, bytes);
     }
 
     #[test]
     fn reconcile_never_overwrites_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
 
         let local_bytes = b"local user edits - must not be clobbered";
         fs::write(folder.join("diary.md"), local_bytes).unwrap();
@@ -1066,10 +1213,32 @@ mod tests {
         let mut m = Manifest::new(actor);
         crate::v1::ops::create_text(&mut m, "diary.md", 0).unwrap();
 
-        reconcile_projection_to_disk(folder, &m).unwrap();
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
 
         let on_disk = fs::read(folder.join("diary.md")).unwrap();
         assert_eq!(on_disk, local_bytes, "reconcile clobbered local edits");
+    }
+
+    #[test]
+    fn reconcile_never_overwrites_existing_binary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+
+        // Local bytes on disk disagree with the manifest+blob content.
+        let local_bytes = b"local binary - keep me";
+        fs::write(folder.join("img.bin"), local_bytes).unwrap();
+
+        let remote_bytes = b"remote binary";
+        let hash = blobs.insert_bytes(remote_bytes).unwrap();
+        let mut m = Manifest::new(ActorId::new());
+        crate::v1::ops::create_binary(&mut m, "img.bin", &hash, remote_bytes.len() as u64)
+            .unwrap();
+
+        reconcile_projection_to_disk(folder, &m, &blobs).unwrap();
+
+        let on_disk = fs::read(folder.join("img.bin")).unwrap();
+        assert_eq!(on_disk, local_bytes, "binary reconcile clobbered local file");
     }
 
     #[test]
@@ -1326,6 +1495,40 @@ mod tests {
             BinaryScanOutcome::Skipped(reason) => assert_eq!(reason, "kind_mismatch"),
             other => panic!("expected Skipped(kind_mismatch), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_inbound_blob_rejects_hash_mismatch() {
+        let (_tmp, blobs) = fresh_blob_store();
+        let bytes = b"real payload";
+        let wrong_hash = hash_hex(b"different payload");
+        assert!(handle_inbound_blob(&wrong_hash, bytes, &blobs).is_err());
+        // Store must not have been populated under either the claimed
+        // or the real hash.
+        assert!(!blobs.has(&wrong_hash));
+        assert!(!blobs.has(&hash_hex(bytes)));
+    }
+
+    #[test]
+    fn handle_inbound_blob_stores_when_hash_matches() {
+        let (_tmp, blobs) = fresh_blob_store();
+        let bytes = b"legit payload";
+        let h = hash_hex(bytes);
+        handle_inbound_blob(&h, bytes, &blobs).unwrap();
+        assert!(blobs.has(&h));
+        assert_eq!(blobs.read(&h).unwrap(), bytes);
+    }
+
+    #[test]
+    fn handle_inbound_blob_rejects_oversize() {
+        let (_tmp, blobs) = fresh_blob_store();
+        // Pretend we got something bigger than MAX_BLOB_SIZE. Use a
+        // small string; we override the size check by constructing a
+        // vec of the right length.
+        let bytes = vec![0u8; MAX_BLOB_SIZE + 1];
+        let h = hash_hex(&bytes);
+        assert!(handle_inbound_blob(&h, &bytes, &blobs).is_err());
+        assert!(!blobs.has(&h));
     }
 
     #[test]
