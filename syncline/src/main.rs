@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Sync { folder, url, name, .. } => {
-            syncline::client::app::run_client(folder, url, name).await?;
+            syncline::client_v1::run_client(folder, url, name).await?;
         }
     }
 
