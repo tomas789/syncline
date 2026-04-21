@@ -41,6 +41,13 @@ impl Db {
         Ok(Self { pool })
     }
 
+    /// Raw connection pool — used by server-side migration code that
+    /// needs to run ad-hoc DDL / schema queries the typed helpers here
+    /// don't expose.
+    pub(crate) fn pool(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+
     pub async fn save_update(&self, doc_id: &str, update: &[u8]) -> Result<()> {
         sqlx::query("INSERT INTO updates (doc_id, update_data) VALUES (?, ?)")
             .bind(doc_id)
