@@ -36,8 +36,8 @@ use crate::v1::ids::{ActorId, Lamport, NodeId};
 use crate::v1::manifest::{Manifest, NodeKind};
 use crate::v1::projection::project;
 use crate::v1::sync::{
-    decode_version_handshake, encode_version_handshake, handle_manifest_payload,
-    manifest_step1_payload,
+    decode_version_handshake, encode_manifest_update, encode_version_handshake,
+    handle_manifest_payload, manifest_step1_payload,
 };
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
@@ -47,18 +47,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
 };
 use tracing::{debug, error, info, warn};
+use walkdir::WalkDir;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
+use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_CAP_MS: u64 = 30_000;
+const SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const TEXT_EXTS: &[&str] = &["md", "txt"];
 
 /// Entry point for `syncline sync`. Blocks for the lifetime of the
 /// client, reconnecting on transport errors.
@@ -182,114 +186,150 @@ async fn run_session(
         .await
         .context("send manifest step1")?;
 
-    // --- Read loop ----------------------------------------------------------
-    while let Some(msg) = read.next().await {
-        let data = match msg {
-            Ok(WsMessage::Binary(b)) => b,
-            Ok(WsMessage::Close(_)) => {
-                info!("server closed connection");
-                return Ok(());
-            }
-            Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
-            Ok(other) => {
-                debug!("ignoring {:?} frame", other);
-                continue;
-            }
-            Err(e) => anyhow::bail!("ws read error: {e}"),
-        };
-        let Some((msg_type, doc_id, payload)) = decode_message(&data) else {
-            warn!("dropping malformed frame");
-            continue;
-        };
-        if doc_id == MANIFEST_DOC_ID {
-            match msg_type {
-                MSG_MANIFEST_SYNC => {
-                    match handle_manifest_payload(manifest, payload) {
-                        Ok(reply) => {
-                            if let Some(reply_payload) = reply {
-                                let frame = encode_message(
-                                    MSG_MANIFEST_SYNC,
-                                    MANIFEST_DOC_ID,
-                                    &reply_payload,
-                                );
-                                if let Err(e) = write
-                                    .send(WsMessage::Binary(frame.into()))
-                                    .await
-                                {
-                                    anyhow::bail!("ws write during manifest reply: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("applying manifest payload: {e}");
-                            continue;
-                        }
-                    }
-                    // Persist after every successful apply so a crashed
-                    // client resumes with up-to-date state.
-                    if let Err(e) = save_manifest(syncline_dir, manifest) {
-                        error!("persisting manifest: {e}");
-                    }
-                    // Conservative reconcile: only create missing entries
-                    // (dirs + empty text placeholders). Never deletes,
-                    // never overwrites. Full content arrives via the
-                    // content-subdoc STEP_1 we fire next.
-                    if let Err(e) = reconcile_projection_to_disk(folder, manifest) {
-                        error!("reconciling projection: {e}");
-                    }
-                    // Subscribe to any newly-appeared text content
-                    // subdocs. Idempotent across repeated manifest
-                    // applies via `content_subscribed`.
-                    if let Err(e) = subscribe_new_text_content(
-                        &mut write,
-                        manifest,
-                        content,
-                        &mut content_subscribed,
-                    )
-                    .await
-                    {
-                        anyhow::bail!("content STEP_1 broadcast: {e}");
-                    }
-                }
-                other => {
-                    debug!("ignoring manifest doc frame msg_type={:#x}", other);
-                }
-            }
-            continue;
-        }
+    // --- Read loop + polling scanner ---------------------------------------
+    let mut scan_timer = interval(SCAN_INTERVAL);
+    scan_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // `interval` emits its first tick immediately; consume it so our
+    // first *scheduled* scan is SCAN_INTERVAL from now. The explicit
+    // initial scan below covers startup.
+    scan_timer.tick().await;
 
-        if let Some(node_id) = parse_content_doc_id(doc_id) {
-            match msg_type {
-                MSG_SYNC_STEP_2 | MSG_UPDATE => {
-                    if let Err(e) = content.apply_update(node_id, payload) {
-                        error!("apply content update for {:?}: {e}", node_id);
+    // Initial scan: push local additions/edits to the server as soon as
+    // the session is up. Subsequent scans run on the 5 s timer.
+    if let Err(e) = scan_once(
+        folder,
+        syncline_dir,
+        manifest,
+        content,
+        &mut write,
+        &mut content_subscribed,
+    )
+    .await
+    {
+        warn!("initial scan failed: {e:?}");
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            msg_opt = read.next() => {
+                let Some(msg) = msg_opt else {
+                    anyhow::bail!("ws read stream ended without a close frame");
+                };
+                let data = match msg {
+                    Ok(WsMessage::Binary(b)) => b,
+                    Ok(WsMessage::Close(_)) => {
+                        info!("server closed connection");
+                        return Ok(());
+                    }
+                    Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
+                    Ok(other) => {
+                        debug!("ignoring {:?} frame", other);
                         continue;
                     }
-                    if let Err(e) = content.persist(node_id) {
-                        error!("persist content subdoc for {:?}: {e}", node_id);
+                    Err(e) => anyhow::bail!("ws read error: {e}"),
+                };
+                let Some((msg_type, doc_id, payload)) = decode_message(&data) else {
+                    warn!("dropping malformed frame");
+                    continue;
+                };
+                if doc_id == MANIFEST_DOC_ID {
+                    match msg_type {
+                        MSG_MANIFEST_SYNC => {
+                            match handle_manifest_payload(manifest, payload) {
+                                Ok(reply) => {
+                                    if let Some(reply_payload) = reply {
+                                        let frame = encode_message(
+                                            MSG_MANIFEST_SYNC,
+                                            MANIFEST_DOC_ID,
+                                            &reply_payload,
+                                        );
+                                        if let Err(e) = write
+                                            .send(WsMessage::Binary(frame.into()))
+                                            .await
+                                        {
+                                            anyhow::bail!(
+                                                "ws write during manifest reply: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("applying manifest payload: {e}");
+                                    continue;
+                                }
+                            }
+                            if let Err(e) = save_manifest(syncline_dir, manifest) {
+                                error!("persisting manifest: {e}");
+                            }
+                            if let Err(e) = reconcile_projection_to_disk(folder, manifest) {
+                                error!("reconciling projection: {e}");
+                            }
+                            if let Err(e) = subscribe_new_text_content(
+                                &mut write,
+                                manifest,
+                                content,
+                                &mut content_subscribed,
+                            )
+                            .await
+                            {
+                                anyhow::bail!("content STEP_1 broadcast: {e}");
+                            }
+                        }
+                        other => {
+                            debug!("ignoring manifest doc frame msg_type={:#x}", other);
+                        }
                     }
-                    if let Err(e) = flush_content_to_disk(folder, manifest, content, node_id)
-                    {
-                        error!("write content to disk for {:?}: {e}", node_id);
+                    continue;
+                }
+
+                if let Some(node_id) = parse_content_doc_id(doc_id) {
+                    match msg_type {
+                        MSG_SYNC_STEP_2 | MSG_UPDATE => {
+                            if let Err(e) = content.apply_update(node_id, payload) {
+                                error!("apply content update for {:?}: {e}", node_id);
+                                continue;
+                            }
+                            if let Err(e) = content.persist(node_id) {
+                                error!("persist content subdoc for {:?}: {e}", node_id);
+                            }
+                            if let Err(e) =
+                                flush_content_to_disk(folder, manifest, content, node_id)
+                            {
+                                error!("write content to disk for {:?}: {e}", node_id);
+                            }
+                        }
+                        MSG_SYNC_STEP_1 => {
+                            debug!("unexpected STEP_1 for {}", doc_id);
+                        }
+                        other => {
+                            debug!(
+                                "ignoring content frame msg_type={:#x} for {}",
+                                other, doc_id
+                            );
+                        }
                     }
+                    continue;
                 }
-                MSG_SYNC_STEP_1 => {
-                    // Server replies to our STEP_1 with STEP_2 or UPDATE,
-                    // so receiving STEP_1 from the server is unexpected
-                    // under v1. Log and ignore rather than echoing.
-                    debug!("unexpected STEP_1 for {}", doc_id);
-                }
-                other => {
-                    debug!("ignoring content frame msg_type={:#x} for {}", other, doc_id);
+
+                debug!("dropping frame for unknown doc_id={}", doc_id);
+            }
+            _ = scan_timer.tick() => {
+                if let Err(e) = scan_once(
+                    folder,
+                    syncline_dir,
+                    manifest,
+                    content,
+                    &mut write,
+                    &mut content_subscribed,
+                )
+                .await
+                {
+                    warn!("periodic scan failed: {e:?}");
                 }
             }
-            continue;
         }
-
-        debug!("dropping frame for unknown doc_id={}", doc_id);
     }
-    // read stream ended with no close frame — treat as transport loss
-    anyhow::bail!("ws read stream ended without a close frame");
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +353,147 @@ fn save_manifest(syncline_dir: &Path, manifest: &Manifest) -> Result<()> {
         txn.encode_state_as_update_v1(&StateVector::default())
     };
     atomic_write(&syncline_dir.join("manifest.bin"), &bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Polling scanner (Phase 3.3b.2 outbound)
+// ---------------------------------------------------------------------------
+
+/// Walk the vault once, detect local-only text files and modifications,
+/// and push them to the server as a single batch.
+///
+/// Per text file on disk:
+///   * not in manifest → `create_text`, seed content subdoc, mark for upload
+///   * in manifest and content matches → no-op
+///   * in manifest but content differs → apply minimal-edit delta to subdoc
+///
+/// Binary files are skipped (3.3c). Files missing from disk but present
+/// in the manifest are intentionally NOT deleted in this pass (deletion
+/// detection requires distinguishing "gone" from "not yet written", and
+/// the minimum viable client should not accidentally propagate apparent
+/// deletions triggered by transient I/O).
+async fn scan_once(
+    folder: &Path,
+    syncline_dir: &Path,
+    manifest: &mut Manifest,
+    content: &mut ContentStore,
+    write: &mut WsSink,
+    subscribed: &mut HashSet<NodeId>,
+) -> Result<()> {
+    let pre_sv = manifest.doc().transact().state_vector();
+
+    // Snapshot projection once for path lookups. The loop may grow the
+    // manifest, but we rely on `create_text` to detect duplicates and
+    // on the caller running scan_once single-threaded.
+    let proj = project(manifest);
+
+    let mut pending_content: Vec<(NodeId, Vec<u8>)> = Vec::new();
+    let mut new_files = 0usize;
+    let mut modified_files = 0usize;
+
+    for dent in WalkDir::new(folder)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.') && name != ".syncline"
+        })
+        .filter_map(|e| e.ok())
+    {
+        if !dent.file_type().is_file() {
+            continue;
+        }
+        let abs = dent.path();
+        let Ok(rel) = abs.strip_prefix(folder) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if is_unsafe_relative_path(&rel_str) {
+            continue;
+        }
+        let ext = rel
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !TEXT_EXTS.contains(&ext.as_str()) {
+            // Binary: upload path lands in 3.3c.
+            continue;
+        }
+
+        let body = match fs::read_to_string(abs) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("skip unreadable/non-UTF8 {}: {}", rel_str, e);
+                continue;
+            }
+        };
+
+        if let Some(existing) = proj.by_path.get(&rel_str) {
+            if existing.kind != NodeKind::Text {
+                continue;
+            }
+            if let Some(update) = content.replace_text(existing.id, &body)? {
+                content.persist(existing.id)?;
+                manifest.record_modify(existing.id);
+                pending_content.push((existing.id, update));
+                modified_files += 1;
+            }
+        } else {
+            let size = body.len() as u64;
+            match crate::v1::ops::create_text(manifest, &rel_str, size) {
+                Ok(nid) => {
+                    // Seed the brand-new subdoc via `replace_text` (empty → body).
+                    if let Some(update) = content.replace_text(nid, &body)? {
+                        content.persist(nid)?;
+                        pending_content.push((nid, update));
+                    }
+                    new_files += 1;
+                }
+                Err(e) => {
+                    debug!("create_text({:?}) skipped: {}", rel_str, e);
+                }
+            }
+        }
+    }
+
+    let post_sv = manifest.doc().transact().state_vector();
+    if post_sv != pre_sv {
+        let update_bytes = {
+            let txn = manifest.doc().transact();
+            txn.encode_state_as_update_v1(&pre_sv)
+        };
+        let payload = encode_manifest_update(&update_bytes);
+        let frame = encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &payload);
+        write
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .context("send manifest update from scanner")?;
+        save_manifest(syncline_dir, manifest)?;
+    }
+
+    for (node_id, update) in pending_content {
+        let frame = encode_message(MSG_UPDATE, &content_doc_id(node_id), &update);
+        write
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .context("send content update from scanner")?;
+    }
+
+    if new_files + modified_files > 0 {
+        info!(
+            new_files,
+            modified_files, "scanner pushed local changes to server"
+        );
+    }
+
+    // Newly-created entries get a STEP_1 so we also hear concurrent
+    // server-side edits that may already be in flight for that doc id.
+    subscribe_new_text_content(write, manifest, content, subscribed).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +575,70 @@ impl ContentStore {
         let txn = doc.transact();
         Some(text.get_string(&txn))
     }
+
+    /// Replace this node's Y.Text body with `new_body` using a minimal
+    /// edit (common-prefix / common-suffix trim). Returns the encoded
+    /// Y.Doc update delta for this transaction, suitable for broadcast
+    /// as a `MSG_UPDATE`. Returns `None` if no change was needed.
+    fn replace_text(&mut self, node_id: NodeId, new_body: &str) -> Result<Option<Vec<u8>>> {
+        self.ensure_loaded(node_id)?;
+        let doc = self.docs.get(&node_id).expect("loaded above");
+        let text = doc.get_or_insert_text("text");
+        let pre_sv = doc.transact().state_vector();
+        let old = text.get_string(&doc.transact());
+        if old == new_body {
+            return Ok(None);
+        }
+        let (prefix, old_mid_len, new_mid) = compute_minimal_edit(&old, new_body);
+        {
+            let mut txn = doc.transact_mut();
+            if old_mid_len > 0 {
+                text.remove_range(&mut txn, prefix, old_mid_len);
+            }
+            if !new_mid.is_empty() {
+                text.insert(&mut txn, prefix, &new_mid);
+            }
+        }
+        let update = {
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&pre_sv)
+        };
+        Ok(Some(update))
+    }
+}
+
+/// Minimal insert/delete that turns `old` into `new`, expressed as
+/// (prefix_byte_index, old_middle_byte_len, new_middle_string). All
+/// byte offsets sit on UTF-8 char boundaries in both strings.
+fn compute_minimal_edit(old: &str, new: &str) -> (u32, u32, String) {
+    let common_head = old
+        .as_bytes()
+        .iter()
+        .zip(new.as_bytes().iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut prefix = common_head;
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+
+    let max_suffix = (old.len() - prefix).min(new.len() - prefix);
+    let common_tail = old
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(new.as_bytes().iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut suffix = common_tail;
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+
+    let old_mid_len = (old.len() - prefix - suffix) as u32;
+    let new_mid = new[prefix..new.len() - suffix].to_string();
+    (prefix as u32, old_mid_len, new_mid)
 }
 
 fn content_doc_id(node_id: NodeId) -> String {
@@ -615,7 +860,6 @@ fn banner(folder: &Path, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::Text;
 
     #[test]
     fn backoff_caps_at_reconnect_cap() {
@@ -770,6 +1014,81 @@ mod tests {
         flush_content_to_disk(folder, &m, &store, nid).unwrap();
         let written = fs::read_to_string(folder.join("notes/hi.md")).unwrap();
         assert_eq!(written, "Hello, world!");
+    }
+
+    #[test]
+    fn compute_minimal_edit_identical() {
+        let (p, old_len, new_mid) = compute_minimal_edit("hello", "hello");
+        assert_eq!(p, 5);
+        assert_eq!(old_len, 0);
+        assert_eq!(new_mid, "");
+    }
+
+    #[test]
+    fn compute_minimal_edit_middle_replace() {
+        // "Hello WORLD!" -> "Hello rust!" — common prefix "Hello ", common suffix "!"
+        let (p, old_len, new_mid) = compute_minimal_edit("Hello WORLD!", "Hello rust!");
+        assert_eq!(p, 6);
+        assert_eq!(old_len, 5);
+        assert_eq!(new_mid, "rust");
+    }
+
+    #[test]
+    fn compute_minimal_edit_append_and_delete() {
+        let (p, old_len, new_mid) = compute_minimal_edit("abc", "abcdef");
+        assert_eq!(p, 3);
+        assert_eq!(old_len, 0);
+        assert_eq!(new_mid, "def");
+
+        let (p2, old_len2, new_mid2) = compute_minimal_edit("abcdef", "abc");
+        assert_eq!(p2, 3);
+        assert_eq!(old_len2, 3);
+        assert_eq!(new_mid2, "");
+    }
+
+    #[test]
+    fn compute_minimal_edit_respects_utf8_boundaries() {
+        // "Hi ★!" vs "Hi ★?" — the only difference is the last byte
+        // of the trailing ASCII. Prefix and suffix must not bisect the
+        // 3-byte UTF-8 sequence of '★'.
+        let (p, old_len, new_mid) = compute_minimal_edit("Hi ★!", "Hi ★?");
+        assert_eq!(old_len, 1, "should delete only the '!'");
+        assert_eq!(new_mid, "?");
+        // prefix should land on the byte boundary just before '!' in old.
+        assert!("Hi ★!".is_char_boundary(p as usize));
+        assert!("Hi ★?".is_char_boundary(p as usize));
+    }
+
+    #[test]
+    fn replace_text_produces_applicable_update() {
+        let node_id = NodeId::new();
+        let mut store = ContentStore::new(std::env::temp_dir().join("syncline_test_replace"));
+        // Seed from empty to "foo".
+        let u1 = store.replace_text(node_id, "foo").unwrap().unwrap();
+        assert_eq!(store.current_text(node_id).as_deref(), Some("foo"));
+
+        // Evolve to "food".
+        let u2 = store.replace_text(node_id, "food").unwrap().unwrap();
+        assert_eq!(store.current_text(node_id).as_deref(), Some("food"));
+
+        // A peer that applies both updates on top of an empty doc must
+        // converge to the same text.
+        let peer = Doc::new();
+        let t = peer.get_or_insert_text("text");
+        peer.transact_mut()
+            .apply_update(Update::decode_v1(&u1).unwrap());
+        peer.transact_mut()
+            .apply_update(Update::decode_v1(&u2).unwrap());
+        assert_eq!(t.get_string(&peer.transact()), "food");
+    }
+
+    #[test]
+    fn replace_text_noop_when_unchanged() {
+        let mut store = ContentStore::new(std::env::temp_dir().join("syncline_test_noop"));
+        let nid = NodeId::new();
+        store.replace_text(nid, "same").unwrap();
+        // Second call with identical body must produce no update.
+        assert!(store.replace_text(nid, "same").unwrap().is_none());
     }
 
     #[test]
