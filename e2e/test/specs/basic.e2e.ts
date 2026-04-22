@@ -3,112 +3,255 @@ import { join } from 'path';
 import * as fs from 'fs';
 import { expect, browser } from '@wdio/globals';
 
-describe('Syncline E2E Configuration', () => {
+describe('Syncline v1 E2E', () => {
     let serverProc: ChildProcess;
     let cliProc: ChildProcess;
+    const port = 3040;
+    const serverUrl = `ws://localhost:${port}/sync`;
     const dbPath = join(__dirname, '../../test-syncline-e2e.db');
     const folderPath = join(__dirname, '../../test-sync-folder');
+    const repoRoot = join(__dirname, '../../../');
+
+    // Poll `fn` until it returns a truthy value, or time out.
+    async function waitFor<T>(
+        label: string,
+        fn: () => Promise<T | null | undefined | false | ''>,
+        timeoutMs = 20000,
+        stepMs = 500
+    ): Promise<T> {
+        const deadline = Date.now() + timeoutMs;
+        let lastErr: unknown;
+        while (Date.now() < deadline) {
+            try {
+                const v = await fn();
+                if (v) return v as T;
+            } catch (e) {
+                lastErr = e;
+            }
+            await browser.pause(stepMs);
+        }
+        throw new Error(
+            `waitFor("${label}") timed out after ${timeoutMs}ms${lastErr ? `: ${String(lastErr)}` : ''}`
+        );
+    }
+
+    async function vaultReadText(path: string): Promise<string | null> {
+        return browser.executeObsidian(async ({ app }, p) => {
+            const f = (app as any).vault.getAbstractFileByPath(p);
+            if (!f || !('stat' in f)) return null;
+            return await (app as any).vault.read(f);
+        }, path);
+    }
+
+    async function vaultReadBinaryHex(path: string): Promise<string | null> {
+        return browser.executeObsidian(async ({ app }, p) => {
+            const f = (app as any).vault.getAbstractFileByPath(p);
+            if (!f || !('stat' in f)) return null;
+            const data: ArrayBuffer = await (app as any).vault.readBinary(f);
+            const u8 = new Uint8Array(data);
+            let hex = '';
+            for (let i = 0; i < u8.length; i++) {
+                hex += u8[i].toString(16).padStart(2, '0');
+            }
+            return hex;
+        }, path);
+    }
+
+    async function vaultHas(path: string): Promise<boolean> {
+        return browser.executeObsidian(async ({ app }, p) => {
+            return (app as any).vault.getAbstractFileByPath(p) !== null;
+        }, path);
+    }
 
     before(async function () {
-        // Allow up to 2 minutes for initial cargo build on cold starts
-        this.timeout(120000); 
+        // Cold cargo builds can take a while.
+        this.timeout(180000);
 
-        console.log("Setting up E2E environment...");
-        
-        // Pre-build the binary synchronously to avoid file-lock errors when both the 
-        // CLI client and the server simultaneously try to compile 'syncline'.
-        console.log("Building Syncline binary...");
+        console.log('Setting up E2E environment...');
+
+        // Build the syncline binary synchronously. Avoids the file-lock race
+        // that fires when server and CLI clients try to compile in parallel.
+        console.log('Building Syncline binary...');
         execSync('cargo build --bin syncline', {
-            cwd: join(__dirname, '../../../'),
+            cwd: repoRoot,
             stdio: 'inherit'
         });
 
-        // Clean up from previous run
+        // Clean any leftover state from a previous run.
         if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
         if (fs.existsSync(folderPath)) fs.rmSync(folderPath, { recursive: true, force: true });
         fs.mkdirSync(folderPath, { recursive: true });
 
-        // Setup the plugin data file with the dev server URL
-        const dataJsonPath = join(__dirname, '../../test-vault/.obsidian/plugins/syncline/data.json');
-        if (!fs.existsSync(join(__dirname, '../../test-vault/.obsidian/plugins/syncline'))) {
-            fs.mkdirSync(join(__dirname, '../../test-vault/.obsidian/plugins/syncline'), { recursive: true });
-        }
-        fs.writeFileSync(dataJsonPath, JSON.stringify({
-            url: "ws://localhost:3040/sync"
-        }));
-
-        // Start server
-        serverProc = spawn('cargo', ['run', '--bin', 'syncline', '--', 'server', '--port', '3040', '--db-path', dbPath], {
-            cwd: join(__dirname, '../../../'),
-            stdio: 'pipe'
-        });
-        serverProc.stdout?.on('data', d => console.log('SERVER: ' + d));
-        serverProc.stderr?.on('data', d => console.error('SERVER ERR: ' + d));
-
-        // Wait a bit
-        await browser.pause(2000);
-
-        // Start CLI
-        cliProc = spawn('cargo', ['run', '--bin', 'syncline', '--', 'sync', '-f', folderPath, '-u', 'ws://localhost:3040/sync'], {
-            cwd: join(__dirname, '../../../'),
-            stdio: 'pipe'
-        });
-        cliProc.stdout?.on('data', d => console.log('CLI: ' + d));
-        cliProc.stderr?.on('data', d => console.error('CLI ERR: ' + d));
+        // Start server.
+        serverProc = spawn(
+            'cargo',
+            ['run', '--bin', 'syncline', '--', 'server', '--port', String(port), '--db-path', dbPath],
+            { cwd: repoRoot, stdio: 'pipe' }
+        );
+        serverProc.stdout?.on('data', (d) => console.log('SERVER: ' + d));
+        serverProc.stderr?.on('data', (d) => console.error('SERVER ERR: ' + d));
 
         await browser.pause(2000);
-    });
 
-    after(() => {
-        if (serverProc && !serverProc.killed) serverProc.kill();
-        if (cliProc && !cliProc.killed) cliProc.kill();
-    });
+        // Start the native CLI client (v1 via client_v1::run_client).
+        cliProc = spawn(
+            'cargo',
+            ['run', '--bin', 'syncline', '--', 'sync', '-f', folderPath, '-u', serverUrl],
+            { cwd: repoRoot, stdio: 'pipe' }
+        );
+        cliProc.stdout?.on('data', (d) => console.log('CLI: ' + d));
+        cliProc.stderr?.on('data', (d) => console.error('CLI ERR: ' + d));
 
-    it('should boot up Obsidian and sync a new file to CLI', async () => {
-        // Wait for Obsidian to initialize and sync
+        await browser.pause(2000);
+
+        // Let Obsidian fully initialise.
         await browser.pause(5000);
 
         const obsidianPage = browser.getObsidianPage();
         try {
             await obsidianPage.enablePlugin('syncline-obsidian');
-            console.log("Syncline plugin enabled");
-        } catch (e) {
-            console.error("Could not enable plugin or already enabled:", e?.message);
+            console.log('Syncline plugin enabled');
+        } catch (e: any) {
+            console.error('Could not enable plugin or already enabled:', e?.message);
         }
 
+        await browser.executeObsidian(async ({ app }, url) => {
+            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            if (!plugin) throw new Error('Syncline plugin not found in app.plugins');
+            plugin.settings.serverUrl = url;
+            await plugin.saveSettings();
+            plugin.disconnect();
+            await plugin.connect();
+        }, serverUrl);
+
+        // Small settle window so the WS handshake completes.
+        await browser.pause(2000);
+    });
+
+    after(() => {
+        if (cliProc && !cliProc.killed) cliProc.kill();
+        if (serverProc && !serverProc.killed) serverProc.kill();
+    });
+
+    // ---- 1: Obsidian → CLI create (original test preserved) ----
+    it('syncs a new file Obsidian → CLI', async () => {
+        const obsidianPage = browser.getObsidianPage();
+        await obsidianPage.write('test.md', '# Hello from E2E');
+
+        const target = join(folderPath, 'test.md');
+        const content = await waitFor<string>('test.md on CLI side', async () => {
+            if (!fs.existsSync(target)) return null;
+            const c = fs.readFileSync(target, 'utf8');
+            return c.includes('# Hello from E2E') ? c : null;
+        });
+        expect(content).toContain('# Hello from E2E');
+    });
+
+    // ---- 2: CLI → Obsidian create ----
+    it('syncs a new file CLI → Obsidian', async () => {
+        fs.writeFileSync(join(folderPath, 'from-cli.md'), '# Dropped from CLI');
+
+        const content = await waitFor<string>('from-cli.md in vault', async () => {
+            const c = await vaultReadText('from-cli.md');
+            return c && c.includes('# Dropped from CLI') ? c : null;
+        });
+        expect(content).toContain('# Dropped from CLI');
+    });
+
+    // ---- 3a: Modify Obsidian → CLI ----
+    it('propagates modifications Obsidian → CLI', async () => {
+        const obsidianPage = browser.getObsidianPage();
+        await obsidianPage.write('test.md', '# Modified from Obsidian');
+
+        const target = join(folderPath, 'test.md');
+        const content = await waitFor<string>('test.md modified on CLI side', async () => {
+            if (!fs.existsSync(target)) return null;
+            const c = fs.readFileSync(target, 'utf8');
+            return c.includes('# Modified from Obsidian') ? c : null;
+        });
+        expect(content).toContain('# Modified from Obsidian');
+    });
+
+    // ---- 3b: Modify CLI → Obsidian ----
+    it('propagates modifications CLI → Obsidian', async () => {
+        fs.writeFileSync(join(folderPath, 'test.md'), '# Modified from CLI');
+
+        const content = await waitFor<string>('test.md modified in vault', async () => {
+            const c = await vaultReadText('test.md');
+            return c && c.includes('# Modified from CLI') ? c : null;
+        });
+        expect(content).toContain('# Modified from CLI');
+    });
+
+    // ---- 4: Rename Obsidian → CLI ----
+    it('propagates renames Obsidian → CLI', async () => {
         await browser.executeObsidian(async ({ app }) => {
-            const plugin = (app as any).plugins.plugins["syncline-obsidian"];
-            if (plugin) {
-                plugin.settings.serverUrl = "ws://localhost:3040/sync";
-                await plugin.saveSettings();
-                
-                // Disconnect first just in case
-                plugin.disconnect();
-                await plugin.connect();
-            } else {
-                throw new Error("Syncline plugin not found in app.plugins");
-            }
+            const f = (app as any).vault.getAbstractFileByPath('test.md');
+            if (!f) throw new Error('test.md not found in vault before rename');
+            await (app as any).fileManager.renameFile(f, 'renamed.md');
         });
 
-        const title = await browser.getTitle();
-        console.log('Obsidian window title:', title);
+        await waitFor('rename on CLI side', async () => {
+            const oldGone = !fs.existsSync(join(folderPath, 'test.md'));
+            const newHere = fs.existsSync(join(folderPath, 'renamed.md'));
+            return oldGone && newHere;
+        });
+    });
 
-        // We can create a file in the vault using obsidianPage
-        await obsidianPage.write('test.md', '# Hello from E2E');
-        
-        // Wait for propagation
-        let synced = false;
-        const targetFile = join(folderPath, 'test.md');
-        for (let i = 0; i < 20; i++) {
-            if (fs.existsSync(targetFile)) {
-                synced = true;
-                break;
-            }
-            await browser.pause(1000);
+    // ---- 5: Delete CLI → Obsidian ----
+    it('propagates deletes CLI → Obsidian', async () => {
+        fs.unlinkSync(join(folderPath, 'renamed.md'));
+
+        await waitFor('renamed.md removed from vault', async () => {
+            return !(await vaultHas('renamed.md'));
+        });
+    });
+
+    // ---- 6: Binary blob roundtrip CLI → Obsidian ----
+    it('roundtrips a binary blob CLI → Obsidian', async () => {
+        // PNG magic header + non-textual payload (includes 0x00). Not a valid
+        // PNG — Syncline doesn't care, it's just bytes through the blob path.
+        const bytes = Buffer.from([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x01, 0x02, 0x03, 0xfe, 0xfd, 0xfc, 0xfb,
+            0xde, 0xad, 0xbe, 0xef,
+        ]);
+        const expectedHex = bytes.toString('hex');
+
+        fs.writeFileSync(join(folderPath, 'pixel.png'), bytes);
+
+        const gotHex = await waitFor<string>('pixel.png bytes in vault', async () => {
+            const h = await vaultReadBinaryHex('pixel.png');
+            return h === expectedHex ? h : null;
+        }, 30000);
+        expect(gotHex).toBe(expectedHex);
+    });
+
+    // ---- 7: `syncline verify` after sync settles ----
+    it('passes `syncline verify` after sync settles', async function () {
+        this.timeout(60000);
+
+        // Let any pending sync drain.
+        await browser.pause(3000);
+
+        // Stop the background `sync` process so `verify` can read the
+        // local `.syncline/` state without contention.
+        if (cliProc && !cliProc.killed) {
+            cliProc.kill();
+            await new Promise<void>((resolve) => {
+                const done = () => resolve();
+                cliProc.once('exit', done);
+                setTimeout(done, 3000);
+            });
         }
 
-        expect(synced).toBe(true);
-        const content = fs.readFileSync(targetFile, 'utf8');
-        expect(content).toContain('# Hello from E2E');
+        // `syncline verify` exits 0 iff the local projection hash matches
+        // the server. execSync throws on non-zero exit.
+        const result = execSync(
+            `cargo run --bin syncline -- verify -f "${folderPath}" -u ${serverUrl} -t 8`,
+            { cwd: repoRoot, encoding: 'utf8' }
+        );
+        console.log('VERIFY:', result);
+        expect(result).toBeDefined();
     });
 });
