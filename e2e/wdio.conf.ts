@@ -31,6 +31,8 @@ export const config = {
         // Per-test budget. The cold-build setup runs in `before()` (which
         // has its own 180s timeout); each test only waits for one
         // cross-process sync round-trip and finishes in seconds.
-        timeout: 60000
+        // Bumped to 120s as a safety margin for slow CI (Linux scan
+        // detection of unlinks can lag a noticeable bit on the GHA runner).
+        timeout: 120000
     },
 };
