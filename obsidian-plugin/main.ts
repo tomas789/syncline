@@ -8,145 +8,174 @@ import {
   TAbstractFile,
   debounce,
 } from "obsidian";
-// @ts-ignore
+// @ts-ignore - rollup base64-inlines the .wasm binary at build time.
 import wasmBinary from "./wasm/syncline_bg.wasm";
 import * as wasmModule from "./wasm/syncline.js";
+
+// ---------------------------------------------------------------------------
+// Settings & persistence layout
+// ---------------------------------------------------------------------------
 
 interface SynclineSettings {
   serverUrl: string;
   autoSync: boolean;
-  /** UUIDs of all files this client has ever seen (used for offline-deletion detection). */
-  knownFiles: string[];
-  /** Maps relative file path → permanent UUID. Persisted so renames survive restarts. */
-  uuidMap: Record<string, string>;
+  /** Stable per-installation ActorId (UUIDv4, hyphenated). Minted on first run. */
+  actorId: string | null;
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
-  knownFiles: [],
-  uuidMap: {},
+  actorId: null,
 };
 
 type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
+
+// ---------------------------------------------------------------------------
+// WASM binding shape (v1)
+// ---------------------------------------------------------------------------
 
 let wasmInitialized = false;
 let wasm: WasmModule | null = null;
 
 interface WasmModule {
-  SynclineClient: new (url: string) => SynclineClient;
+  SynclineV1Client: new (
+    url: string,
+    actorIdHex: string | null | undefined,
+  ) => SynclineV1Client;
 }
 
-interface SynclineClient {
+interface ProjectionRow {
+  id: string;
+  path: string;
+  kind: "text" | "binary" | "directory";
+  blob_hash: string | null;
+  size: number;
+  is_conflict_copy: boolean;
+}
+
+interface SynclineV1Client {
+  actorId(): string;
+  initManifest(): void;
+  loadManifestState(state: Uint8Array, lamport: number): void;
+  manifestSnapshot(): Uint8Array;
+  lamport(): bigint | number;
+  onManifestChanged(cb: () => void): void;
+  onContentChanged(cb: (nodeId: string) => void): void;
+  onBlob(cb: (hash: string, data: Uint8Array) => void): void;
+  onStatus(cb: (status: string) => void): void;
   connect(): void;
-  add_doc(doc_id: string, callback: () => void): void;
-  add_doc_with_state(doc_id: string, state: Uint8Array, callback: () => void): void;
-  add_binary_doc(
-    doc_id: string,
-    callback: () => void,
-    blob_callback: (doc_id: string, data: Uint8Array) => void,
-  ): void;
-  remove_doc(doc_id: string): void;
-  get_text(doc_id: string): string | undefined;
-  get_doc_state(doc_id: string): Uint8Array | undefined;
-  update(doc_id: string, content: string): void;
-  set_text(doc_id: string, content: string): void;
-  is_connected(): boolean;
-  doc_count(): number;
-  create_index(callback?: () => void): void;
-  index_insert(key: string): void;
-  index_remove(key: string): void;
-  index_keys(): string[];
-  get_meta_path(doc_id: string): string | undefined;
-  set_meta_path(doc_id: string, path: string): void;
-  get_meta_type(doc_id: string): string | undefined;
-  set_meta_type(doc_id: string, file_type: string): void;
-  get_blob_hash(doc_id: string): string | undefined;
-  set_blob_hash(doc_id: string, hash: string): void;
-  send_blob(doc_id: string, data: Uint8Array): void;
-  request_blob(doc_id: string, hash: string): void;
   disconnect(): void;
+  isConnected(): boolean;
+  createText(path: string, size: number): string;
+  createTextAllowingCollision(path: string, size: number): string;
+  createBinary(path: string, blobHash: string, size: number): string;
+  delete(path: string): void;
+  rename(from: string, to: string): void;
+  recordModifyText(path: string): void;
+  recordModifyBinary(path: string, blobHash: string, size: number): void;
+  projectionJson(): string;
+  projectionHashHex(): string;
+  sendVerify(): void;
+  subscribeContent(nodeIdHex: string, state?: Uint8Array | null): void;
+  unsubscribeContent(nodeIdHex: string): void;
+  getContentText(nodeIdHex: string): string | undefined;
+  updateContentText(nodeIdHex: string, newContent: string): void;
+  contentSnapshot(nodeIdHex: string): Uint8Array | undefined;
+  sendBlob(bytes: Uint8Array): string;
+  requestBlob(blobHashHex: string): void;
   free(): void;
 }
 
 async function initWasm(): Promise<WasmModule> {
-  if (wasmInitialized && wasm) {
-    return wasm;
-  }
-
+  if (wasmInitialized && wasm) return wasm;
   const buffer = Uint8Array.from(atob(wasmBinary as unknown as string), (c) =>
     c.charCodeAt(0),
   );
   await wasmModule.default(Promise.resolve(buffer));
   wasmInitialized = true;
   wasm = wasmModule as unknown as WasmModule;
-  console.debug("[Syncline] WASM initialized");
+  console.debug("[Syncline] WASM initialized (v1)");
   return wasm;
 }
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 /**
- * Duration to suppress the file-watcher after writing a remote update to disk.
- * Must be strictly greater than the onFileModify debounce window (300 ms) to
- * guarantee that any debounced handler triggered by our own vault.modify()
- * call is still suppressed when it finally fires.
- *
- * See docs/tla/SynclineSyncDiffLayer.tla — the TLA+ model proved that
- * without this guard, a stale disk read generates spurious DELETE operations.
+ * How long we suppress file-watcher events after we write a remote update
+ * to disk. Must exceed the onFileModify debounce window so our own writes
+ * can't race back in as spurious local modifies. Same invariant as v0 —
+ * see docs/tla/SynclineSyncDiffLayer.tla.
  */
 const IGNORE_CHANGES_TIMEOUT_MS = 1000;
 
-/** Text-based file extensions that use Y.Text CRDT for content sync. */
-const TEXT_EXTENSIONS = ["md", "txt"];
+/** Extensions that project as text nodes (Y.Text CRDT). Everything else is binary. */
+const TEXT_EXTENSIONS = new Set(["md", "txt"]);
 
-/** Returns true if a file should be synced as binary (not via Y.Text CRDT). */
-function isBinaryFile(file: TFile): boolean {
-  return !TEXT_EXTENSIONS.includes(file.extension ?? "");
+function isTextPath(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return false;
+  return TEXT_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
 
-/** Compute SHA-256 hex hash of a byte array using Web Crypto. */
+function isTextFile(file: TFile): boolean {
+  return TEXT_EXTENSIONS.has((file.extension ?? "").toLowerCase());
+}
+
+/** Web Crypto SHA-256 → lowercase hex. */
 async function sha256Hex(data: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
 
 export default class SynclinePlugin extends Plugin {
-  settings: SynclineSettings;
-  statusBarItem: HTMLElement;
-  statusIcon: HTMLElement;
-  statusText: HTMLElement;
-  ribbonIconEl: HTMLElement;
+  settings!: SynclineSettings;
+  statusBarItem!: HTMLElement;
+  statusIcon!: HTMLElement;
+  statusText!: HTMLElement;
+  ribbonIconEl!: HTMLElement;
   syncStatus: SyncStatus = "disconnected";
 
-  client: SynclineClient | null = null;
+  client: SynclineV1Client | null = null;
   ignoreChanges: Set<string> = new Set();
+
+  /** Last projection we reconciled against — keyed by path. */
+  lastProjection: Map<string, ProjectionRow> = new Map();
+  /** Node ids we've subscribed to a content subdoc for. */
+  subscribedContent: Set<string> = new Set();
+  /** Blob hashes we've already fetched this session (to avoid re-requests). */
+  requestedBlobs: Set<string> = new Set();
+
   statusCheckInterval: number | null = null;
-  /** Tracks UUID strings (not paths) for all files currently known to be synced. */
-  knownFiles: Set<string> = new Set();
   reconnectTimeout: number | null = null;
-  reconnectAttempts: number = 0;
+  reconnectAttempts = 0;
+
+  // ---------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------
 
   async onload() {
-    console.debug("[Syncline] Loading plugin...");
+    console.debug("[Syncline] Loading plugin (v1)…");
     await this.loadSettings();
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("syncline-status-bar");
-    this.statusIcon = this.statusBarItem.createDiv({
-      cls: "status-icon disconnected",
-    });
-    this.statusText = this.statusBarItem.createDiv({
-      text: "Syncline: disconnected",
-    });
+    this.statusIcon = this.statusBarItem.createDiv({ cls: "status-icon disconnected" });
+    this.statusText = this.statusBarItem.createDiv({ text: "Syncline: disconnected" });
+    this.statusBarItem.onClickEvent(() => this.showStatusDetails());
 
-    this.statusBarItem.onClickEvent(() => {
-      this.showStatusDetails();
-    });
-
-    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline: disconnected", () => {
-      this.showStatusDetails();
-    });
+    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline: disconnected", () =>
+      this.showStatusDetails(),
+    );
     this.ribbonIconEl.addClass("syncline-ribbon", "disconnected");
 
     this.registerEvent(this.app.vault.on("modify", this.onFileModify));
@@ -174,93 +203,134 @@ export default class SynclinePlugin extends Plugin {
       DEFAULT_SETTINGS,
       await this.loadData(),
     ) as SynclineSettings;
-    // Ensure uuidMap exists on older saved data
-    if (!this.settings.uuidMap) {
-      this.settings.uuidMap = {};
-    }
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
 
-  // ---------------------------------------------------------------------------
-  // UUID helpers
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // On-disk persistence for CRDT state
+  // ---------------------------------------------------------------
 
-  /** Returns the stable UUID for a file path, generating one if it doesn't exist yet. */
-  getOrCreateUuid(filePath: string): string {
-    if (!this.settings.uuidMap[filePath]) {
-      this.settings.uuidMap[filePath] = crypto.randomUUID();
+  /** Root folder for v1 CRDT snapshots — separate from any v0 leftovers. */
+  private get stateRoot(): string {
+    return `${this.app.vault.configDir}/plugins/syncline-obsidian/v1`;
+  }
+  private get manifestPath(): string {
+    return `${this.stateRoot}/manifest.bin`;
+  }
+  private get lamportPath(): string {
+    return `${this.stateRoot}/lamport.txt`;
+  }
+  private contentPath(nodeId: string): string {
+    return `${this.stateRoot}/content/${nodeId}.bin`;
+  }
+
+  private async ensureStateRoot(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    if (!(await adapter.exists(this.stateRoot))) {
+      await adapter.mkdir(this.stateRoot);
     }
-    return this.settings.uuidMap[filePath];
+    const contentDir = `${this.stateRoot}/content`;
+    if (!(await adapter.exists(contentDir))) {
+      await adapter.mkdir(contentDir);
+    }
   }
 
-  /** Returns a uuid→path lookup derived from the current uuidMap. */
-  reverseUuidMap(): Record<string, string> {
-    return Object.fromEntries(
-      Object.entries(this.settings.uuidMap).map(([path, uuid]) => [uuid, path]),
-    );
+  private async loadManifestFromDisk(): Promise<{ state: Uint8Array; lamport: number } | null> {
+    const adapter = this.app.vault.adapter;
+    if (!(await adapter.exists(this.manifestPath))) return null;
+    try {
+      const state = new Uint8Array(await adapter.readBinary(this.manifestPath));
+      let lamport = 0;
+      if (await adapter.exists(this.lamportPath)) {
+        const txt = await adapter.read(this.lamportPath);
+        lamport = Number.parseInt(txt.trim(), 10) || 0;
+      }
+      return { state, lamport };
+    } catch (e) {
+      console.error("[Syncline] Failed to load manifest from disk:", e);
+      return null;
+    }
   }
 
-  // ---------------------------------------------------------------------------
-  // CRDT state persistence
-  // ---------------------------------------------------------------------------
-
-  /** Directory inside the plugin config folder where CRDT states are stored. */
-  private get crdtDir(): string {
-    return `${this.app.vault.configDir}/plugins/syncline-obsidian/crdt`;
-  }
-
-  /** Persist the full CRDT state for a document so offline edits survive restarts. */
-  private async saveCrdtState(uuid: string): Promise<void> {
+  private async persistManifest(): Promise<void> {
     if (!this.client) return;
-    const state = this.client.get_doc_state(uuid);
-    if (!state) return;
-    const path = `${this.crdtDir}/${uuid}.bin`;
     try {
-      // Ensure the crdt directory exists
-      if (!(await this.app.vault.adapter.exists(this.crdtDir))) {
-        await this.app.vault.adapter.mkdir(this.crdtDir);
-      }
-      await this.app.vault.adapter.writeBinary(path, state.buffer);
-    } catch (error) {
-      console.error(`[Syncline] Error saving CRDT state for ${uuid}:`, error);
+      await this.ensureStateRoot();
+      const snap = this.client.manifestSnapshot();
+      // Zero-length means uninitialised — don't clobber.
+      if (!snap || snap.length === 0) return;
+      const buffer = snap.buffer.slice(
+        snap.byteOffset,
+        snap.byteOffset + snap.byteLength,
+      ) as ArrayBuffer;
+      await this.app.vault.adapter.writeBinary(this.manifestPath, buffer);
+      const lamport = this.client.lamport().toString();
+      await this.app.vault.adapter.write(this.lamportPath, lamport);
+    } catch (e) {
+      console.error("[Syncline] Failed to persist manifest:", e);
     }
   }
 
-  /** Load persisted CRDT state for a document, or null if none exists. */
-  private async loadCrdtState(uuid: string): Promise<Uint8Array | null> {
-    const path = `${this.crdtDir}/${uuid}.bin`;
+  private persistManifestDebounced = debounce(() => void this.persistManifest(), 500, false);
+
+  private async loadContentState(nodeId: string): Promise<Uint8Array | null> {
+    const adapter = this.app.vault.adapter;
+    const p = this.contentPath(nodeId);
+    if (!(await adapter.exists(p))) return null;
     try {
-      if (await this.app.vault.adapter.exists(path)) {
-        const buffer = await this.app.vault.adapter.readBinary(path);
-        return new Uint8Array(buffer);
-      }
-    } catch (error) {
-      console.error(`[Syncline] Error loading CRDT state for ${uuid}:`, error);
+      return new Uint8Array(await adapter.readBinary(p));
+    } catch (e) {
+      console.error(`[Syncline] Failed to load content state ${nodeId}:`, e);
+      return null;
     }
-    return null;
   }
 
-  // ---------------------------------------------------------------------------
+  private async persistContentState(nodeId: string): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.ensureStateRoot();
+      const snap = this.client.contentSnapshot(nodeId);
+      if (!snap) return;
+      const buffer = snap.buffer.slice(
+        snap.byteOffset,
+        snap.byteOffset + snap.byteLength,
+      ) as ArrayBuffer;
+      await this.app.vault.adapter.writeBinary(this.contentPath(nodeId), buffer);
+    } catch (e) {
+      console.error(`[Syncline] Failed to persist content ${nodeId}:`, e);
+    }
+  }
+
+  private async removeContentState(nodeId: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const p = this.contentPath(nodeId);
+    if (await adapter.exists(p)) {
+      try {
+        await adapter.remove(p);
+      } catch (e) {
+        console.error(`[Syncline] Failed to remove content state ${nodeId}:`, e);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------
   // Status / UI
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
 
   updateStatus(status: SyncStatus, text?: string) {
     this.syncStatus = status;
     this.statusIcon.className = `status-icon ${status}`;
-
     const statusTexts: Record<SyncStatus, string> = {
       synced: "Syncline: synced",
       syncing: "Syncline: syncing…",
       error: "Syncline: error",
       disconnected: "Syncline: disconnected",
     };
-
-    const newText = text || statusTexts[status];
+    const newText = text ?? statusTexts[status];
     this.statusText.setText(newText);
-
     if (this.ribbonIconEl) {
       this.ribbonIconEl.removeClass("synced", "syncing", "error", "disconnected");
       this.ribbonIconEl.addClass(status);
@@ -269,26 +339,24 @@ export default class SynclinePlugin extends Plugin {
   }
 
   showStatusDetails() {
-    const count = this.client?.doc_count() ?? 0;
+    const count = this.lastProjection.size;
     const status =
       this.syncStatus === "synced"
-        ? `Connected (${count} files)`
+        ? `Connected (${count} file${count === 1 ? "" : "s"})`
         : this.syncStatus === "syncing"
-          ? "Connecting..."
+          ? "Connecting…"
           : this.syncStatus === "error"
-            ? "Connection error - click to reconnect"
-            : "Disconnected - click to connect";
-
+            ? "Connection error — click to reconnect"
+            : "Disconnected — click to connect";
     new Notice(`Syncline: ${status}`);
-
     if (this.syncStatus === "error" || this.syncStatus === "disconnected") {
       void this.connect();
     }
   }
 
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
   // Connection lifecycle
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
 
   async connect() {
     if (this.reconnectTimeout !== null) {
@@ -301,40 +369,46 @@ export default class SynclinePlugin extends Plugin {
       console.debug("[Syncline] Connecting to:", this.settings.serverUrl);
 
       const wasmMod = await initWasm();
-      this.client = new wasmMod.SynclineClient(this.settings.serverUrl);
+      this.client = new wasmMod.SynclineV1Client(
+        this.settings.serverUrl,
+        this.settings.actorId ?? undefined,
+      );
 
-      // Create the __index__ document first
-      this.client.create_index(() => {
-        this.onIndexUpdate();
+      // Persist the actor id the first time so we don't keep minting new ones.
+      if (!this.settings.actorId) {
+        this.settings.actorId = this.client.actorId();
+        await this.saveSettings();
+      }
+
+      await this.ensureStateRoot();
+      const persisted = await this.loadManifestFromDisk();
+      if (persisted) {
+        this.client.loadManifestState(persisted.state, persisted.lamport);
+      } else {
+        this.client.initManifest();
+      }
+
+      this.client.onManifestChanged(() => {
+        this.persistManifestDebounced();
+        void this.reconcileProjection();
+      });
+      this.client.onContentChanged((nodeId) => {
+        void this.onContentChanged(nodeId);
+      });
+      this.client.onBlob((hash, bytes) => {
+        void this.onBlobReceived(hash, bytes);
+      });
+      this.client.onStatus((s) => {
+        console.debug("[Syncline] status:", s);
       });
 
-      // Register all vault files under their UUIDs BEFORE connecting
-      const files = this.app.vault.getFiles();
-      console.debug("[Syncline] Adding", files.length, "files to index");
-
-      for (const file of files) {
-        const uuid = this.getOrCreateUuid(file.path);
-        this.knownFiles.add(uuid);
-        this.client.index_insert(uuid);
-      }
-
-      // Open WebSocket — WASM will send SyncStep1 for all registered docs on open
       this.client.connect();
 
-      // Subscribe to content for each file
-      for (const file of files) {
-        const uuid = this.settings.uuidMap[file.path];
-        if (uuid) {
-          if (isBinaryFile(file)) {
-            this.addBinaryDocOnly(file, uuid);
-          } else {
-            void this.addDocOnly(file, uuid);
-          }
-        }
-      }
-
-      // Persist the (possibly expanded) uuidMap
-      await this.saveSettings();
+      // Ingest any vault files not yet in the manifest (first run, or a
+      // file created while offline). Done after the handshake completes,
+      // so scanLocalVault below just walks what's on disk.
+      await this.scanLocalVault();
+      await this.reconcileProjection();
 
       this.startStatusCheck();
     } catch (error) {
@@ -346,12 +420,9 @@ export default class SynclinePlugin extends Plugin {
 
   scheduleReconnect() {
     if (this.reconnectTimeout !== null) return;
-
-    const baseDelay = 1000;
-    const delay = Math.min(baseDelay * Math.pow(2, this.reconnectAttempts), 30000);
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
-
-    console.debug(`[Syncline] Scheduling reconnect in ${delay}ms (Attempt ${this.reconnectAttempts})`);
+    console.debug(`[Syncline] reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
     this.reconnectTimeout = window.setTimeout(() => {
       this.reconnectTimeout = null;
       void this.connect();
@@ -371,7 +442,9 @@ export default class SynclinePlugin extends Plugin {
       this.client = null;
     }
     this.ignoreChanges.clear();
-    this.knownFiles.clear();
+    this.lastProjection.clear();
+    this.subscribedContent.clear();
+    this.requestedBlobs.clear();
     this.updateStatus("disconnected");
   }
 
@@ -379,22 +452,19 @@ export default class SynclinePlugin extends Plugin {
     if (this.statusCheckInterval !== null) {
       window.clearInterval(this.statusCheckInterval);
     }
-
     let wasConnected = false;
     let ticksDisconnected = 0;
-
     this.statusCheckInterval = window.setInterval(() => {
       if (!this.client) {
         this.updateStatus("disconnected");
         return;
       }
-
-      if (this.client.is_connected()) {
+      if (this.client.isConnected()) {
         wasConnected = true;
         ticksDisconnected = 0;
         this.reconnectAttempts = 0;
-        const count = this.client.doc_count();
-        this.updateStatus("synced", `Syncline: ${count} file${count === 1 ? '' : 's'}`);
+        const count = this.lastProjection.size;
+        this.updateStatus("synced", `Syncline: ${count} file${count === 1 ? "" : "s"}`);
       } else {
         if (wasConnected) {
           this.updateStatus("error", "Syncline: connection lost");
@@ -422,244 +492,160 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Index management
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // Local → manifest: scan-and-ingest on connect
+  // ---------------------------------------------------------------
 
-  onIndexUpdate() {
+  /**
+   * Ingest every vault file that isn't already represented in the
+   * manifest. Uses `createTextAllowingCollision` / `createBinary` so a
+   * remote manifest entry at the same path produces a projection
+   * conflict (resolved by the Rust projection layer, §6.4) rather than
+   * an error.
+   */
+  async scanLocalVault(): Promise<void> {
     if (!this.client) return;
-
-    const keys = this.client.index_keys(); // these are UUIDs
-    console.debug("[Syncline] Index update, keys:", keys);
-
-    const reverseMap = this.reverseUuidMap();
-
-    for (const uuid of keys) {
-      if (!this.knownFiles.has(uuid)) {
-        if (this.settings.knownFiles.includes(uuid)) {
-          // UUID was known before but is no longer on the server → offline deletion
-          console.debug("[Syncline] Detected offline deletion from index sync:", uuid);
-          this.client.index_remove(uuid);
+    const projection = this.readProjection();
+    const pathsInManifest = new Set(projection.map((r) => r.path));
+    for (const file of this.app.vault.getFiles()) {
+      if (pathsInManifest.has(file.path)) continue;
+      try {
+        if (isTextFile(file)) {
+          const content = await this.app.vault.read(file);
+          const size = new TextEncoder().encode(content).byteLength;
+          const nodeId = this.client.createTextAllowingCollision(file.path, size);
+          this.subscribeToContent(nodeId, content);
         } else {
-          this.knownFiles.add(uuid);
-          const path = reverseMap[uuid];
-          const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
-          if (file instanceof TFile) {
-            void this.addDocOnly(file, uuid);
-          } else {
-            void this.createFileFromRemote(uuid);
+          const data = await this.app.vault.readBinary(file);
+          const hash = await sha256Hex(data);
+          const bytes = new Uint8Array(data);
+          if (this.client.isConnected()) {
+            this.client.sendBlob(bytes);
+          }
+          this.client.createBinary(file.path, hash, data.byteLength);
+        }
+      } catch (e) {
+        console.error(`[Syncline] scan: failed to ingest ${file.path}:`, e);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Projection reconciliation — the core v1 idea.
+  //
+  // Whenever the manifest changes (either because we mutated it, or a
+  // remote update arrived), re-project and make the vault match: create
+  // missing files, rename moved files, delete tombstoned ones, and
+  // subscribe/request any new content subdocs / blobs.
+  // ---------------------------------------------------------------
+
+  private readProjection(): ProjectionRow[] {
+    if (!this.client) return [];
+    try {
+      return JSON.parse(this.client.projectionJson()) as ProjectionRow[];
+    } catch (e) {
+      console.error("[Syncline] bad projection JSON:", e);
+      return [];
+    }
+  }
+
+  async reconcileProjection(): Promise<void> {
+    if (!this.client) return;
+    const projection = this.readProjection();
+    const byPath = new Map<string, ProjectionRow>();
+    const byId = new Map<string, ProjectionRow>();
+    for (const row of projection) {
+      byPath.set(row.path, row);
+      byId.set(row.id, row);
+    }
+
+    // --- Removals: paths that were in the prior projection but aren't now ---
+    for (const [path, prev] of this.lastProjection) {
+      if (!byId.has(prev.id)) {
+        await this.removeLocalFile(path);
+        this.subscribedContent.delete(prev.id);
+        void this.removeContentState(prev.id);
+      } else {
+        const current = byId.get(prev.id);
+        if (current && current.path !== path) {
+          await this.renameLocalFile(path, current.path);
+        }
+      }
+    }
+
+    // --- Additions / ensure-subscribed ---
+    for (const row of projection) {
+      const existing = this.app.vault.getAbstractFileByPath(row.path);
+      if (row.kind === "text") {
+        if (!(existing instanceof TFile)) {
+          // File doesn't exist on disk yet — create placeholder so the
+          // subdoc subscription can write content into it on first sync.
+          try {
+            await this.ensureParentFolders(row.path);
+            this.ignoreChanges.add(row.path);
+            await this.app.vault.create(row.path, "");
+          } catch (e) {
+            console.error(`[Syncline] create placeholder ${row.path}:`, e);
+          } finally {
+            setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
           }
         }
-      }
-    }
-
-    // UUIDs that disappeared from the index → delete local file
-    for (const uuid of Array.from(this.knownFiles)) {
-      if (!keys.includes(uuid)) {
-        this.knownFiles.delete(uuid);
-        const path = reverseMap[uuid];
-        if (path) {
-          this.deleteLocalFile(path, uuid);
+        if (!this.subscribedContent.has(row.id)) {
+          this.subscribeToContent(row.id);
+        }
+      } else if (row.kind === "binary") {
+        if (row.blob_hash) {
+          await this.ensureBinaryInSync(row);
         }
       }
     }
 
-    this.settings.knownFiles = Array.from(this.knownFiles);
-    void this.saveSettings();
+    this.lastProjection = byPath;
   }
 
-  // ---------------------------------------------------------------------------
-  // Document management
-  // ---------------------------------------------------------------------------
-
-  /** Subscribe to a doc by UUID. On first sync, merge local + remote via CRDT; thereafter handle remote updates. */
-  async addDocOnly(file: TFile, uuid: string) {
-    if (!this.client) return;
-
-    let initialSyncDone = false;
-
-    // Load persisted CRDT state and local file content in parallel
-    const [persistedState, localContent] = await Promise.all([
-      this.loadCrdtState(uuid),
-      this.app.vault.read(file),
-    ]);
-
-    if (!this.client) return; // client may have been torn down during await
-
-    const onSync = () => {
-      // Ensure meta.path is set so the CLI client (and other WASM clients) know the file's path
-      this.client?.set_meta_path(uuid, file.path);
-
-      if (!initialSyncDone) {
-        initialSyncDone = true;
-
-        // After SyncStep2 merges remote edits into our doc (which already
-        // contains our offline edits from step 2 below), write the fully
-        // merged result to disk.
-        const mergedContent = this.client?.get_text(uuid) || "";
-        if (mergedContent !== localContent) {
-          this.ignoreChanges.add(file.path);
-          this.app.vault
-            .modify(file, mergedContent)
-            .finally(() => {
-              setTimeout(() => this.ignoreChanges.delete(file.path), IGNORE_CHANGES_TIMEOUT_MS);
-            })
-            .catch((error) => {
-              console.error(`[Syncline] Error updating ${file.path} after initial sync:`, error);
-            });
-        }
-
-        // Persist the merged CRDT state
-        void this.saveCrdtState(uuid);
-      } else {
-        // FIX(Issue #6): Suppress the file-watcher IMMEDIATELY when CRDT
-        // is updated, BEFORE the async disk write in onRemoteUpdate().
-        this.ignoreChanges.add(file.path);
-        void this.onRemoteUpdate(uuid).then(() => this.saveCrdtState(uuid));
-      }
-    };
-
-    if (persistedState) {
-      // We have prior CRDT state — load it so the doc starts with full history.
-      // add_doc_with_state applies the state before registering the observer,
-      // so historical operations are not re-broadcast.
-      this.client.add_doc_with_state(uuid, persistedState, onSync);
-
-      // Apply offline edits IMMEDIATELY, before SyncStep2 arrives.
-      // The diff is against the persisted CRDT content (not post-merge),
-      // so it produces only the delta from offline file edits. When
-      // SyncStep2 later merges remote operations, both sets of edits
-      // coexist in the CRDT — no data loss.
-      const persistedContent = this.client.get_text(uuid) || "";
-      if (persistedContent !== localContent) {
-        this.client.update(uuid, localContent);
-      }
-    } else {
-      // First time syncing this doc (or state was lost). Use plain add_doc.
-      // Push local content after sync completes (handled in onSync callback
-      // only if the remote CRDT is empty — new file case).
-      this.client.add_doc(uuid, onSync);
-
-      // For a brand-new doc with no persisted state and no remote content,
-      // push local content now. If remote has content (from SyncStep2),
-      // the callback will write it to disk.
-      const remoteContent = this.client.get_text(uuid) || "";
-      if (remoteContent === "" && localContent !== "") {
-        this.client.update(uuid, localContent);
-      }
+  private async removeLocalFile(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+    this.ignoreChanges.add(path);
+    try {
+      await this.app.fileManager.trashFile(file);
+    } catch (e) {
+      console.error(`[Syncline] trash ${path}:`, e);
+    } finally {
+      setTimeout(() => this.ignoreChanges.delete(path), IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
 
-  /** Subscribe to a binary doc by UUID. Handles blob upload/download for non-text files. */
-  addBinaryDocOnly(file: TFile, uuid: string) {
-    if (!this.client) return;
-
-    let initialSyncDone = false;
-
-    // Metadata callback: fires when the CRDT meta document is updated
-    const onMetaUpdate = () => {
-      this.client?.set_meta_path(uuid, file.path);
-      this.client?.set_meta_type(uuid, "binary");
-
-      if (!initialSyncDone) {
-        initialSyncDone = true;
-        // On initial sync: compare local hash with remote hash
-        this.app.vault
-          .readBinary(file)
-          .then(async (data) => {
-            const localHash = await sha256Hex(data);
-            const remoteHash = this.client?.get_blob_hash(uuid);
-
-            if (!remoteHash || remoteHash === "") {
-              // No remote hash yet — upload our data
-              this.client?.set_blob_hash(uuid, localHash);
-              this.client?.send_blob(uuid, new Uint8Array(data));
-            } else if (remoteHash !== localHash) {
-              // Remote has different content — request it
-              this.client?.request_blob(uuid, remoteHash);
-            }
-            // else: hashes match, nothing to do
-          })
-          .catch((error) => {
-            console.error(`[Syncline] Error reading binary file ${file.path}:`, error);
-          });
-      } else {
-        // Subsequent meta updates: check if blob hash changed
-        const remoteHash = this.client?.get_blob_hash(uuid);
-        if (remoteHash && remoteHash !== "") {
-          this.app.vault
-            .readBinary(file)
-            .then(async (data) => {
-              const localHash = await sha256Hex(data);
-              if (remoteHash !== localHash) {
-                // Remote has newer blob — request it
-                this.client?.request_blob(uuid, remoteHash);
-              }
-            })
-            .catch((error) => {
-              console.error(`[Syncline] Error reading binary file ${file.path}:`, error);
-            });
-        }
-      }
-    };
-
-    // Blob callback: fires when MSG_BLOB_UPDATE arrives with binary data
-    const onBlobReceived = (_docId: string, data: Uint8Array) => {
-      const targetPath = this.client?.get_meta_path(uuid) ?? file.path;
-      this.ignoreChanges.add(targetPath);
-
-      const existingFile = this.app.vault.getAbstractFileByPath(targetPath);
-      const promise: Promise<unknown> = existingFile instanceof TFile
-        ? this.app.vault.modifyBinary(existingFile, data.buffer as ArrayBuffer)
-        : this.ensureParentFolders(targetPath).then(() => {
-            return this.app.vault.createBinary(targetPath, data.buffer as ArrayBuffer).then(() => {
-              this.settings.uuidMap[targetPath] = uuid;
-              void this.saveSettings();
-            });
-          });
-
-      promise
-        .then(() => {
-          console.debug(`[Syncline] Wrote binary file ${targetPath} (${data.length} bytes)`);
-        })
-        .catch((error) => {
-          console.error(`[Syncline] Failed to write binary file ${targetPath}:`, error);
-        })
-        .finally(() => {
-          setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
-        });
-    };
-
-    this.client.add_binary_doc(uuid, onMetaUpdate, onBlobReceived);
-  }
-
-  /** Register a new file: assign UUID, track it, insert into index, subscribe. */
-  addFile(file: TFile) {
-    if (!this.client) return;
-
-    const uuid = this.getOrCreateUuid(file.path);
-    this.knownFiles.add(uuid);
-    this.client.index_insert(uuid);
-    if (isBinaryFile(file)) {
-      this.addBinaryDocOnly(file, uuid);
-    } else {
-      this.addDocOnly(file, uuid);
+  private async renameLocalFile(from: string, to: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(from);
+    if (!(file instanceof TFile)) return;
+    try {
+      await this.ensureParentFolders(to);
+      this.ignoreChanges.add(from);
+      this.ignoreChanges.add(to);
+      await this.app.fileManager.renameFile(file, to);
+    } catch (e) {
+      console.error(`[Syncline] rename ${from} → ${to}:`, e);
+    } finally {
+      setTimeout(() => {
+        this.ignoreChanges.delete(from);
+        this.ignoreChanges.delete(to);
+      }, IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
     const parts = filePath.split("/");
     parts.pop();
-    let currentPath = "";
+    let cur = "";
     for (const part of parts) {
-      currentPath = currentPath ? `${currentPath}/${part}` : part;
-      const existing = this.app.vault.getAbstractFileByPath(currentPath);
-      if (!existing) {
+      cur = cur ? `${cur}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(cur)) {
         try {
-          await this.app.vault.createFolder(currentPath);
+          await this.app.vault.createFolder(cur);
         } catch (e) {
-          if (!this.app.vault.getAbstractFileByPath(currentPath)) {
-            console.error(`[Syncline] Failed to create folder ${currentPath}:`, e);
+          if (!this.app.vault.getAbstractFileByPath(cur)) {
+            console.error(`[Syncline] create folder ${cur}:`, e);
             throw e;
           }
         }
@@ -667,174 +653,175 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  /** Subscribe to a remote-only UUID and create the local file once meta.path is known. */
-  createFileFromRemote(uuid: string) {
+  // ---------------------------------------------------------------
+  // Text content subdocs
+  // ---------------------------------------------------------------
+
+  /**
+   * Subscribe to the content subdoc for `nodeId`. If `initialContent`
+   * is given (from the local-file scanner), seed the subdoc so our
+   * first update carries the file's bytes.
+   */
+  private subscribeToContent(nodeId: string, initialContent?: string): void {
     if (!this.client) return;
+    if (this.subscribedContent.has(nodeId)) return;
+    void (async () => {
+      if (!this.client) return;
+      const state = await this.loadContentState(nodeId);
+      try {
+        this.client.subscribeContent(nodeId, state ?? null);
+      } catch (e) {
+        console.error(`[Syncline] subscribe_content ${nodeId}:`, e);
+        return;
+      }
+      this.subscribedContent.add(nodeId);
+      if (initialContent !== undefined) {
+        const current = this.client.getContentText(nodeId) ?? "";
+        if (current !== initialContent) {
+          this.client.updateContentText(nodeId, initialContent);
+        }
+      }
+    })();
+  }
 
-    // We don't know yet if this is text or binary — use add_doc first,
-    // and once meta.type arrives via CRDT we can decide.
-    this.client.add_doc(uuid, () => {
-      const path = this.client?.get_meta_path(uuid);
-      const metaType = this.client?.get_meta_type(uuid);
-      if (path) {
-        // Record the path→uuid mapping now that we know it
-        this.settings.uuidMap[path] = uuid;
-        void this.saveSettings();
+  private async onContentChanged(nodeId: string): Promise<void> {
+    if (!this.client) return;
+    const row = this.findRowById(nodeId);
+    if (!row || row.kind !== "text") return;
+    const text = this.client.getContentText(nodeId);
+    if (text == null) return;
+    const file = this.app.vault.getAbstractFileByPath(row.path);
+    void this.persistContentState(nodeId);
+    if (file instanceof TFile) {
+      try {
+        const current = await this.app.vault.read(file);
+        if (current === text) return;
+        this.ignoreChanges.add(row.path);
+        await this.app.vault.modify(file, text);
+      } catch (e) {
+        console.error(`[Syncline] modify ${row.path}:`, e);
+      } finally {
+        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+      }
+    } else {
+      try {
+        await this.ensureParentFolders(row.path);
+        this.ignoreChanges.add(row.path);
+        await this.app.vault.create(row.path, text);
+      } catch (e) {
+        console.error(`[Syncline] create ${row.path}:`, e);
+      } finally {
+        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+      }
+    }
+  }
 
-        if (metaType === "binary") {
-          // Re-register as binary doc and request blob
-          this.client?.remove_doc(uuid);
-          const file = this.app.vault.getAbstractFileByPath(path);
-          if (file instanceof TFile) {
-            this.addBinaryDocOnly(file, uuid);
-          } else {
-            // Create placeholder, then register binary doc
-            void this.ensureParentFolders(path).then(() => {
-              void this.app.vault.createBinary(path, new ArrayBuffer(0)).then((newFile) => {
-                this.addBinaryDocOnly(newFile, uuid);
-              }).catch((error) => {
-                console.error(`[Syncline] Failed to create binary file ${path}:`, error);
-              });
-            });
-          }
+  private findRowById(nodeId: string): ProjectionRow | undefined {
+    for (const row of this.lastProjection.values()) {
+      if (row.id === nodeId) return row;
+    }
+    return undefined;
+  }
+
+  // ---------------------------------------------------------------
+  // Binary blob protocol
+  // ---------------------------------------------------------------
+
+  /**
+   * Make sure the file at `row.path` has content hashing to
+   * `row.blob_hash`. If not, either push our bytes (remote has no blob
+   * yet) or request the remote blob (we have different bytes).
+   */
+  private async ensureBinaryInSync(row: ProjectionRow): Promise<void> {
+    if (!this.client || !row.blob_hash) return;
+    const file = this.app.vault.getAbstractFileByPath(row.path);
+    if (file instanceof TFile) {
+      try {
+        const data = await this.app.vault.readBinary(file);
+        const localHash = await sha256Hex(data);
+        if (localHash === row.blob_hash) return;
+        if (this.requestedBlobs.has(row.blob_hash)) return;
+        this.requestedBlobs.add(row.blob_hash);
+        this.client.requestBlob(row.blob_hash);
+      } catch (e) {
+        console.error(`[Syncline] ensureBinaryInSync ${row.path}:`, e);
+      }
+    } else {
+      if (this.requestedBlobs.has(row.blob_hash)) return;
+      this.requestedBlobs.add(row.blob_hash);
+      try {
+        this.client.requestBlob(row.blob_hash);
+      } catch (e) {
+        console.error(`[Syncline] requestBlob ${row.blob_hash}:`, e);
+      }
+    }
+  }
+
+  private async onBlobReceived(hash: string, bytes: Uint8Array): Promise<void> {
+    // A blob may satisfy multiple projection rows (e.g. a conflict copy).
+    const matches = Array.from(this.lastProjection.values()).filter(
+      (r) => r.kind === "binary" && r.blob_hash === hash,
+    );
+    for (const row of matches) {
+      const buffer = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer;
+      const file = this.app.vault.getAbstractFileByPath(row.path);
+      this.ignoreChanges.add(row.path);
+      try {
+        if (file instanceof TFile) {
+          await this.app.vault.modifyBinary(file, buffer);
         } else {
-          void this.onRemoteUpdate(uuid);
+          await this.ensureParentFolders(row.path);
+          await this.app.vault.createBinary(row.path, buffer);
         }
-      }
-    });
-  }
-
-  deleteLocalFile(filePath: string, uuid: string) {
-    const file = this.app.vault.getAbstractFileByPath(filePath);
-    if (file instanceof TFile) {
-      this.ignoreChanges.add(filePath);
-      this.app.fileManager.trashFile(file).catch((error) => {
-        console.error(`[Syncline] Error deleting file ${filePath}:`, error);
-      }).finally(() => {
-        setTimeout(() => this.ignoreChanges.delete(filePath), IGNORE_CHANGES_TIMEOUT_MS);
-      });
-    }
-    this.client?.remove_doc(uuid);
-  }
-
-  async onRemoteUpdate(uuid: string) {
-    if (!this.client) return;
-
-    const content = this.client.get_text(uuid);
-    if (content == null) return;
-
-    const metaPath = this.client.get_meta_path(uuid);
-    const reverseMap = this.reverseUuidMap();
-    const currentPath = reverseMap[uuid] ?? metaPath;
-
-    if (!currentPath && !metaPath) {
-      return; // Path not known yet
-    }
-
-    const targetPath = metaPath ?? currentPath;
-
-    // Handle rename propagated from a remote client: meta.path changed
-    if (metaPath && currentPath && metaPath !== currentPath) {
-      const oldFile = this.app.vault.getAbstractFileByPath(currentPath);
-      if (oldFile instanceof TFile) {
-        this.ignoreChanges.add(currentPath);
-        this.ignoreChanges.add(metaPath);
-        try {
-          await this.ensureParentFolders(metaPath);
-          await this.app.fileManager.renameFile(oldFile, metaPath);
-          delete this.settings.uuidMap[currentPath];
-          this.settings.uuidMap[metaPath] = uuid;
-          await this.saveSettings();
-        } catch (error) {
-          console.error(`[Syncline] Error renaming ${currentPath} → ${metaPath}:`, error);
-        } finally {
-          setTimeout(() => {
-            this.ignoreChanges.delete(currentPath);
-            this.ignoreChanges.delete(metaPath);
-          }, IGNORE_CHANGES_TIMEOUT_MS);
-        }
-      }
-    }
-
-    const file = this.app.vault.getAbstractFileByPath(targetPath);
-
-    if (file instanceof TFile) {
-      try {
-        const currentContent = await this.app.vault.read(file);
-        if (currentContent === content) {
-          // Disk already matches CRDT — clear ignore early, nothing to write.
-          this.ignoreChanges.delete(targetPath);
-          return;
-        }
-        // ignoreChanges is already set by the caller (addDocOnly callback)
-        // but ensure it's set in case onRemoteUpdate is called from elsewhere.
-        this.ignoreChanges.add(targetPath);
-        await this.app.vault.modify(file, content);
-      } catch (error) {
-        console.error(`[Syncline] Error updating file ${targetPath}:`, error);
+      } catch (e) {
+        console.error(`[Syncline] write blob → ${row.path}:`, e);
       } finally {
-        // Clear the suppression after IGNORE_CHANGES_TIMEOUT_MS.
-        // This MUST be longer than the 300 ms debounce on onFileModify so
-        // that any watcher event caused by our vault.modify() call above
-        // is still suppressed when the debounced handler fires.
-        setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
-      }
-    } else if (!file && targetPath) {
-      try {
-        await this.ensureParentFolders(targetPath);
-        this.ignoreChanges.add(targetPath);
-        await this.app.vault.create(targetPath, content);
-        if (metaPath) {
-          this.settings.uuidMap[metaPath] = uuid;
-          await this.saveSettings();
-        }
-        this.knownFiles.add(uuid);
-      } catch (error) {
-        console.error(`[Syncline] Failed to create file ${targetPath} on remote update:`, error);
-      } finally {
-        setTimeout(() => this.ignoreChanges.delete(targetPath), IGNORE_CHANGES_TIMEOUT_MS);
+        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Vault event handlers
-  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // Vault → manifest: local file events
+  // ---------------------------------------------------------------
 
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (this.ignoreChanges.has(file.path)) return;
     if (!this.client) return;
 
-    const uuid = this.settings.uuidMap[file.path];
-    if (!uuid) return;
+    const row = this.lastProjection.get(file.path);
+    if (!row) {
+      // Not yet in the projection — treat as a create event.
+      void this.ingestNewFile(file);
+      return;
+    }
 
-    if (isBinaryFile(file)) {
-      // Binary file: read bytes, compute hash, upload if changed
+    if (row.kind === "text") {
+      try {
+        const content = await this.app.vault.read(file);
+        if (this.ignoreChanges.has(file.path)) return;
+        const crdtContent = this.client.getContentText(row.id) ?? "";
+        if (crdtContent === content) return;
+        this.client.updateContentText(row.id, content);
+        this.client.recordModifyText(row.path);
+        void this.persistContentState(row.id);
+      } catch (e) {
+        console.error(`[Syncline] onModify text ${file.path}:`, e);
+      }
+    } else if (row.kind === "binary") {
       try {
         const data = await this.app.vault.readBinary(file);
         if (this.ignoreChanges.has(file.path)) return;
         const hash = await sha256Hex(data);
-        const currentHash = this.client.get_blob_hash(uuid);
-        if (currentHash === hash) return; // unchanged
-        this.client.set_blob_hash(uuid, hash);
-        this.client.set_meta_type(uuid, "binary");
-        this.client.send_blob(uuid, new Uint8Array(data));
-      } catch (error) {
-        console.error(`[Syncline] Error syncing binary file ${file.path}:`, error);
-      }
-    } else {
-      // Text file: existing behavior
-      try {
-        const content = await this.app.vault.read(file);
-        if (this.ignoreChanges.has(file.path)) return;
-        const crdtContent = this.client.get_text(uuid);
-        if (crdtContent === content) return;
-        this.client.update(uuid, content);
-        // Persist CRDT state so offline edits survive plugin restarts
-        void this.saveCrdtState(uuid);
-      } catch (error) {
-        console.error("[Syncline] Error syncing:", error);
+        if (row.blob_hash === hash) return;
+        this.client.sendBlob(new Uint8Array(data));
+        this.client.recordModifyBinary(row.path, hash, data.byteLength);
+      } catch (e) {
+        console.error(`[Syncline] onModify binary ${file.path}:`, e);
       }
     }
   }, 300);
@@ -842,54 +829,71 @@ export default class SynclinePlugin extends Plugin {
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (this.ignoreChanges.has(file.path)) return;
-
-    this.addFile(file);
-    this.settings.knownFiles = Array.from(this.knownFiles);
-    void this.saveSettings();
+    void this.ingestNewFile(file);
   };
+
+  private async ingestNewFile(file: TFile): Promise<void> {
+    if (!this.client) return;
+    try {
+      if (isTextFile(file)) {
+        const content = await this.app.vault.read(file);
+        const size = new TextEncoder().encode(content).byteLength;
+        let nodeId: string;
+        try {
+          nodeId = this.client.createText(file.path, size);
+        } catch (e) {
+          // Path taken — fall back to the collision-tolerant variant; the
+          // projection will resolve it with a `.conflict-` suffix.
+          console.debug(`[Syncline] createText collision for ${file.path}:`, e);
+          nodeId = this.client.createTextAllowingCollision(file.path, size);
+        }
+        this.subscribeToContent(nodeId, content);
+      } else {
+        const data = await this.app.vault.readBinary(file);
+        const hash = await sha256Hex(data);
+        this.client.sendBlob(new Uint8Array(data));
+        this.client.createBinary(file.path, hash, data.byteLength);
+      }
+    } catch (e) {
+      console.error(`[Syncline] ingestNewFile ${file.path}:`, e);
+    }
+  }
 
   onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (this.ignoreChanges.has(file.path)) return;
-
-    const uuid = this.settings.uuidMap[file.path];
-    if (uuid) {
-      this.client?.index_remove(uuid);
-      this.client?.remove_doc(uuid);
-      this.knownFiles.delete(uuid);
-      delete this.settings.uuidMap[file.path];
+    if (!this.client) return;
+    const row = this.lastProjection.get(file.path);
+    if (!row) return;
+    try {
+      this.client.delete(file.path);
+      this.subscribedContent.delete(row.id);
+      void this.removeContentState(row.id);
+    } catch (e) {
+      console.error(`[Syncline] delete ${file.path}:`, e);
     }
-
-    this.settings.knownFiles = Array.from(this.knownFiles);
-    void this.saveSettings();
   };
 
   onFileRename = (file: TAbstractFile, oldPath: string) => {
-    if (this.ignoreChanges.has(file instanceof TFile ? file.path : oldPath)) return;
-
-    const uuid = this.settings.uuidMap[oldPath];
-    if (uuid) {
-      // Keep the same UUID — only update the path mapping and broadcast via set_meta_path
-      delete this.settings.uuidMap[oldPath];
-      if (file instanceof TFile) {
-        this.settings.uuidMap[file.path] = uuid;
-        // This CRDT update broadcasts the new meta.path to all other clients
-        this.client?.set_meta_path(uuid, file.path);
-      } else {
-        // Renamed to a non-file — remove from sync
-        this.client?.index_remove(uuid);
-        this.client?.remove_doc(uuid);
-        this.knownFiles.delete(uuid);
+    if (!(file instanceof TFile)) return;
+    if (this.ignoreChanges.has(oldPath) || this.ignoreChanges.has(file.path)) return;
+    if (!this.client) return;
+    const row = this.lastProjection.get(oldPath);
+    if (row) {
+      try {
+        this.client.rename(oldPath, file.path);
+      } catch (e) {
+        console.error(`[Syncline] rename ${oldPath} → ${file.path}:`, e);
       }
-    } else if (file instanceof TFile) {
-      // File was not previously tracked
-      this.addFile(file);
+    } else {
+      void this.ingestNewFile(file);
     }
-
-    this.settings.knownFiles = Array.from(this.knownFiles);
-    void this.saveSettings();
   };
 }
+
+// ---------------------------------------------------------------------------
+// Settings UI
+// ---------------------------------------------------------------------------
 
 class SynclineSettingTab extends PluginSettingTab {
   plugin: SynclinePlugin;
@@ -922,12 +926,10 @@ class SynclineSettingTab extends PluginSettingTab {
       .setName("Auto sync")
       .setDesc("Sync automatically when Obsidian starts")
       .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoSync)
-          .onChange(async (value) => {
-            this.plugin.settings.autoSync = value;
-            await this.plugin.saveSettings();
-          }),
+        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
+          this.plugin.settings.autoSync = value;
+          await this.plugin.saveSettings();
+        }),
       );
 
     new Setting(containerEl)
@@ -939,5 +941,16 @@ class SynclineSettingTab extends PluginSettingTab {
           void this.plugin.connect();
         }),
       );
+
+    new Setting(containerEl).setName("Identity").setHeading();
+    new Setting(containerEl)
+      .setName("Actor ID")
+      .setDesc("Stable per-installation identifier used for CRDT authorship.")
+      .addText((text) => {
+        text
+          .setPlaceholder("(minted on first connect)")
+          .setValue(this.plugin.settings.actorId ?? "")
+          .setDisabled(true);
+      });
   }
 }
