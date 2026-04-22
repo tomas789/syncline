@@ -1,0 +1,137 @@
+name: prerelease
+
+# Per docs/RELEASE_PLAN.md §4a: alphas and betas are tagged manually on
+# release/v1 and skip release-please (which is wired to main only). This
+# workflow turns that tag into a published GitHub pre-release with all
+# three platform binaries plus the Obsidian plugin assets.
+on:
+  push:
+    tags:
+      - '*-alpha.*'
+      - '*-beta.*'
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: ${{ matrix.binary_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            binary_name: syncline-linux-amd64
+            artifact_path: target/release/syncline
+          - platform: macos-latest
+            binary_name: syncline-macos-arm64
+            artifact_path: target/release/syncline
+          - platform: windows-latest
+            binary_name: syncline-windows-amd64.exe
+            artifact_path: target/release/syncline.exe
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build syncline binary
+        run: cargo build --release -p syncline
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp '${{ matrix.artifact_path }}' 'artifacts/${{ matrix.binary_name }}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary_name }}
+          path: artifacts/${{ matrix.binary_name }}
+          if-no-files-found: error
+
+  plugin:
+    name: Obsidian plugin assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build plugin
+        run: |
+          cd obsidian-plugin
+          npm ci
+          npm run build
+
+      - name: Stage plugin assets
+        # Ship obsidian-plugin/manifest.json (id=syncline-obsidian), not the
+        # repo-root manifest.json (id=syncline). The plugin code stores its
+        # state at .obsidian/plugins/syncline-obsidian/, so BRAT must use
+        # the matching id or the plugin can't find its own data.
+        run: |
+          mkdir -p artifacts
+          cp obsidian-plugin/main.js artifacts/main.js
+          cp obsidian-plugin/manifest.json artifacts/manifest.json
+          cp obsidian-plugin/styles.css artifacts/styles.css
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: Publish pre-release
+    needs: [binaries, plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Sanity-check tag matches manifest
+        # Catches "you tagged 1.0.0-alpha.2 but forgot to bump
+        # obsidian-plugin/manifest.json" before BRAT users see it.
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          mv=$(node -p "require('./artifacts/manifest.json').version")
+          if [ "$tag" != "$mv" ]; then
+            echo "::error::tag '$tag' != manifest.json version '$mv'"
+            exit 1
+          fi
+
+      - name: Create / update GitHub pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # If this workflow is re-run on the same tag, append assets to
+          # the existing release rather than failing.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            # GITHUB_REF_NAME is the tag (not the branch) on a tag push,
+            # so pin --target to the commit SHA the tag resolves to.
+            gh release create "$tag" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --notes "Pre-release built from tag \`$tag\`. See docs/RELEASE_PLAN.md for installation guidance." \
+              artifacts/*
+          fi
