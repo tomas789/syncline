@@ -16,7 +16,7 @@ describe('Syncline v1 E2E', () => {
     async function waitFor<T>(
         label: string,
         fn: () => Promise<T | null | undefined | false | ''>,
-        timeoutMs = 20000,
+        timeoutMs = 40000,
         stepMs = 500
     ): Promise<T> {
         const deadline = Date.now() + timeoutMs;
@@ -82,30 +82,45 @@ describe('Syncline v1 E2E', () => {
         if (fs.existsSync(folderPath)) fs.rmSync(folderPath, { recursive: true, force: true });
         fs.mkdirSync(folderPath, { recursive: true });
 
-        // Start server.
+        // Start server. Buffer stderr so we can wait for the listen line.
+        let serverStderr = '';
         serverProc = spawn(
             'cargo',
             ['run', '--bin', 'syncline', '--', 'server', '--port', String(port), '--db-path', dbPath],
             { cwd: repoRoot, stdio: 'pipe' }
         );
-        serverProc.stdout?.on('data', (d) => console.log('SERVER: ' + d));
-        serverProc.stderr?.on('data', (d) => console.error('SERVER ERR: ' + d));
+        serverProc.stdout?.on('data', (d) => {
+            serverStderr += String(d);
+            console.log('SERVER: ' + d);
+        });
+        serverProc.stderr?.on('data', (d) => {
+            serverStderr += String(d);
+            console.error('SERVER ERR: ' + d);
+        });
 
-        await browser.pause(2000);
+        // Wait for the server to actually be listening before starting the CLI.
+        // `cargo run` on a cold cache can take 20–40s just to relink.
+        await waitFor('server listening', async () => /listening/i.test(serverStderr), 60000);
 
         // Start the native CLI client (v1 via client_v1::run_client).
+        let cliStderr = '';
         cliProc = spawn(
             'cargo',
             ['run', '--bin', 'syncline', '--', 'sync', '-f', folderPath, '-u', serverUrl],
             { cwd: repoRoot, stdio: 'pipe' }
         );
-        cliProc.stdout?.on('data', (d) => console.log('CLI: ' + d));
-        cliProc.stderr?.on('data', (d) => console.error('CLI ERR: ' + d));
+        cliProc.stdout?.on('data', (d) => {
+            cliStderr += String(d);
+            console.log('CLI: ' + d);
+        });
+        cliProc.stderr?.on('data', (d) => {
+            cliStderr += String(d);
+            console.error('CLI ERR: ' + d);
+        });
 
-        await browser.pause(2000);
-
-        // Let Obsidian fully initialise.
-        await browser.pause(5000);
+        // Wait for the CLI to complete its WS handshake with the server.
+        // Without this we race the first-test writes before sync is live.
+        await waitFor('CLI handshake', async () => /v1 handshake OK/.test(cliStderr), 60000);
 
         const obsidianPage = browser.getObsidianPage();
         try {
@@ -124,8 +139,13 @@ describe('Syncline v1 E2E', () => {
             await plugin.connect();
         }, serverUrl);
 
-        // Small settle window so the WS handshake completes.
-        await browser.pause(2000);
+        // Wait for the plugin's WS client to report isConnected=true.
+        await waitFor('plugin connected', async () => {
+            return browser.executeObsidian(async ({ app }) => {
+                const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+                return !!(plugin && plugin.client && plugin.client.isConnected());
+            });
+        }, 30000);
     });
 
     after(() => {
