@@ -28,6 +28,9 @@ export const config = {
     reporters: ['spec'],
     mochaOpts: {
         ui: 'bdd',
-        timeout: 60000
+        // Tests that wait for cross-process sync (server ↔ CLI ↔ plugin)
+        // need headroom on cold CI runners where the first text-file
+        // round-trip through the v1 content-subdoc path is slow.
+        timeout: 180000
     },
 };
