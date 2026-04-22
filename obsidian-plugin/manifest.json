@@ -1,7 +1,7 @@
 {
   "id": "syncline-obsidian",
   "name": "Syncline",
-  "version": "0.6.0",
+  "version": "1.0.0-alpha.1",
   "minAppVersion": "0.15.0",
   "description": "Syncline sync plugin for Obsidian",
   "author": "Tomas Krejci",
