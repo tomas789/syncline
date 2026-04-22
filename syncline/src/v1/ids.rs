@@ -193,6 +193,7 @@ mod tests {
         assert_eq!(NodeId::parse_str(&s), Some(id));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn uuidv7_sorts_temporally() {
         let a = NodeId::new();

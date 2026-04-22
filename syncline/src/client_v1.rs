@@ -33,7 +33,8 @@ use crate::protocol::{
     V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
 use crate::client::watcher::DebouncedWatcher;
-use crate::v1::blob_store::{BlobStore, hash_hex};
+use crate::v1::blob_store::BlobStore;
+use crate::v1::hash::hash_hex;
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
 use crate::v1::ids::{ActorId, Lamport, NodeId};
 use crate::v1::manifest::{Manifest, NodeKind};

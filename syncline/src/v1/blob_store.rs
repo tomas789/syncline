@@ -10,8 +10,8 @@
 //! expected hash on `insert_verified`, so a peer pushing us a corrupted blob
 //! can't poison the store.
 
+use super::hash::hash_hex;
 use anyhow::{Context, Result, anyhow, bail};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -119,11 +119,6 @@ impl BlobStore {
         })?;
         Ok(())
     }
-}
-
-/// Hash `bytes` and return the 64-char lowercase hex digest.
-pub fn hash_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Return `Ok(())` iff `s` is exactly 64 lowercase-hex characters.
