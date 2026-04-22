@@ -5237,6 +5237,7 @@ dependencies = [
  "futures",
  "futures-util",
  "gethostname",
+ "getrandom 0.2.17",
  "headers",
  "imara-diff",
  "js-sys",
