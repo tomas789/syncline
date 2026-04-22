@@ -826,14 +826,6 @@ async fn scan_once(
         .filter(|(path, _)| !visited_rel.contains(path.as_str()))
         .map(|(path, entry)| (entry.id, entry.kind, entry.blob_hash.clone(), path.clone()))
         .collect();
-    if !deletion_candidates.is_empty() {
-        info!(
-            candidates = deletion_candidates.len(),
-            visited = visited_rel.len(),
-            projected = proj.by_path.len(),
-            "scan_once: deletion candidates found"
-        );
-    }
     for (id, kind, blob_hash, path) in deletion_candidates {
         match kind {
             NodeKind::Text => {
@@ -842,10 +834,8 @@ async fn scan_once(
                 // (i.e. have a persisted subdoc). Otherwise this is a
                 // remote-only entry we have yet to materialise, not a
                 // user-driven deletion.
-                let has_p = content.has_persisted(id);
-                let deleted = has_p && manifest.delete(id);
-                info!(node = ?id, %path, has_persisted = has_p, deleted, "scan_once: text delete check");
-                if deleted {
+                if content.has_persisted(id) && manifest.delete(id) {
+                    debug!(node = ?id, %path, "local text delete detected");
                     deleted_files += 1;
                 }
             }
