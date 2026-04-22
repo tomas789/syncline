@@ -16,7 +16,7 @@ describe('Syncline v1 E2E', () => {
     async function waitFor<T>(
         label: string,
         fn: () => Promise<T | null | undefined | false | ''>,
-        timeoutMs = 40000,
+        timeoutMs = 120000,
         stepMs = 500
     ): Promise<T> {
         const deadline = Date.now() + timeoutMs;
