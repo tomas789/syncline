@@ -145,7 +145,18 @@ export default class SynclinePlugin extends Plugin {
   syncStatus: SyncStatus = "disconnected";
 
   client: SynclineV1Client | null = null;
-  ignoreChanges: Set<string> = new Set();
+  /**
+   * Per-event-kind suppression of vault echoes that follow our own writes.
+   * Keyed by event type ("modify"|"create"|"delete"|"rename") then path.
+   * Suppressing a `modify` echo on `foo.md` must not suppress a later
+   * `rename` of the same path, so the kinds are tracked separately.
+   */
+  ignoreEvents: { modify: Set<string>; create: Set<string>; delete: Set<string>; rename: Set<string> } = {
+    modify: new Set(),
+    create: new Set(),
+    delete: new Set(),
+    rename: new Set(),
+  };
 
   /** Last projection we reconciled against — keyed by path. */
   lastProjection: Map<string, ProjectionRow> = new Map();
@@ -388,12 +399,18 @@ export default class SynclinePlugin extends Plugin {
         this.client.initManifest();
       }
 
+      // The WASM observer fires synchronously while it still holds a
+      // mutable borrow on the manifest RefCell. If we run reconcile
+      // here, its synchronous `projectionJson()` re-enters the same
+      // RefCell and the borrow check panic surfaces as a silent
+      // exception, leaving `lastProjection` empty. Defer to a microtask
+      // so the borrow is released before we read.
       this.client.onManifestChanged(() => {
         this.persistManifestDebounced();
-        void this.reconcileProjection();
+        Promise.resolve().then(() => this.reconcileProjection());
       });
       this.client.onContentChanged((nodeId) => {
-        void this.onContentChanged(nodeId);
+        Promise.resolve().then(() => this.onContentChanged(nodeId));
       });
       this.client.onBlob((hash, bytes) => {
         void this.onBlobReceived(hash, bytes);
@@ -441,7 +458,7 @@ export default class SynclinePlugin extends Plugin {
       this.client.free();
       this.client = null;
     }
-    this.ignoreChanges.clear();
+    for (const k of Object.values(this.ignoreEvents)) k.clear();
     this.lastProjection.clear();
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
@@ -582,12 +599,12 @@ export default class SynclinePlugin extends Plugin {
           // subdoc subscription can write content into it on first sync.
           try {
             await this.ensureParentFolders(row.path);
-            this.ignoreChanges.add(row.path);
+            this.ignoreEvents.create.add(row.path);
             await this.app.vault.create(row.path, "");
           } catch (e) {
             console.error(`[Syncline] create placeholder ${row.path}:`, e);
           } finally {
-            setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+            setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
           }
         }
         if (!this.subscribedContent.has(row.id)) {
@@ -606,13 +623,13 @@ export default class SynclinePlugin extends Plugin {
   private async removeLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
-    this.ignoreChanges.add(path);
+    this.ignoreEvents.delete.add(path);
     try {
       await this.app.fileManager.trashFile(file);
     } catch (e) {
       console.error(`[Syncline] trash ${path}:`, e);
     } finally {
-      setTimeout(() => this.ignoreChanges.delete(path), IGNORE_CHANGES_TIMEOUT_MS);
+      setTimeout(() => this.ignoreEvents.delete.delete(path), IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
 
@@ -621,15 +638,15 @@ export default class SynclinePlugin extends Plugin {
     if (!(file instanceof TFile)) return;
     try {
       await this.ensureParentFolders(to);
-      this.ignoreChanges.add(from);
-      this.ignoreChanges.add(to);
+      this.ignoreEvents.rename.add(from);
+      this.ignoreEvents.rename.add(to);
       await this.app.fileManager.renameFile(file, to);
     } catch (e) {
       console.error(`[Syncline] rename ${from} → ${to}:`, e);
     } finally {
       setTimeout(() => {
-        this.ignoreChanges.delete(from);
-        this.ignoreChanges.delete(to);
+        this.ignoreEvents.rename.delete(from);
+        this.ignoreEvents.rename.delete(to);
       }, IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
@@ -696,22 +713,22 @@ export default class SynclinePlugin extends Plugin {
       try {
         const current = await this.app.vault.read(file);
         if (current === text) return;
-        this.ignoreChanges.add(row.path);
+        this.ignoreEvents.modify.add(row.path);
         await this.app.vault.modify(file, text);
       } catch (e) {
         console.error(`[Syncline] modify ${row.path}:`, e);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+        setTimeout(() => this.ignoreEvents.modify.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     } else {
       try {
         await this.ensureParentFolders(row.path);
-        this.ignoreChanges.add(row.path);
+        this.ignoreEvents.create.add(row.path);
         await this.app.vault.create(row.path, text);
       } catch (e) {
         console.error(`[Syncline] create ${row.path}:`, e);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+        setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -768,7 +785,8 @@ export default class SynclinePlugin extends Plugin {
         bytes.byteOffset + bytes.byteLength,
       ) as ArrayBuffer;
       const file = this.app.vault.getAbstractFileByPath(row.path);
-      this.ignoreChanges.add(row.path);
+      const kind: 'modify' | 'create' = file instanceof TFile ? 'modify' : 'create';
+      this.ignoreEvents[kind].add(row.path);
       try {
         if (file instanceof TFile) {
           await this.app.vault.modifyBinary(file, buffer);
@@ -779,7 +797,7 @@ export default class SynclinePlugin extends Plugin {
       } catch (e) {
         console.error(`[Syncline] write blob → ${row.path}:`, e);
       } finally {
-        setTimeout(() => this.ignoreChanges.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+        setTimeout(() => this.ignoreEvents[kind].delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -790,7 +808,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreChanges.has(file.path)) return;
+    if (this.ignoreEvents.modify.has(file.path)) return;
     if (!this.client) return;
 
     const row = this.lastProjection.get(file.path);
@@ -803,7 +821,7 @@ export default class SynclinePlugin extends Plugin {
     if (row.kind === "text") {
       try {
         const content = await this.app.vault.read(file);
-        if (this.ignoreChanges.has(file.path)) return;
+        if (this.ignoreEvents.modify.has(file.path)) return;
         const crdtContent = this.client.getContentText(row.id) ?? "";
         if (crdtContent === content) return;
         this.client.updateContentText(row.id, content);
@@ -815,7 +833,7 @@ export default class SynclinePlugin extends Plugin {
     } else if (row.kind === "binary") {
       try {
         const data = await this.app.vault.readBinary(file);
-        if (this.ignoreChanges.has(file.path)) return;
+        if (this.ignoreEvents.modify.has(file.path)) return;
         const hash = await sha256Hex(data);
         if (row.blob_hash === hash) return;
         this.client.sendBlob(new Uint8Array(data));
@@ -828,7 +846,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreChanges.has(file.path)) return;
+    if (this.ignoreEvents.create.has(file.path)) return;
     void this.ingestNewFile(file);
   };
 
@@ -861,7 +879,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreChanges.has(file.path)) return;
+    if (this.ignoreEvents.delete.has(file.path)) return;
     if (!this.client) return;
     const row = this.lastProjection.get(file.path);
     if (!row) return;
@@ -876,7 +894,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileRename = (file: TAbstractFile, oldPath: string) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreChanges.has(oldPath) || this.ignoreChanges.has(file.path)) return;
+    if (this.ignoreEvents.rename.has(oldPath) || this.ignoreEvents.rename.has(file.path)) return;
     if (!this.client) return;
     const row = this.lastProjection.get(oldPath);
     if (row) {

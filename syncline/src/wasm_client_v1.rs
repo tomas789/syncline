@@ -142,9 +142,12 @@ impl SynclineV1Client {
 
     /// Rehydrate the manifest from a persisted Yrs update. `lamport`
     /// is the last-observed counter from `.syncline/lamport`.
+    /// `lamport` is taken as `f64` so it can be passed as a plain JS Number
+    /// (wasm-bindgen marshals `u64` as BigInt, which the plugin's persisted
+    /// counter is not). Lamport stamps in practice stay well below 2^53.
     #[wasm_bindgen(js_name = loadManifestState)]
-    pub fn load_manifest_state(&self, state: &[u8], lamport: u64) -> Result<(), JsValue> {
-        let manifest = Manifest::from_update(self.actor, Lamport(lamport), state)
+    pub fn load_manifest_state(&self, state: &[u8], lamport: f64) -> Result<(), JsValue> {
+        let manifest = Manifest::from_update(self.actor, Lamport(lamport as u64), state)
             .map_err(|e| JsValue::from_str(&format!("load_manifest_state: {e}")))?;
         self.install_manifest_observer(&manifest);
         *self.manifest.borrow_mut() = Some(manifest);
@@ -159,13 +162,15 @@ impl SynclineV1Client {
         }
     }
 
+    /// Returned as `f64` so the JS side gets a plain Number — same reasoning
+    /// as `loadManifestState`'s `lamport` arg.
     #[wasm_bindgen(js_name = lamport)]
-    pub fn lamport_value(&self) -> u64 {
+    pub fn lamport_value(&self) -> f64 {
         self.manifest
             .borrow()
             .as_ref()
-            .map(|m| m.lamport().get())
-            .unwrap_or(0)
+            .map(|m| m.lamport().get() as f64)
+            .unwrap_or(0.0)
     }
 
     fn install_manifest_observer(&self, manifest: &Manifest) {
@@ -312,10 +317,13 @@ impl SynclineV1Client {
     // Manifest ops (path-level)
     // ---------------------------------------------------------------
 
+    // Size args are exposed as `f64` for the same reason as `lamport` —
+    // wasm-bindgen renders `u64` as JS BigInt, but the plugin always has
+    // these as plain Numbers (TextEncoder.encode().byteLength, file.stat.size).
     #[wasm_bindgen(js_name = createText)]
-    pub fn create_text(&self, path: String, size: u64) -> Result<String, JsValue> {
+    pub fn create_text(&self, path: String, size: f64) -> Result<String, JsValue> {
         with_manifest_mut(&self.manifest, |m| {
-            ops::create_text(m, &path, size)
+            ops::create_text(m, &path, size as u64)
                 .map(|id| id.to_string_hyphenated())
                 .map_err(to_js)
         })
@@ -325,10 +333,10 @@ impl SynclineV1Client {
     pub fn create_text_allowing_collision(
         &self,
         path: String,
-        size: u64,
+        size: f64,
     ) -> Result<String, JsValue> {
         with_manifest_mut(&self.manifest, |m| {
-            ops::create_text_allowing_collision(m, &path, size)
+            ops::create_text_allowing_collision(m, &path, size as u64)
                 .map(|id| id.to_string_hyphenated())
                 .map_err(to_js)
         })
@@ -339,10 +347,10 @@ impl SynclineV1Client {
         &self,
         path: String,
         blob_hash_hex: String,
-        size: u64,
+        size: f64,
     ) -> Result<String, JsValue> {
         with_manifest_mut(&self.manifest, |m| {
-            ops::create_binary(m, &path, &blob_hash_hex, size)
+            ops::create_binary(m, &path, &blob_hash_hex, size as u64)
                 .map(|id| id.to_string_hyphenated())
                 .map_err(to_js)
         })
@@ -368,10 +376,10 @@ impl SynclineV1Client {
         &self,
         path: String,
         blob_hash_hex: String,
-        size: u64,
+        size: f64,
     ) -> Result<(), JsValue> {
         with_manifest_mut(&self.manifest, |m| {
-            ops::record_modify_binary(m, &path, &blob_hash_hex, size).map_err(to_js)
+            ops::record_modify_binary(m, &path, &blob_hash_hex, size as u64).map_err(to_js)
         })
     }
 
@@ -526,12 +534,12 @@ impl SynclineV1Client {
         let node_id = NodeId::parse_str(&node_id_hex)?;
         let content = self.content.borrow();
         let cd = content.get(&node_id)?;
-        let text = cd.doc.get_or_insert_text("content");
+        let text = cd.doc.get_or_insert_text("text");
         let txn = cd.doc.transact();
         Some(text.get_string(&txn))
     }
 
-    /// Diff-apply `new_content` into the subdoc's `content` Y.Text.
+    /// Diff-apply `new_content` into the subdoc's `text` Y.Text.
     #[wasm_bindgen(js_name = updateContentText)]
     pub fn update_content_text(&self, node_id_hex: String, new_content: String) {
         let Some(node_id) = NodeId::parse_str(&node_id_hex) else {
@@ -541,7 +549,7 @@ impl SynclineV1Client {
         let Some(cd) = content.get(&node_id) else {
             return;
         };
-        let text = cd.doc.get_or_insert_text("content");
+        let text = cd.doc.get_or_insert_text("text");
         let mut txn = cd.doc.transact_mut();
         let current = text.get_string(&txn);
         if current == new_content {
