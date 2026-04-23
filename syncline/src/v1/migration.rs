@@ -57,6 +57,15 @@ pub fn migrate_v0_vault(vault_root: &Path, actor: ActorId) -> Result<Migration> 
     // the same directory NodeId across all files that live under it.
     let mut dir_nodes: HashMap<String, NodeId> = HashMap::new();
 
+    // Pass 1: read every snapshot, drop ghosts, bucket the survivors by
+    // their `meta.path`. v0 occasionally produced multiple non-tombstoned
+    // snapshots for the same path (rename/recreate cycles, mid-sync
+    // divergence). If we just create one v1 node per snapshot, the
+    // projection collapses them into same-path collisions and the disk
+    // ends up flooded with `.conflict-…` siblings the user never authored
+    // — see post-mortem in docs (the alpha.1 → alpha.2 incident).
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, Vec<V0Snapshot>> = BTreeMap::new();
     let snapshots = collect_snapshot_paths(&data_dir)?;
     for snap in snapshots {
         match read_snapshot(&snap) {
@@ -84,42 +93,7 @@ pub fn migrate_v0_vault(vault_root: &Path, actor: ActorId) -> Result<Migration> 
                     continue;
                 }
 
-                let parent = ensure_parent_chain(
-                    &mut manifest,
-                    &mut dir_nodes,
-                    &v0.rel_path,
-                );
-
-                let leaf_name = leaf_segment(&v0.rel_path).to_string();
-                let size = match v0.kind {
-                    NodeKind::Text => v0.content.as_ref().map(|s| s.len()).unwrap_or(0) as u64,
-                    NodeKind::Binary => 0,
-                    NodeKind::Directory => 0,
-                };
-
-                let node_id = manifest.create_node(
-                    &leaf_name,
-                    parent,
-                    v0.kind,
-                    v0.blob_hash.as_deref(),
-                    size,
-                );
-
-                match v0.kind {
-                    NodeKind::Text => {
-                        if let Some(body) = v0.content {
-                            text_contents.insert(node_id, body);
-                        }
-                    }
-                    NodeKind::Binary => {
-                        if let Some(h) = v0.blob_hash {
-                            binary_hashes.insert(node_id, h);
-                        }
-                    }
-                    NodeKind::Directory => {
-                        // v0 had no directory docs — unreachable here.
-                    }
-                }
+                by_path.entry(v0.rel_path.clone()).or_default().push(v0);
             }
             Ok(None) => {
                 warnings.push(format!(
@@ -133,6 +107,59 @@ pub fn migrate_v0_vault(vault_root: &Path, actor: ActorId) -> Result<Migration> 
                     snap.display(),
                     e
                 ));
+            }
+        }
+    }
+
+    // Pass 2: dedupe each bucket and create exactly one v1 node per path.
+    // Tiebreak rule: longest content wins (fewer edits get clobbered),
+    // then content lexicographic order so the result is deterministic
+    // across runs and across machines that migrate the same v0 dataset.
+    // Discarded duplicates surface as warnings — caller can inspect
+    // `.syncline.v0.bak/` if they need to recover one manually.
+    for (rel_path, mut snaps) in by_path {
+        if snaps.len() > 1 {
+            snaps.sort_by(|a, b| {
+                let asize = a.content.as_ref().map(|s| s.len()).unwrap_or(0);
+                let bsize = b.content.as_ref().map(|s| s.len()).unwrap_or(0);
+                bsize.cmp(&asize).then_with(|| a.content.cmp(&b.content))
+            });
+            let kept_size = snaps[0].content.as_ref().map(|s| s.len()).unwrap_or(0);
+            for dropped in &snaps[1..] {
+                let dsize = dropped.content.as_ref().map(|s| s.len()).unwrap_or(0);
+                warnings.push(format!(
+                    "v0 had multiple live snapshots for {:?}; kept {} bytes, discarded {} bytes",
+                    rel_path, kept_size, dsize
+                ));
+            }
+            snaps.truncate(1);
+        }
+        let v0 = snaps.into_iter().next().expect("non-empty after dedup");
+
+        let parent = ensure_parent_chain(&mut manifest, &mut dir_nodes, &rel_path);
+        let leaf_name = leaf_segment(&rel_path).to_string();
+        let size = match v0.kind {
+            NodeKind::Text => v0.content.as_ref().map(|s| s.len()).unwrap_or(0) as u64,
+            NodeKind::Binary => 0,
+            NodeKind::Directory => 0,
+        };
+
+        let node_id =
+            manifest.create_node(&leaf_name, parent, v0.kind, v0.blob_hash.as_deref(), size);
+
+        match v0.kind {
+            NodeKind::Text => {
+                if let Some(body) = v0.content {
+                    text_contents.insert(node_id, body);
+                }
+            }
+            NodeKind::Binary => {
+                if let Some(h) = v0.blob_hash {
+                    binary_hashes.insert(node_id, h);
+                }
+            }
+            NodeKind::Directory => {
+                // v0 had no directory docs — unreachable here.
             }
         }
     }
@@ -457,5 +484,72 @@ mod tests {
 
         let p = project(&m.manifest);
         assert_eq!(p.len(), 10);
+    }
+
+    #[test]
+    fn migrate_collapses_duplicate_path_snapshots() {
+        // v0 occasionally left multiple non-tombstoned snapshots for the
+        // same `meta.path` (rename/recreate cycles, mid-sync divergence).
+        // Without dedup the projection collapses them into same-path
+        // collisions and the disk gets flooded with `.conflict-…` files
+        // — alpha.1 → alpha.2 incident. One node per path is the
+        // invariant.
+        let vault = TempDir::new().unwrap();
+        let data = vault.path().join(".syncline/data");
+        make_v0_snapshot(&data, "Knápek.md", "text", Some("short"), None);
+        make_v0_snapshot(&data, "Knápek.md", "text", Some("longer body here"), None);
+        make_v0_snapshot(&data, "Knápek.md", "text", Some("middle"), None);
+
+        let m = migrate_v0_vault(vault.path(), ActorId::new()).unwrap();
+        let p = project(&m.manifest);
+
+        // Exactly one node, exactly one path — no conflict suffixes.
+        let live_text = m
+            .manifest
+            .live_entries()
+            .iter()
+            .filter(|e| e.kind == NodeKind::Text)
+            .count();
+        assert_eq!(live_text, 1, "duplicates must collapse to one node");
+        assert_eq!(p.by_path.len(), 1);
+        assert!(p.by_path.contains_key("Knápek.md"));
+        assert!(
+            p.by_path.values().all(|e| !e.is_conflict_copy),
+            "no projection collisions"
+        );
+
+        // Tiebreak: longest content wins.
+        let id = p.by_path["Knápek.md"].id;
+        assert_eq!(
+            m.text_contents.get(&id).map(String::as_str),
+            Some("longer body here")
+        );
+
+        // The two discarded siblings get a warning each.
+        let dropped = m
+            .warnings
+            .iter()
+            .filter(|w| w.contains("multiple live snapshots") && w.contains("Knápek.md"))
+            .count();
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn migrate_dedup_prefers_nonempty_over_empty() {
+        // The "empty content = ghost-deleted" filter runs first, so an
+        // empty snapshot never reaches the dedup bucket. But if v0 had
+        // both a non-empty snapshot and a same-path placeholder with
+        // *whitespace-only* content, dedup must still pick the
+        // longer/non-trivial one.
+        let vault = TempDir::new().unwrap();
+        let data = vault.path().join(".syncline/data");
+        make_v0_snapshot(&data, "x.md", "text", Some(" "), None);
+        make_v0_snapshot(&data, "x.md", "text", Some("real content"), None);
+
+        let m = migrate_v0_vault(vault.path(), ActorId::new()).unwrap();
+        let p = project(&m.manifest);
+        assert_eq!(p.by_path.len(), 1);
+        let id = p.by_path["x.md"].id;
+        assert_eq!(m.text_contents.get(&id).map(String::as_str), Some("real content"));
     }
 }

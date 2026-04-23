@@ -322,9 +322,16 @@ async fn run_session(
     // DEBOUNCE_MS before triggering a scan. The 5 s polling timer above
     // stays in place as a fallback for platforms where notify is unreliable
     // (network mounts, some VM filesystems, fsevents quirks).
+    // Capacity sized for first-sync bursts: materialising a few thousand
+    // placeholders generates many DebouncedEvent batches in a few hundred
+    // ms. With the original 16-slot buffer the debouncer's `try_send`
+    // failed almost immediately ("Channel full, dropped event"), and a
+    // user-edit batch could end up in one of the dropped frames. The
+    // periodic 5 s scan recovers eventually but the latency on real
+    // edits is bad. 1024 covers any realistic burst.
     let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<
         std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>,
-    >(16);
+    >(1024);
     let mut watcher = match DebouncedWatcher::new(watcher_tx, Duration::from_millis(DEBOUNCE_MS)) {
         Ok(w) => Some(w),
         Err(e) => {
