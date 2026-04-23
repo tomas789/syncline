@@ -576,8 +576,20 @@ export default class SynclinePlugin extends Plugin {
       byId.set(row.id, row);
     }
 
+    // Snapshot the previous map and publish the new one *before* any
+    // disk writes. Critical: without this, the placeholder writes below
+    // fire vault.create+vault.modify events whose handlers consult
+    // `this.lastProjection` to decide adopt-vs-ingest. If lastProjection
+    // is still the *old* (empty, on first sync) map, those handlers fall
+    // through to `ingestNewFile`, which mints a fresh client-actor
+    // NodeId at the same path → projection-level collision → cascading
+    // `.conflict-…` siblings on every peer. See post-mortem in the
+    // alpha.1 incident notes.
+    const previousProjection = this.lastProjection;
+    this.lastProjection = byPath;
+
     // --- Removals: paths that were in the prior projection but aren't now ---
-    for (const [path, prev] of this.lastProjection) {
+    for (const [path, prev] of previousProjection) {
       if (!byId.has(prev.id)) {
         await this.removeLocalFile(path);
         this.subscribedContent.delete(prev.id);
@@ -597,14 +609,22 @@ export default class SynclinePlugin extends Plugin {
         if (!(existing instanceof TFile)) {
           // File doesn't exist on disk yet — create placeholder so the
           // subdoc subscription can write content into it on first sync.
+          // Suppress *both* create and modify echoes: vault.create with
+          // any content (even "") fires both events on most platforms,
+          // and a missed modify-suppression here is exactly how the
+          // alpha.1 cascade started.
           try {
             await this.ensureParentFolders(row.path);
             this.ignoreEvents.create.add(row.path);
+            this.ignoreEvents.modify.add(row.path);
             await this.app.vault.create(row.path, "");
           } catch (e) {
             console.error(`[Syncline] create placeholder ${row.path}:`, e);
           } finally {
-            setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+            setTimeout(() => {
+              this.ignoreEvents.create.delete(row.path);
+              this.ignoreEvents.modify.delete(row.path);
+            }, IGNORE_CHANGES_TIMEOUT_MS);
           }
         }
         if (!this.subscribedContent.has(row.id)) {
@@ -616,8 +636,6 @@ export default class SynclinePlugin extends Plugin {
         }
       }
     }
-
-    this.lastProjection = byPath;
   }
 
   private async removeLocalFile(path: string): Promise<void> {
@@ -723,12 +741,18 @@ export default class SynclinePlugin extends Plugin {
     } else {
       try {
         await this.ensureParentFolders(row.path);
+        // Suppress *both* events: vault.create with non-empty content
+        // fires create + modify on most platforms.
         this.ignoreEvents.create.add(row.path);
+        this.ignoreEvents.modify.add(row.path);
         await this.app.vault.create(row.path, text);
       } catch (e) {
         console.error(`[Syncline] create ${row.path}:`, e);
       } finally {
-        setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
+        setTimeout(() => {
+          this.ignoreEvents.create.delete(row.path);
+          this.ignoreEvents.modify.delete(row.path);
+        }, IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -809,11 +833,26 @@ export default class SynclinePlugin extends Plugin {
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (this.ignoreEvents.modify.has(file.path)) return;
+    // Belt-and-braces: if the file was just created (placeholder write
+    // or our own remote-driven create), suppress the modify echo too.
+    // Obsidian fires modify on vault.create on most platforms, and a
+    // missed suppression here is what triggered the alpha.1 cascade.
+    if (this.ignoreEvents.create.has(file.path)) return;
     if (!this.client) return;
 
-    const row = this.lastProjection.get(file.path);
+    let row = this.lastProjection.get(file.path);
     if (!row) {
-      // Not yet in the projection — treat as a create event.
+      // lastProjection might be stale — e.g. we're in the middle of a
+      // reconcile that hasn't republished it yet. Re-check the live
+      // projection before falling through to ingestNewFile, which would
+      // mint a fresh client-actor NodeId at this path. If the live
+      // projection already covers the path, defer; the next
+      // modify/create event after reconcile completes will adopt
+      // cleanly.
+      const live = this.readProjection().find((r) => r.path === file.path);
+      if (live) {
+        return;
+      }
       void this.ingestNewFile(file);
       return;
     }
@@ -847,6 +886,12 @@ export default class SynclinePlugin extends Plugin {
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
     if (this.ignoreEvents.create.has(file.path)) return;
+    // Live-projection guard: if the path is already known to the
+    // manifest, this is a remote-driven create we missed suppressing —
+    // not a user-created file. Don't mint a fresh NodeId.
+    if (this.client && this.readProjection().some((r) => r.path === file.path)) {
+      return;
+    }
     void this.ingestNewFile(file);
   };
 
