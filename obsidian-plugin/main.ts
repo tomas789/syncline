@@ -6,11 +6,13 @@ import {
   Notice,
   TFile,
   TAbstractFile,
+  WorkspaceLeaf,
   debounce,
 } from "obsidian";
 // @ts-ignore - rollup base64-inlines the .wasm binary at build time.
 import wasmBinary from "./wasm/syncline_bg.wasm";
 import * as wasmModule from "./wasm/syncline.js";
+import { SYNCLINE_VIEW_TYPE, SynclineStatusView } from "./status-view";
 
 // ---------------------------------------------------------------------------
 // Settings & persistence layout
@@ -21,15 +23,74 @@ interface SynclineSettings {
   autoSync: boolean;
   /** Stable per-installation ActorId (UUIDv4, hyphenated). Minted on first run. */
   actorId: string | null;
+  /** When true, the status view exposes raw CRDT counters and the full
+   * event ring; default UI stays compact. Off by default. */
+  debugMode: boolean;
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
   actorId: null,
+  debugMode: false,
 };
 
 type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
+
+// ---------------------------------------------------------------------------
+// Event log — bounded ring buffer of human-readable sync events, surfaced
+// by the status view. The plugin pushes from every observable boundary
+// (connect / disconnect / reconnect / status / manifest / content / blob /
+// local file events). Cap is generous because each event is small and
+// having >100 entries lets a developer scroll back through a problem.
+// ---------------------------------------------------------------------------
+
+export type SyncEventKind =
+  | "connect"
+  | "disconnect"
+  | "reconnect"
+  | "status"
+  | "error"
+  | "manifest"
+  | "content"
+  | "blob"
+  | "local-create"
+  | "local-modify"
+  | "local-delete"
+  | "local-rename"
+  | "info";
+
+export interface SyncEvent {
+  /** Unix epoch ms; rendered relative to "now" in the view. */
+  t: number;
+  kind: SyncEventKind;
+  message: string;
+}
+
+const EVENT_RING_SIZE = 500;
+
+class SyncEventLog {
+  private events: SyncEvent[] = [];
+
+  log(kind: SyncEventKind, message: string): void {
+    this.events.push({ t: Date.now(), kind, message });
+    if (this.events.length > EVENT_RING_SIZE) {
+      // Drop oldest. Slicing here is O(n) but n is bounded (≤ EVENT_RING_SIZE)
+      // and we only pay it when we'd otherwise grow past the cap, not on
+      // every push.
+      this.events = this.events.slice(-EVENT_RING_SIZE);
+    }
+  }
+
+  /** Most recent `n` events, newest first. */
+  recent(n: number): SyncEvent[] {
+    return this.events.slice(-n).reverse();
+  }
+
+  lastEventTime(): number | null {
+    return this.events.length === 0 ? null : this.events[this.events.length - 1].t;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // WASM binding shape (v1)
@@ -169,6 +230,9 @@ export default class SynclinePlugin extends Plugin {
   reconnectTimeout: number | null = null;
   reconnectAttempts = 0;
 
+  /** Bounded ring of human-readable sync events; rendered by the status view. */
+  syncEvents: SyncEventLog = new SyncEventLog();
+
   // ---------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------
@@ -178,14 +242,26 @@ export default class SynclinePlugin extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
+    // Status view (works on both desktop and mobile, unlike the status
+    // bar item below which only renders on desktop).
+    this.registerView(
+      SYNCLINE_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new SynclineStatusView(leaf, this),
+    );
+    this.addCommand({
+      id: "open-syncline-status",
+      name: "Open Syncline status",
+      callback: () => void this.activateStatusView(),
+    });
+
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("syncline-status-bar");
     this.statusIcon = this.statusBarItem.createDiv({ cls: "status-icon disconnected" });
     this.statusText = this.statusBarItem.createDiv({ text: "Syncline: disconnected" });
-    this.statusBarItem.onClickEvent(() => this.showStatusDetails());
+    this.statusBarItem.onClickEvent(() => void this.activateStatusView());
 
-    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline: disconnected", () =>
-      this.showStatusDetails(),
+    this.ribbonIconEl = this.addRibbonIcon("sync", "Syncline status", () =>
+      void this.activateStatusView(),
     );
     this.ribbonIconEl.addClass("syncline-ribbon", "disconnected");
 
@@ -349,22 +425,6 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  showStatusDetails() {
-    const count = this.lastProjection.size;
-    const status =
-      this.syncStatus === "synced"
-        ? `Connected (${count} file${count === 1 ? "" : "s"})`
-        : this.syncStatus === "syncing"
-          ? "Connecting…"
-          : this.syncStatus === "error"
-            ? "Connection error — click to reconnect"
-            : "Disconnected — click to connect";
-    new Notice(`Syncline: ${status}`);
-    if (this.syncStatus === "error" || this.syncStatus === "disconnected") {
-      void this.connect();
-    }
-  }
-
   // ---------------------------------------------------------------
   // Connection lifecycle
   // ---------------------------------------------------------------
@@ -377,6 +437,7 @@ export default class SynclinePlugin extends Plugin {
 
     try {
       this.updateStatus("syncing", "Syncline: connecting…");
+      this.syncEvents.log("connect", `Connecting to ${this.settings.serverUrl}`);
       console.debug("[Syncline] Connecting to:", this.settings.serverUrl);
 
       const wasmMod = await initWasm();
@@ -407,15 +468,40 @@ export default class SynclinePlugin extends Plugin {
       // so the borrow is released before we read.
       this.client.onManifestChanged(() => {
         this.persistManifestDebounced();
-        Promise.resolve().then(() => this.reconcileProjection());
+        Promise.resolve().then(() => {
+          // Capture the size before reconcile rewrites the map so the
+          // event message reflects the *delta* the manifest just learned
+          // about rather than the post-reconcile snapshot.
+          const before = this.lastProjection.size;
+          void this.reconcileProjection().then(() => {
+            const delta = this.lastProjection.size - before;
+            const sign = delta > 0 ? `+${delta}` : String(delta);
+            this.syncEvents.log(
+              "manifest",
+              `Manifest update applied (${sign}, now ${this.lastProjection.size} entries)`,
+            );
+          });
+        });
       });
       this.client.onContentChanged((nodeId) => {
-        Promise.resolve().then(() => this.onContentChanged(nodeId));
+        Promise.resolve().then(() => {
+          const row = this.findRowById(nodeId);
+          this.syncEvents.log(
+            "content",
+            `Content received: ${row?.path ?? nodeId.slice(0, 8) + "…"}`,
+          );
+          return this.onContentChanged(nodeId);
+        });
       });
       this.client.onBlob((hash, bytes) => {
+        this.syncEvents.log(
+          "blob",
+          `Blob received: ${bytes.length} bytes (${hash.slice(0, 8)}…)`,
+        );
         void this.onBlobReceived(hash, bytes);
       });
       this.client.onStatus((s) => {
+        this.syncEvents.log("status", `WS status: ${s}`);
         console.debug("[Syncline] status:", s);
       });
 
@@ -429,6 +515,8 @@ export default class SynclinePlugin extends Plugin {
 
       this.startStatusCheck();
     } catch (error) {
+      const msg = String((error as Error)?.message ?? error);
+      this.syncEvents.log("error", `Connection failed: ${msg}`);
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
       this.scheduleReconnect();
@@ -439,6 +527,10 @@ export default class SynclinePlugin extends Plugin {
     if (this.reconnectTimeout !== null) return;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
+    this.syncEvents.log(
+      "reconnect",
+      `Reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${this.reconnectAttempts})`,
+    );
     console.debug(`[Syncline] reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
     this.reconnectTimeout = window.setTimeout(() => {
       this.reconnectTimeout = null;
@@ -463,6 +555,7 @@ export default class SynclinePlugin extends Plugin {
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
     this.updateStatus("disconnected");
+    this.syncEvents.log("disconnect", "Disconnected");
   }
 
   startStatusCheck() {
@@ -507,6 +600,105 @@ export default class SynclinePlugin extends Plugin {
       window.clearInterval(this.statusCheckInterval);
       this.statusCheckInterval = null;
     }
+  }
+
+  // ---------------------------------------------------------------
+  // Status view helpers — surface human-friendly state for the
+  // SynclineStatusView ItemView. Methods are public because the view
+  // imports the plugin instance, not the other way round.
+  // ---------------------------------------------------------------
+
+  /** Headline for the status view. One short clause describing where we are. */
+  statusTitle(): string {
+    switch (this.syncStatus) {
+      case "synced":
+        return "All in sync";
+      case "syncing":
+        return "Syncing…";
+      case "error":
+        return "Sync error";
+      case "disconnected":
+        return this.reconnectTimeout !== null ? "Reconnecting…" : "Offline";
+    }
+  }
+
+  /** Smaller secondary line under the title. Counts + URL. */
+  statusSubtitle(): string {
+    const url = this.settings.serverUrl;
+    const count = this.lastProjection.size;
+    return `${count} file${count === 1 ? "" : "s"} • ${url}`;
+  }
+
+  /**
+   * Best-effort count of "things still in flight." We can't always know
+   * exactly (CRDT operations don't surface a write queue), so this is
+   * the count of subdocs we've subscribed to but whose content hasn't
+   * been persisted to disk yet — the loudest "pending" signal we have.
+   */
+  pendingCount(): number {
+    if (!this.client) return 0;
+    let pending = 0;
+    for (const id of this.subscribedContent) {
+      // No public API for "is this subdoc state persisted on disk?", but
+      // contentSnapshot returning empty bytes is a reliable proxy: a
+      // freshly-subscribed but never-applied subdoc has an empty state
+      // vector.
+      const snap = this.client.contentSnapshot(id);
+      if (!snap || snap.length === 0) pending += 1;
+    }
+    return pending;
+  }
+
+  /** Open the status view in the right sidebar (or focus an existing one). */
+  async activateStatusView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null =
+      workspace.getLeavesOfType(SYNCLINE_VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      if (!leaf) {
+        // No right sidebar (e.g. very narrow window) — fall back to a
+        // main-area leaf.
+        leaf = workspace.getLeaf(true);
+      }
+      await leaf.setViewState({ type: SYNCLINE_VIEW_TYPE, active: true });
+    }
+    workspace.revealLeaf(leaf);
+  }
+
+  /**
+   * Copy a diagnostics blob to the clipboard. JSON, pretty-printed,
+   * everything a bug report would need. Debug-only because it includes
+   * the actor id + server URL.
+   */
+  copyDiagnostics(): void {
+    const diag = {
+      timestamp: new Date().toISOString(),
+      version: "1.0.0-alpha.4", // bumped manually each release; not pulled from manifest because that requires a vault read
+      settings: {
+        serverUrl: this.settings.serverUrl,
+        autoSync: this.settings.autoSync,
+        actorId: this.settings.actorId,
+        debugMode: this.settings.debugMode,
+      },
+      runtime: {
+        syncStatus: this.syncStatus,
+        isConnected: this.client?.isConnected() ?? false,
+        actorId: this.client?.actorId() ?? null,
+        lamport: this.client?.lamport() ?? null,
+        projectionSize: this.lastProjection.size,
+        subscribedContent: this.subscribedContent.size,
+        requestedBlobs: this.requestedBlobs.size,
+        reconnectAttempts: this.reconnectAttempts,
+        pendingReconnect: this.reconnectTimeout !== null,
+      },
+      recentEvents: this.syncEvents.recent(100),
+    };
+    const text = JSON.stringify(diag, null, 2);
+    navigator.clipboard.writeText(text).then(
+      () => new Notice("Syncline diagnostics copied to clipboard"),
+      (e) => new Notice(`Clipboard write failed: ${String(e?.message ?? e)}`),
+    );
   }
 
   // ---------------------------------------------------------------
@@ -866,7 +1058,12 @@ export default class SynclinePlugin extends Plugin {
         this.client.updateContentText(row.id, content);
         this.client.recordModifyText(row.path);
         void this.persistContentState(row.id);
+        this.syncEvents.log("local-modify", `Local edit: ${file.path}`);
       } catch (e) {
+        this.syncEvents.log(
+          "error",
+          `onModify text ${file.path}: ${String((e as Error)?.message ?? e)}`,
+        );
         console.error(`[Syncline] onModify text ${file.path}:`, e);
       }
     } else if (row.kind === "binary") {
@@ -877,7 +1074,15 @@ export default class SynclinePlugin extends Plugin {
         if (row.blob_hash === hash) return;
         this.client.sendBlob(new Uint8Array(data));
         this.client.recordModifyBinary(row.path, hash, data.byteLength);
+        this.syncEvents.log(
+          "local-modify",
+          `Local edit (binary): ${file.path} (${data.byteLength} bytes)`,
+        );
       } catch (e) {
+        this.syncEvents.log(
+          "error",
+          `onModify binary ${file.path}: ${String((e as Error)?.message ?? e)}`,
+        );
         console.error(`[Syncline] onModify binary ${file.path}:`, e);
       }
     }
@@ -911,13 +1116,22 @@ export default class SynclinePlugin extends Plugin {
           nodeId = this.client.createTextAllowingCollision(file.path, size);
         }
         this.subscribeToContent(nodeId, content);
+        this.syncEvents.log("local-create", `Local create: ${file.path} (${size} bytes)`);
       } else {
         const data = await this.app.vault.readBinary(file);
         const hash = await sha256Hex(data);
         this.client.sendBlob(new Uint8Array(data));
         this.client.createBinary(file.path, hash, data.byteLength);
+        this.syncEvents.log(
+          "local-create",
+          `Local create (binary): ${file.path} (${data.byteLength} bytes)`,
+        );
       }
     } catch (e) {
+      this.syncEvents.log(
+        "error",
+        `Failed to ingest ${file.path}: ${String((e as Error)?.message ?? e)}`,
+      );
       console.error(`[Syncline] ingestNewFile ${file.path}:`, e);
     }
   }
@@ -932,7 +1146,12 @@ export default class SynclinePlugin extends Plugin {
       this.client.delete(file.path);
       this.subscribedContent.delete(row.id);
       void this.removeContentState(row.id);
+      this.syncEvents.log("local-delete", `Local delete: ${file.path}`);
     } catch (e) {
+      this.syncEvents.log(
+        "error",
+        `Delete failed for ${file.path}: ${String((e as Error)?.message ?? e)}`,
+      );
       console.error(`[Syncline] delete ${file.path}:`, e);
     }
   };
@@ -945,7 +1164,12 @@ export default class SynclinePlugin extends Plugin {
     if (row) {
       try {
         this.client.rename(oldPath, file.path);
+        this.syncEvents.log("local-rename", `Local rename: ${oldPath} → ${file.path}`);
       } catch (e) {
+        this.syncEvents.log(
+          "error",
+          `Rename failed ${oldPath} → ${file.path}: ${String((e as Error)?.message ?? e)}`,
+        );
         console.error(`[Syncline] rename ${oldPath} → ${file.path}:`, e);
       }
     } else {
@@ -1015,5 +1239,33 @@ class SynclineSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.actorId ?? "")
           .setDisabled(true);
       });
+
+    new Setting(containerEl).setName("Diagnostics").setHeading();
+
+    new Setting(containerEl)
+      .setName("Open status panel")
+      .setDesc(
+        "Open the Syncline status view in the right sidebar. Shows current " +
+          "sync state, recent activity, and (in debug mode) live CRDT counters.",
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Open")
+          .setIcon("sync")
+          .onClick(() => void this.plugin.activateStatusView()),
+      );
+
+    new Setting(containerEl)
+      .setName("Debug mode")
+      .setDesc(
+        "Show full event ring, raw CRDT counters, and a Copy diagnostics " +
+          "button in the status view. Off in normal use.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.debugMode).onChange(async (value) => {
+          this.plugin.settings.debugMode = value;
+          await this.plugin.saveSettings();
+        }),
+      );
   }
 }

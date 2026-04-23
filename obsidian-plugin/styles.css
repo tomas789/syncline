@@ -61,3 +61,174 @@
 .syncline-ribbon.disconnected {
   color: #9e9e9e;
 }
+
+/* ---------- Status View (sidebar pane, mobile + desktop) ---------- */
+
+.syncline-view {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.syncline-view-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.syncline-view-dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background-color: #9e9e9e;
+}
+.syncline-view-dot.synced {
+  background-color: #4caf50;
+}
+.syncline-view-dot.syncing {
+  background-color: #ff9800;
+  animation: pulse 1s infinite;
+}
+.syncline-view-dot.error {
+  background-color: #f44336;
+}
+.syncline-view-dot.disconnected {
+  background-color: #9e9e9e;
+}
+
+.syncline-view-header-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.syncline-view-title {
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.2;
+}
+.syncline-view-subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  opacity: 0.7;
+  word-break: break-all;
+}
+
+.syncline-view-counters {
+  display: flex;
+  gap: 16px;
+  padding: 8px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.syncline-view-counter {
+  flex: 0 0 auto;
+}
+.syncline-view-counter-val {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.syncline-view-counter-label {
+  font-size: 11px;
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.syncline-view-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.syncline-view-actions button {
+  font-size: 12px;
+}
+
+.syncline-view-verify {
+  font-size: 12px;
+  padding: 6px 8px;
+  background: var(--background-modifier-hover);
+  border-radius: 4px;
+  opacity: 0.85;
+}
+
+.syncline-view-log h4,
+.syncline-view-debug h4 {
+  margin: 8px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.syncline-view-log {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.syncline-view-log-empty {
+  font-size: 12px;
+  opacity: 0.5;
+  font-style: italic;
+}
+.syncline-view-log-row {
+  display: grid;
+  grid-template-columns: 70px 90px 1fr;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  font-family: var(--font-monospace);
+  align-items: baseline;
+}
+.syncline-view-log-time {
+  opacity: 0.5;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.syncline-view-log-kind {
+  opacity: 0.7;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--background-modifier-hover);
+  display: inline-block;
+}
+.syncline-view-log-kind.kind-error {
+  background: rgba(244, 67, 54, 0.18);
+}
+.syncline-view-log-kind.kind-connect,
+.syncline-view-log-kind.kind-disconnect,
+.syncline-view-log-kind.kind-reconnect {
+  background: rgba(33, 150, 243, 0.18);
+}
+.syncline-view-log-kind.kind-manifest {
+  background: rgba(156, 39, 176, 0.18);
+}
+.syncline-view-log-kind.kind-content,
+.syncline-view-log-kind.kind-blob {
+  background: rgba(76, 175, 80, 0.18);
+}
+.syncline-view-log-msg {
+  word-break: break-word;
+}
+
+.syncline-view-debug dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+  margin: 0;
+}
+.syncline-view-debug dt {
+  font-weight: 500;
+  opacity: 0.7;
+}
+.syncline-view-debug dd {
+  margin: 0;
+  font-family: var(--font-monospace);
+  word-break: break-all;
+}
