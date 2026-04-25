@@ -80,6 +80,39 @@ impl Db {
         Ok(row.0)
     }
 
+    /// Encode the current state vector for a doc as v1 bytes.
+    ///
+    /// Used by the server to advertise what it has so the client can
+    /// reply with the inverse diff (its updates the server is missing).
+    /// Without this the sync handshake is one-way: a client whose subdoc
+    /// has updates we never observed has no way to push them back after
+    /// reconnect.
+    pub async fn get_doc_state_vector(&self, doc_id: &str) -> Result<Vec<u8>> {
+        use yrs::Doc;
+        use yrs::ReadTxn;
+        use yrs::Transact;
+        use yrs::Update;
+        use yrs::updates::decoder::Decode;
+        use yrs::updates::encoder::Encode;
+
+        let all_updates = self.load_doc_updates(doc_id).await?;
+        tokio::task::spawn_blocking(move || {
+            let doc = Doc::new();
+            if !all_updates.is_empty() {
+                let mut txn = doc.transact_mut();
+                for update_data in all_updates {
+                    if let Ok(u) = Update::decode_v1(&update_data) {
+                        txn.apply_update(u);
+                    }
+                }
+            }
+            let txn = doc.transact();
+            Ok(txn.state_vector().encode_v1())
+        })
+        .await
+        .unwrap()
+    }
+
     pub async fn get_all_updates_since(
         &self,
         doc_id: &str,

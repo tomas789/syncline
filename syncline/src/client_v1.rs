@@ -532,7 +532,34 @@ async fn run_session(
                             }
                         }
                         MSG_SYNC_STEP_1 => {
-                            debug!("unexpected STEP_1 for {}", doc_id);
+                            // Server (or peer) is asking for the diff
+                            // we have past their state vector. This is
+                            // the second leg of the Yrs sync protocol —
+                            // without it, content authored locally but
+                            // never re-edited never flows back to the
+                            // server. (See the corresponding server
+                            // change in handle_content_step1.)
+                            match content.encode_diff_v1(node_id, payload) {
+                                Ok(diff) => {
+                                    let frame = encode_message(
+                                        MSG_SYNC_STEP_2,
+                                        &content_doc_id(node_id),
+                                        &diff,
+                                    );
+                                    if let Err(e) = write
+                                        .send(WsMessage::Binary(frame.into()))
+                                        .await
+                                    {
+                                        anyhow::bail!(
+                                            "reply STEP_2 for {}: {e}",
+                                            doc_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("encode diff for {}: {}", doc_id, e);
+                                }
+                            }
                         }
                         other => {
                             debug!(
@@ -1073,6 +1100,18 @@ impl ContentStore {
         let doc = self.docs.get(&node_id).expect("inserted above");
         let txn = doc.transact();
         Ok(txn.state_vector().encode_v1())
+    }
+
+    /// Encode the local subdoc state as an update relative to a peer's
+    /// state vector. Used to reply to an incoming `MSG_SYNC_STEP_1` —
+    /// the returned bytes contain whatever updates the peer is missing.
+    fn encode_diff_v1(&mut self, node_id: NodeId, peer_sv_payload: &[u8]) -> Result<Vec<u8>> {
+        self.ensure_loaded(node_id)?;
+        let peer_sv = StateVector::decode_v1(peer_sv_payload)
+            .context("decode peer state vector")?;
+        let doc = self.docs.get(&node_id).expect("inserted above");
+        let txn = doc.transact();
+        Ok(txn.encode_state_as_update_v1(&peer_sv))
     }
 
     fn apply_update(&mut self, node_id: NodeId, payload: &[u8]) -> Result<()> {

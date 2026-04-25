@@ -373,6 +373,8 @@ async fn handle_content_step1(
     let Ok(sv) = StateVector::decode_v1(payload) else {
         return;
     };
+
+    // 1) Reply with what we have past the client's SV (existing behaviour).
     match state.db.get_all_updates_since(doc_id, &sv).await {
         Ok(update) if !update.is_empty() => {
             let frame = encode_message(MSG_SYNC_STEP_2, doc_id, &update);
@@ -380,6 +382,21 @@ async fn handle_content_step1(
         }
         Ok(_) => {}
         Err(e) => tracing::error!("DB read for {}: {}", doc_id, e),
+    }
+
+    // 2) Send back our own state vector so the client can push the
+    //    inverse diff (whatever we are missing). Without this the Yrs
+    //    sync protocol is one-way: a client whose subdoc had content
+    //    we never observed (e.g. content authored before the server
+    //    had a chance to record it, then a connection reset wiped the
+    //    in-flight updates) would never re-broadcast that content,
+    //    leaving it stranded on the client side forever.
+    match state.db.get_doc_state_vector(doc_id).await {
+        Ok(server_sv) => {
+            let frame = encode_message(MSG_SYNC_STEP_1, doc_id, &server_sv);
+            let _ = tx_out.send(frame);
+        }
+        Err(e) => tracing::error!("compute server SV for {}: {}", doc_id, e),
     }
 }
 
@@ -538,6 +555,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+    use yrs::updates::encoder::Encode;
     use yrs::{ReadTxn, Transact};
 
     async fn setup_test_server() -> (u16, AppState) {
@@ -780,5 +798,60 @@ mod tests {
         assert_eq!(t, MSG_BLOB_UPDATE);
         assert_eq!(d, hash_hex);
         assert_eq!(payload, bytes);
+    }
+
+    /// Pins the bidirectional content-sync handshake. When a client
+    /// sends `MSG_SYNC_STEP_1` for a content subdoc the server has
+    /// nothing for, the server must still reciprocate with its own
+    /// `MSG_SYNC_STEP_1` (carrying its state vector — empty or not)
+    /// so the client knows to push its updates back. Without this,
+    /// content authored by the client and never re-edited never
+    /// reaches the server.
+    #[tokio::test]
+    async fn server_reciprocates_step1_for_empty_content_doc() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let (mut ws, _) = connect_async(url).await.unwrap();
+
+        // Handshake.
+        send_bin(
+            &mut ws,
+            encode_message(
+                MSG_VERSION,
+                MANIFEST_DOC_ID,
+                &encode_version_handshake(),
+            ),
+        )
+        .await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Client subscribes to a content doc the server has never seen,
+        // sending an empty state vector.
+        let doc_id = "content:019dc69a-1234-7000-8000-000000000001";
+        let empty_sv = yrs::StateVector::default().encode_v1();
+        send_bin(
+            &mut ws,
+            encode_message(MSG_SYNC_STEP_1, doc_id, &empty_sv),
+        )
+        .await;
+
+        // Expect a STEP_1 back from the server (its SV) so we know it
+        // wants whatever we have. The server may also send STEP_2 first
+        // (with empty/non-empty content) — accept either ordering.
+        let mut saw_step1 = false;
+        for _ in 0..2 {
+            let resp = recv_bin(&mut ws).await;
+            let (t, d, _payload) = decode_message(&resp).unwrap();
+            assert_eq!(d, doc_id);
+            if t == MSG_SYNC_STEP_1 {
+                saw_step1 = true;
+                break;
+            }
+            assert_eq!(t, MSG_SYNC_STEP_2, "unexpected msg type {:#x}", t);
+        }
+        assert!(
+            saw_step1,
+            "server must reciprocate STEP_1 even when it has no content for the doc"
+        );
     }
 }
