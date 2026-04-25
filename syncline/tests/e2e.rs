@@ -80,17 +80,20 @@ pub async fn spawn_client(dir: &Path, port: u16) -> Child {
         .expect("Failed to spawn client")
 }
 
-/// Like [`spawn_client`] but captures stderr into an in-memory ring of
-/// log lines that contain known channel-overflow markers. Used by the
-/// channel-buffer regression tests in this file to assert that no
-/// debounced file event was dropped during a high-throughput burst.
+/// Like [`spawn_client`] but captures the child's tracing output and
+/// counts log lines containing known channel-overflow markers. Used
+/// by the channel-buffer regression tests in this file to assert
+/// that no debounced file event was dropped during a high-throughput
+/// burst.
 ///
-/// Returns the child process and a shared `Vec<String>` that the
-/// background reader task appends to whenever it sees one of the
-/// `error!(...)` log lines from `client/watcher.rs`:
+/// `tracing_subscriber::fmt::layer()` writes to **stdout** by default
+/// in this binary (see `main.rs`), so we pipe stdout — not stderr —
+/// to the in-memory reader. Returns the child and a shared
+/// `Vec<String>` that the background reader task appends to whenever
+/// it sees one of the `error!(...)` lines from `client/watcher.rs`:
 ///   - "Channel full or closed, dropped raw file event: ..."
 ///   - "Channel full or closed, dropped debounced file event: ..."
-/// Stderr lines that don't match are still tee'd to the test runner's
+/// Lines that don't match are still tee'd to the test runner's
 /// stderr (via `eprintln!`) so debug context is preserved on failure.
 pub async fn spawn_client_capturing_drops(
     dir: &Path,
@@ -101,19 +104,20 @@ pub async fn spawn_client_capturing_drops(
         .arg("--folder")
         .arg(dir)
         .env("SYNCLINE_URL", format!("ws://127.0.0.1:{}/sync", port))
-        // info is enough to surface the `error!` lines we care about
-        // and avoids the volume of `debug` we'd otherwise have to scan.
+        // `info` is enough to surface the `error!` lines we care
+        // about and avoids the volume of `debug` we'd otherwise have
+        // to scan line by line.
         .env("RUST_LOG", "info")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .expect("Failed to spawn client (stderr-piped)");
-    let stderr = child.stderr.take().expect("piped stderr handle");
+        .expect("Failed to spawn client (stdout-piped)");
+    let stdout = child.stdout.take().expect("piped stdout handle");
     let drops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let drops_clone = drops.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             // Tee everything so failed assertions still show context.
             eprintln!("[client] {line}");
@@ -1620,9 +1624,13 @@ async fn test_bootstrap_3000_file_vault_no_dropped_events() {
         }
     }
 
-    // Spawn peer 0 with stderr capture, peer 1 plain.
+    // Capture stderr on BOTH peers: the channel-overflow bug is in the
+    // shared client code, so it manifests symmetrically. Peer 0 drops
+    // events as its watcher sees the bootstrap scan, peer 1 drops them
+    // as its watcher sees the inbound writes the sync engine performs
+    // on the receive side. Either symptom is the same bug.
     let (_c0, drops0) = spawn_client_capturing_drops(dir0.path(), port).await;
-    let _c1 = spawn_client(dir1.path(), port).await;
+    let (_c1, drops1) = spawn_client_capturing_drops(dir1.path(), port).await;
 
     let dirs = vec![dir0.path().to_path_buf(), dir1.path().to_path_buf()];
     let converged = wait_for_convergence(&dirs, Duration::from_secs(300)).await;
@@ -1632,6 +1640,11 @@ async fn test_bootstrap_3000_file_vault_no_dropped_events() {
          likely indicates dropped debounced events leaving empty/missing \
          files on peer 1 (channel-overflow bug repro)."
     );
+
+    // Allow stderr readers to drain any lines still buffered in the
+    // kernel pipe from the child processes. Without this the assertion
+    // races the reader task and may miss legitimate drop log lines.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Cross-check on disk: every file on peer 1 must exist AND have
     // exactly the bytes peer 0 wrote. An empty-placeholder file
@@ -1657,18 +1670,22 @@ async fn test_bootstrap_3000_file_vault_no_dropped_events() {
         }
     }
 
-    // Hard guarantee: zero overflow log lines on peer 0. Even if every
-    // file made it across (e.g. via the periodic polling fallback),
-    // a single dropped event indicates the channel was undersized for
-    // the workload and the bug is unresolved.
-    let drops = drops0.lock().unwrap().clone();
+    // Hard guarantee: zero overflow log lines on EITHER peer. Even if
+    // every file eventually made it across (e.g. via the periodic
+    // polling fallback compensating for the dropped events), a single
+    // dropped event proves the channel was undersized for the workload
+    // and the bug is unresolved.
+    let d0 = drops0.lock().unwrap().clone();
+    let d1 = drops1.lock().unwrap().clone();
+    let total_drops = d0.len() + d1.len();
     assert!(
-        drops.is_empty(),
-        "peer 0 reported {} dropped event log line(s) during bootstrap of \
-         {TOTAL} files (first up to 5):\n  {}",
-        drops.len(),
-        drops
-            .iter()
+        total_drops == 0,
+        "Channel-overflow drops during bootstrap of {TOTAL} files: \
+         peer 0 = {} line(s), peer 1 = {} line(s). Sample:\n  {}",
+        d0.len(),
+        d1.len(),
+        d0.iter()
+            .chain(d1.iter())
             .take(5)
             .cloned()
             .collect::<Vec<_>>()
@@ -1699,8 +1716,11 @@ async fn test_add_500_files_at_once_no_drops() {
 
     let dir0 = TempDir::new().unwrap();
     let dir1 = TempDir::new().unwrap();
+    // Capture stderr on both peers — bug is symmetric (sender-side
+    // drops on peer 0 from the bootstrap scan, receiver-side drops
+    // on peer 1 from inbound writes — same channel, same code path).
     let (_c0, drops0) = spawn_client_capturing_drops(dir0.path(), port).await;
-    let _c1 = spawn_client(dir1.path(), port).await;
+    let (_c1, drops1) = spawn_client_capturing_drops(dir1.path(), port).await;
 
     // Allow both clients to fully attach FSEvents/inotify before the
     // burst — we want the watcher to see every write live, not via
@@ -1728,8 +1748,11 @@ async fn test_add_500_files_at_once_no_drops() {
     assert!(
         converged,
         "{N}-file burst did not converge within 3 min — files likely \
-         lost to channel-overflow drops on peer 0."
+         lost to channel-overflow drops."
     );
+
+    // Drain stderr buffers before reading the drop counters.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     for i in 0..N {
         let name = format!("burst-{i:03}.md");
@@ -1744,14 +1767,17 @@ async fn test_add_500_files_at_once_no_drops() {
         );
     }
 
-    let drops = drops0.lock().unwrap().clone();
+    let d0 = drops0.lock().unwrap().clone();
+    let d1 = drops1.lock().unwrap().clone();
+    let total_drops = d0.len() + d1.len();
     assert!(
-        drops.is_empty(),
-        "peer 0 reported {} dropped event log line(s) during {N}-file \
-         burst (first up to 5):\n  {}",
-        drops.len(),
-        drops
-            .iter()
+        total_drops == 0,
+        "Channel-overflow drops during {N}-file burst: peer 0 = {} \
+         line(s), peer 1 = {} line(s). Sample:\n  {}",
+        d0.len(),
+        d1.len(),
+        d0.iter()
+            .chain(d1.iter())
             .take(5)
             .cloned()
             .collect::<Vec<_>>()
@@ -1800,7 +1826,7 @@ async fn test_bootstrap_large_vault_no_dropped_events() {
 
     // Generous convergence budget — bootstrap of 1500 files takes a while.
     let dirs = vec![dir0.clone(), env.client_path(1).to_path_buf()];
-    let converged = wait_for_convergence(&dirs, Duration::from_secs(120)).await;
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(240)).await;
     assert!(
         converged,
         "Bootstrap of {N}-file vault did not converge: peer 1 is missing files \

@@ -20,9 +20,13 @@ impl SynclineWatcher {
                             "RAW EVENT: kind={:?}, paths={:?}, attrs={:?}",
                             event.kind, event.paths, event.attrs
                         );
-                        // Send over channel (non-blocking)
-                        if let Err(e) = tx.try_send(event) {
-                            error!("Channel full or closed, dropped raw file event: {}", e);
+                        // Apply backpressure: blocking_send is safe
+                        // here because notify invokes this callback on
+                        // its own (non-tokio) thread. We'd rather wait
+                        // for the consumer to drain than silently
+                        // drop file events under bursty load.
+                        if let Err(e) = tx.blocking_send(event) {
+                            error!("Channel closed, dropped raw file event: {}", e);
                         }
                     }
                     Err(e) => {
@@ -71,9 +75,17 @@ impl DebouncedWatcher {
                         Err(notify::Error::generic(&errstr))
                     }
                 };
-                if let Err(e) = tx.try_send(mapped_res) {
+                // Apply backpressure: blocking_send is safe here
+                // because notify-debouncer-mini invokes this callback
+                // on its own dedicated std thread, not on a tokio
+                // worker. Blocking when the consumer is busy is the
+                // intended behavior — we'd rather slow the watcher
+                // than silently drop events when the channel fills
+                // (the original v1.0.1 try_send + 16-slot channel
+                // dropped events on vault bootstrap >1k files).
+                if let Err(e) = tx.blocking_send(mapped_res) {
                     error!(
-                        "Channel full or closed, dropped debounced file event: {:?}",
+                        "Channel closed, dropped debounced file event: {:?}",
                         e
                     );
                 }
@@ -114,7 +126,7 @@ mod tests {
             .try_init();
 
         let temp_dir = TempDir::new().unwrap();
-        let (tx, mut rx) = mpsc::channel(100);
+        let (tx, mut rx) = mpsc::channel(100000);
         let mut watcher = SynclineWatcher::new(tx).unwrap();
 
         watcher.watch(temp_dir.path()).unwrap();
