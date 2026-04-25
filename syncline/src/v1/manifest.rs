@@ -328,6 +328,77 @@ impl Manifest {
             .filter(|e| !e.deleted)
             .collect()
     }
+
+    /// Look up an entry by its disk-relative path, **including
+    /// tombstoned entries**.
+    ///
+    /// This differs from `Projection::by_path` (which filters
+    /// tombstones away under §6.1 LWW) in that it walks the raw
+    /// `(name, parent)` chain on every entry and yields a match
+    /// regardless of `deleted` state.
+    ///
+    /// Used by `scan_once` to detect that an on-disk file
+    /// corresponds to a tombstoned NodeId — and therefore must be
+    /// removed locally rather than promoted into a fresh sibling
+    /// NodeId via `create_text` / `create_binary`. Without this
+    /// lookup, a peer that reconnects with stale files from before a
+    /// delete propagated would resurrect every one of them on the
+    /// entire network. See `DESIGN_DOC_V1.md` §5.2.
+    ///
+    /// On collision (a live and a tombstoned entry both project to
+    /// the same raw path — possible during a same-path simultaneous
+    /// create) the **live** entry is returned. Directory entries are
+    /// not considered (directories never appear in
+    /// `Projection::by_path`).
+    pub fn find_entry_by_path(&self, path: &str) -> Option<NodeEntry> {
+        let all = self.all_entries();
+        let mut best: Option<NodeEntry> = None;
+        for entry in all.values() {
+            if entry.kind == NodeKind::Directory {
+                continue;
+            }
+            let Some(p) = build_path_ignoring_tombstones(entry, &all) else {
+                continue;
+            };
+            if p != path {
+                continue;
+            }
+            match &best {
+                Some(b) if !b.deleted && entry.deleted => {}
+                _ => {
+                    best = Some(entry.clone());
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Build a disk-relative path for `entry` by walking the parent chain,
+/// **without** the projection's tombstoned-directory bail-out. The
+/// scanner needs to recognise a tombstoned leaf even when its
+/// directory chain itself is partially tombstoned but still on disk.
+/// Returns `None` if the chain is broken (parent NodeId not present)
+/// or pathologically deep.
+fn build_path_ignoring_tombstones(
+    entry: &NodeEntry,
+    all: &HashMap<NodeId, NodeEntry>,
+) -> Option<String> {
+    let mut segments: Vec<String> = vec![entry.name.clone()];
+    let mut cursor = entry.parent;
+    let mut hops = 0usize;
+    const MAX_HOPS: usize = 1024;
+    while let Some(pid) = cursor {
+        hops += 1;
+        if hops > MAX_HOPS {
+            return None;
+        }
+        let parent = all.get(&pid)?;
+        segments.push(parent.name.clone());
+        cursor = parent.parent;
+    }
+    segments.reverse();
+    Some(segments.join("/"))
 }
 
 fn get_entry_map<T: ReadTxn>(nodes: &MapRef, txn: &T, id: NodeId) -> Option<MapRef> {
@@ -540,6 +611,62 @@ mod tests {
         let e = m.get_entry(id).unwrap();
         assert_eq!(e.blob_hash.as_deref(), Some("ef567890"));
         assert_eq!(e.size, 2048);
+    }
+
+    #[test]
+    fn find_entry_by_path_returns_tombstoned() {
+        let mut m = Manifest::new(ActorId::new());
+        let id = m.create_node("ghost.md", None, NodeKind::Text, None, 0);
+        m.delete(id);
+        let found = m.find_entry_by_path("ghost.md").expect("tombstone reachable");
+        assert_eq!(found.id, id);
+        assert!(found.deleted);
+    }
+
+    #[test]
+    fn find_entry_by_path_returns_live() {
+        let mut m = Manifest::new(ActorId::new());
+        let id = m.create_node("alive.md", None, NodeKind::Text, None, 0);
+        let found = m.find_entry_by_path("alive.md").unwrap();
+        assert_eq!(found.id, id);
+        assert!(!found.deleted);
+    }
+
+    #[test]
+    fn find_entry_by_path_returns_none_when_absent() {
+        let m = Manifest::new(ActorId::new());
+        assert!(m.find_entry_by_path("nope.md").is_none());
+    }
+
+    #[test]
+    fn find_entry_by_path_prefers_live_over_tombstoned() {
+        let mut m = Manifest::new(ActorId::new());
+        let dead = m.create_node("collide.md", None, NodeKind::Text, None, 0);
+        m.delete(dead);
+        let live = m.create_node("collide.md", None, NodeKind::Text, None, 0);
+        let found = m.find_entry_by_path("collide.md").unwrap();
+        assert_eq!(found.id, live);
+        assert!(!found.deleted);
+    }
+
+    #[test]
+    fn find_entry_by_path_walks_directory_chain() {
+        let mut m = Manifest::new(ActorId::new());
+        let dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
+        let file = m.create_node("note.md", Some(dir), NodeKind::Text, None, 0);
+        m.delete(file);
+        let found = m.find_entry_by_path("folder/note.md").unwrap();
+        assert_eq!(found.id, file);
+        assert!(found.deleted);
+    }
+
+    #[test]
+    fn find_entry_by_path_skips_directory_kind() {
+        // A directory's "path" must not collide with a file lookup —
+        // directories are emergent (§5.6), never projected as files.
+        let mut m = Manifest::new(ActorId::new());
+        let _dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
+        assert!(m.find_entry_by_path("folder").is_none());
     }
 
     #[test]
