@@ -33,6 +33,7 @@ use crate::protocol::{
     V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
 use crate::client::watcher::DebouncedWatcher;
+use crate::ignore::IgnoreList;
 use crate::v1::blob_store::BlobStore;
 use crate::v1::hash::hash_hex;
 use crate::v1::disk::{migrate_vault_on_disk, read_or_create_actor_id};
@@ -675,15 +676,22 @@ async fn scan_once(
     // diff against `proj.by_path` to detect local deletions.
     let mut visited_rel: HashSet<String> = HashSet::new();
 
+    let ignore = IgnoreList::load(folder);
+    let ignore_for_filter = ignore.clone();
+    let folder_for_filter = folder.to_path_buf();
     for dent in WalkDir::new(folder)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             if e.depth() == 0 {
                 return true;
             }
-            let name = e.file_name().to_string_lossy();
-            !name.starts_with('.') && name != ".syncline"
+            let Ok(rel) = e.path().strip_prefix(&folder_for_filter) else {
+                return true;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let is_dir = e.file_type().is_dir();
+            !ignore_for_filter.is_ignored(&rel_str, is_dir)
         })
         .filter_map(|e| e.ok())
     {
