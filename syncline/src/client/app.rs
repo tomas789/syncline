@@ -7,6 +7,7 @@ use crate::client::state::{
 };
 use crate::client::storage::{load_doc, save_doc};
 use crate::client::watcher::DebouncedWatcher;
+use crate::ignore::IgnoreList;
 use colored::Colorize;
 use std::collections::HashSet;
 use std::fs;
@@ -39,6 +40,7 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
 
     let dir_to_watch = folder;
     let mut local_state = LocalState::new(&dir_to_watch, name);
+    let ignore = IgnoreList::load(&local_state.root_dir);
     info!("Client name: {}", local_state.client_name);
 
     // Bootstrap all local documents BEFORE connecting to the server.
@@ -548,7 +550,7 @@ pub async fn run_client(folder: PathBuf, url: String, name: Option<String>) -> a
                                     Ok(r) => r,
                                     Err(_) => continue,
                                 };
-                                if rel_path.split('/').any(|c| c.starts_with('.')) { continue; }
+                                if ignore.is_ignored(&rel_path, false) { continue; }
 
                                 if !path.exists() {
                                     // Delete event

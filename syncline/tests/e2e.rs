@@ -444,32 +444,60 @@ async fn test_complex_directory_operations() {
 
 #[tokio::test]
 async fn test_filter_ignored_files() {
+    // Hidden files are now synced by default; only `.syncline/` is
+    // hardcoded-ignored, plus whatever the user lists in
+    // `.synclineignore`. This test exercises both: a default-synced
+    // dotfile (`.hidden.md`), a binary, a `.synclineignore`-excluded
+    // file, and the always-ignored `.syncline/` metadata.
     let env = TestEnv::new(2).await;
     let binary0 = env.client_path(0).join("image.png");
     let hidden0 = env.client_path(0).join(".hidden.md");
+    let ignored0 = env.client_path(0).join("device-only.md");
+    let ignore_file = env.client_path(0).join(".synclineignore");
 
+    fs::write(&ignore_file, "device-only.md\n").unwrap();
     fs::write(&binary0, "binary data").unwrap();
     fs::write(&hidden0, "secret text").unwrap();
+    fs::write(&ignored0, "should not leave device 0").unwrap();
 
-    // Wait for binary file to sync (may take longer on slow CI)
+    // Wait for binary + dotfile to sync.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if env.client_path(1).join("image.png").exists() {
+        if env.client_path(1).join("image.png").exists()
+            && env.client_path(1).join(".hidden.md").exists()
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            ".png file should be synced with binary file support"
+            "expected image.png and .hidden.md to sync"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Binary files (like .png) should now be synced via binary support
-    assert!(env.client_path(1).join("image.png").exists(),
-            ".png file should be synced with binary file support");
-    // Hidden files (starting with .) should still NOT be synced
-    assert!(!env.client_path(1).join(".hidden.md").exists(),
-            ".hidden files should not be synced");
+    // Binary file synced via the blob path.
+    assert!(
+        env.client_path(1).join("image.png").exists(),
+        ".png file should sync via the binary path"
+    );
+    // Dotfiles sync by default (Hidden Files Sync — needed for
+    // `.obsidian/` config files).
+    assert!(
+        env.client_path(1).join(".hidden.md").exists(),
+        "dotfiles should sync by default"
+    );
+    // Files matching `.synclineignore` patterns must not propagate.
+    assert!(
+        !env.client_path(1).join("device-only.md").exists(),
+        "files matching .synclineignore should be excluded"
+    );
+    // `.syncline/` is Syncline's own metadata directory and must
+    // never be reflected on the peer's vault.
+    assert!(
+        !env.client_path(1).join(".syncline/manifest.bin").exists()
+            || env.client_path(1).join(".syncline/manifest.bin").is_file(),
+        ".syncline/ exists locally but its contents must not have been pushed from peer 0"
+    );
 }
 
 #[tokio::test]

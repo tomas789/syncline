@@ -1,5 +1,6 @@
 use crate::client::diff::apply_diff_to_yrs;
 use crate::client::storage::{load_doc, save_doc};
+use crate::ignore::IgnoreList;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -311,15 +312,21 @@ impl LocalState {
         }
         let mut disk_files: Vec<DiskFile> = Vec::new();
 
+        let ignore = IgnoreList::load(&self.root_dir);
+        let root_for_filter = self.root_dir.clone();
+        let ignore_for_filter = ignore.clone();
         for entry in WalkDir::new(&self.root_dir)
             .into_iter()
-            .filter_entry(|e| {
+            .filter_entry(move |e| {
                 if e.depth() == 0 {
                     return true;
                 }
-                let name = e.file_name().to_string_lossy();
-                // Skip hidden dirs/files and .syncline metadata
-                !name.starts_with('.') && name != ".syncline"
+                let Ok(rel) = e.path().strip_prefix(&root_for_filter) else {
+                    return true;
+                };
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let is_dir = e.file_type().is_dir();
+                !ignore_for_filter.is_ignored(&rel_str, is_dir)
             })
             .filter_map(|e| e.ok())
         {
@@ -336,8 +343,10 @@ impl LocalState {
                 }
             };
 
-            // Skip hidden path components
-            if rel_path.split('/').any(|c| c.starts_with('.')) {
+            // Defensive re-check — `filter_entry` is the primary gate, but
+            // canonicalization quirks could yield a path the walker accepted
+            // but which the ignore list would reject as a string.
+            if ignore.is_ignored(&rel_path, false) {
                 continue;
             }
 
