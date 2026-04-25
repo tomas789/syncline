@@ -505,6 +505,164 @@ async fn test_offline_creation_and_deletion() {
     assert!(!env.client_path(1).join("base.md").exists());
 }
 
+/// Symmetric inverse of `test_offline_creation_and_deletion`: this time
+/// Client 0 (online) is the deleter and Client 1 (offline) is the
+/// survivor that holds a stale copy on disk.
+///
+/// Reproduces the late-reconnect tombstone resurrection bug: a peer
+/// that goes offline before a delete propagates, then reconnects with
+/// the (now-tombstoned) file still on disk, must NOT resurrect it via
+/// `scan_once` creating a fresh NodeId. Instead, the local stale copy
+/// must be removed when the manifest tombstone arrives.
+///
+/// Spec: DESIGN_DOC_V1.md §5.2 (delete protocol) + §9.5 test plan
+/// (`test_delete_propagates_to_late_reconnecting_client`). The v1
+/// test was named in the design doc but never implemented; v0 had
+/// the same class of bug documented as KNOWN_BUGS #9 (was fixed for
+/// v0, regressed in v1).
+#[tokio::test]
+async fn test_delete_propagates_to_late_reconnecting_client() {
+    let mut env = TestEnv::new(2).await;
+
+    // Synced state: both peers have the file.
+    let path0 = env.client_path(0).join("doomed.md");
+    fs::write(&path0, "delete me later").unwrap();
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(8)).await);
+    assert!(env.client_path(1).join("doomed.md").exists());
+
+    // Peer 1 goes offline.
+    env.clients[1].kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Peer 0 (online) deletes the file. Server gets the tombstone.
+    fs::remove_file(&path0).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Peer 1 reconnects. It still has `doomed.md` on disk from the
+    // pre-delete sync. After reconnect + manifest sync + scan, the
+    // tombstone must win and the local file must be removed — NOT
+    // recreated as a fresh NodeId on the server.
+    let dir1 = env.client_dirs[1].path().to_path_buf();
+    env.clients[1] = spawn_client(&dir1, env.port).await;
+
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await);
+
+    assert!(
+        !env.client_path(0).join("doomed.md").exists(),
+        "peer 0: doomed.md must stay deleted after peer 1 reconnect (resurrection bug)",
+    );
+    assert!(
+        !env.client_path(1).join("doomed.md").exists(),
+        "peer 1: doomed.md must be removed when reconnect surfaces the tombstone (resurrection bug)",
+    );
+}
+
+/// Binary variant of `test_delete_propagates_to_late_reconnecting_client`.
+/// Targets the parallel resurrection path in `process_binary_file`:
+/// when the per-walk projection (which filters tombstoned entries)
+/// reports `None` for a binary path, the scanner currently calls
+/// `create_binary` and produces a fresh NodeId, broadcasting the
+/// tombstoned blob back as a new node.
+#[tokio::test]
+async fn test_delete_propagates_to_late_reconnecting_client_binary() {
+    let mut env = TestEnv::new(2).await;
+
+    // Tiny "PNG" — header + a few payload bytes. Mirrors
+    // test_binary_file_sync's fixture for consistency.
+    let png_data: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0xCA, 0xFE, 0xBA, 0xBE,
+    ];
+    let path0 = env.client_path(0).join("doomed.png");
+    fs::write(&path0, &png_data).unwrap();
+
+    // Binary sync needs a longer settle (CAS blob round-trip).
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(env.client_path(1).join("doomed.png").exists());
+
+    env.clients[1].kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    fs::remove_file(&path0).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let dir1 = env.client_dirs[1].path().to_path_buf();
+    env.clients[1] = spawn_client(&dir1, env.port).await;
+
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await);
+
+    assert!(
+        !env.client_path(0).join("doomed.png").exists(),
+        "peer 0: doomed.png must stay deleted (binary resurrection bug)",
+    );
+    assert!(
+        !env.client_path(1).join("doomed.png").exists(),
+        "peer 1: doomed.png must be removed on reconnect (binary resurrection bug)",
+    );
+}
+
+/// Scaled-down replica of the 2026-04-25 vault chaos: many files
+/// deleted while one peer is offline, and on reconnect the offline
+/// peer must accept the tombstones rather than re-broadcasting all of
+/// them as new nodes (which is what produced the +200-file overwrite
+/// in production).
+///
+/// Uses 25 files to keep CI runtime bounded. The mechanism under test
+/// is identical to the single-file case; we just want to ensure the
+/// fix applies uniformly, not only to one entry.
+#[tokio::test]
+async fn test_bulk_delete_propagates_to_late_reconnecting_client() {
+    let mut env = TestEnv::new(2).await;
+
+    const N: usize = 25;
+    let names: Vec<String> = (0..N).map(|i| format!("doomed_{i:03}.md")).collect();
+
+    for (i, name) in names.iter().enumerate() {
+        fs::write(
+            env.client_path(0).join(name),
+            format!("payload-{i}"),
+        )
+        .unwrap();
+    }
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await);
+    for name in &names {
+        assert!(
+            env.client_path(1).join(name).exists(),
+            "{name} must reach peer 1 in the synced phase",
+        );
+    }
+
+    env.clients[1].kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for name in &names {
+        fs::remove_file(env.client_path(0).join(name)).unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let dir1 = env.client_dirs[1].path().to_path_buf();
+    env.clients[1] = spawn_client(&dir1, env.port).await;
+
+    assert!(wait_for_convergence(&env.dirs(), Duration::from_secs(45)).await);
+
+    let mut still_alive: Vec<String> = Vec::new();
+    for name in &names {
+        if env.client_path(0).join(name).exists()
+            || env.client_path(1).join(name).exists()
+        {
+            still_alive.push(name.clone());
+        }
+    }
+    assert!(
+        still_alive.is_empty(),
+        "{} of {} tombstoned files were resurrected after peer 1 reconnect: {:?}",
+        still_alive.len(),
+        N,
+        still_alive,
+    );
+}
+
 /// Client A syncs a file to the server, then Client B (a fresh directory with its own
 /// pre-existing file of the same name) connects. The conflict is resolved by keeping the
 /// server content as the canonical file and renaming B's local content.
