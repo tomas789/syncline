@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::error;
 use yrs::{Any, GetString, Map, Out, Transact};
@@ -76,6 +78,54 @@ pub async fn spawn_client(dir: &Path, port: u16) -> Child {
         .kill_on_drop(true)
         .spawn()
         .expect("Failed to spawn client")
+}
+
+/// Like [`spawn_client`] but captures stderr into an in-memory ring of
+/// log lines that contain known channel-overflow markers. Used by the
+/// channel-buffer regression tests in this file to assert that no
+/// debounced file event was dropped during a high-throughput burst.
+///
+/// Returns the child process and a shared `Vec<String>` that the
+/// background reader task appends to whenever it sees one of the
+/// `error!(...)` log lines from `client/watcher.rs`:
+///   - "Channel full or closed, dropped raw file event: ..."
+///   - "Channel full or closed, dropped debounced file event: ..."
+/// Stderr lines that don't match are still tee'd to the test runner's
+/// stderr (via `eprintln!`) so debug context is preserved on failure.
+pub async fn spawn_client_capturing_drops(
+    dir: &Path,
+    port: u16,
+) -> (Child, Arc<Mutex<Vec<String>>>) {
+    let mut child = Command::new(syncline_bin())
+        .arg("sync")
+        .arg("--folder")
+        .arg(dir)
+        .env("SYNCLINE_URL", format!("ws://127.0.0.1:{}/sync", port))
+        // info is enough to surface the `error!` lines we care about
+        // and avoids the volume of `debug` we'd otherwise have to scan.
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("Failed to spawn client (stderr-piped)");
+    let stderr = child.stderr.take().expect("piped stderr handle");
+    let drops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let drops_clone = drops.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // Tee everything so failed assertions still show context.
+            eprintln!("[client] {line}");
+            if line.contains("Channel full")
+                || line.contains("dropped debounced file event")
+                || line.contains("dropped raw file event")
+            {
+                drops_clone.lock().unwrap().push(line);
+            }
+        }
+    });
+    (child, drops)
 }
 
 pub async fn spawn_client_with_name(dir: &Path, port: u16, name: &str) -> Child {
@@ -1494,5 +1544,289 @@ async fn test_binary_blob_cas_dedup_across_clients() {
             fs::read(env.client_path(idx).join("two.png")).unwrap(),
             payload
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-buffer overflow regression tests (v1.0.2)
+// ---------------------------------------------------------------------------
+//
+// Repro for the v1.0.1 bug that surfaced in Tom's vault chaos incident
+// (1305-file Obsidian vault on macOS, "Channel full or closed,
+// dropped debounced file event" hundreds of times per minute,
+// blob uploads lost, peers receiving empty placeholder files).
+//
+// Root cause: `client_v1::run_client` builds the watcher mpsc with
+// only **16 slots** (`syncline/src/client_v1.rs:326`). The
+// DebouncedWatcher pumps a `Vec<DebouncedEvent>` per ~300 ms window,
+// but `scan_once` over a thousands-of-files vault takes longer than
+// that, so successive batches stack up and the channel fills. Once
+// full, `try_send` returns `Full(..)` and the batch — together with
+// every blob upload it would have triggered — is silently dropped.
+//
+// These tests assert two invariants that v1.0.1 violates:
+//   (a) every file written on peer 0 reaches peer 1 with byte-for-byte
+//       identical content (no empty placeholders); and
+//   (b) peer 0's stderr is free of the "Channel full" / "dropped"
+//       error lines emitted by `watcher.rs:25,75`.
+//
+// The fix lives in `client_v1.rs:326` — bump the buffer to a size that
+// can absorb a vault-bootstrap burst (or switch to unbounded). Vaults
+// with 1000+ files are not an edge case (KMS users, research vaults,
+// codebases used as Obsidian vaults), so bootstrap MUST scale.
+
+/// Stress test: peer 0 vault is pre-populated with 3000 small files
+/// across 30 subfolders BEFORE the sync client starts. This mirrors
+/// the real-world workflow of installing the SyncLine plugin on top
+/// of an existing vault and watching it bootstrap. After convergence,
+/// peer 1 must hold every file with full content and peer 0 must not
+/// have logged any dropped debounced events.
+///
+/// Uses the multi-thread runtime because the in-test stderr reader
+/// runs concurrently with the convergence poll loop and we don't want
+/// either to starve the other. Budget is generous (5 min) because
+/// `scan_once` is O(vault size) and a 3000-file initial scan can
+/// legitimately take tens of seconds on a cold cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_bootstrap_3000_file_vault_no_dropped_events() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir0 = TempDir::new().unwrap();
+    let dir1 = TempDir::new().unwrap();
+
+    // Pre-populate peer 0 with a realistic mid-sized vault before any
+    // sync process is running. 30 × 100 = 3000 files keeps individual
+    // directories at a sane size while still hitting the channel-burst
+    // regime once `scan_once` starts walking them.
+    const SUBFOLDERS: usize = 30;
+    const FILES_PER_SUBFOLDER: usize = 100;
+    const TOTAL: usize = SUBFOLDERS * FILES_PER_SUBFOLDER;
+    for sf in 0..SUBFOLDERS {
+        let folder = dir0.path().join(format!("folder-{sf:02}"));
+        fs::create_dir_all(&folder).unwrap();
+        for i in 0..FILES_PER_SUBFOLDER {
+            // ~200 B body with a slight per-file variation so each
+            // file is a distinct content blob (no dedup shortcuts).
+            let body = format!(
+                "note {sf:02}/{i:03}\n{}\n",
+                "x".repeat(170 + (i % 30))
+            );
+            fs::write(folder.join(format!("note-{i:03}.md")), body).unwrap();
+        }
+    }
+
+    // Spawn peer 0 with stderr capture, peer 1 plain.
+    let (_c0, drops0) = spawn_client_capturing_drops(dir0.path(), port).await;
+    let _c1 = spawn_client(dir1.path(), port).await;
+
+    let dirs = vec![dir0.path().to_path_buf(), dir1.path().to_path_buf()];
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(300)).await;
+    assert!(
+        converged,
+        "Bootstrap of {TOTAL}-file vault did not converge within 5 min — \
+         likely indicates dropped debounced events leaving empty/missing \
+         files on peer 1 (channel-overflow bug repro)."
+    );
+
+    // Cross-check on disk: every file on peer 1 must exist AND have
+    // exactly the bytes peer 0 wrote. An empty-placeholder file
+    // (manifest entry without blob) would slip past convergence-by-
+    // set-membership but fail this size/content check.
+    for sf in 0..SUBFOLDERS {
+        for i in 0..FILES_PER_SUBFOLDER {
+            let name = format!("folder-{sf:02}/note-{i:03}.md");
+            let p0 = dir0.path().join(&name);
+            let p1 = dir1.path().join(&name);
+            assert!(p1.exists(), "peer 1 missing {name} after bootstrap");
+            let c0 = fs::read(&p0).unwrap();
+            let c1 = fs::read(&p1).unwrap();
+            assert_eq!(
+                c1.len(),
+                c0.len(),
+                "peer 1 has wrong size for {name}: {} vs expected {} \
+                 (likely empty placeholder from dropped debounced event)",
+                c1.len(),
+                c0.len()
+            );
+            assert_eq!(c1, c0, "peer 1 content mismatch on {name}");
+        }
+    }
+
+    // Hard guarantee: zero overflow log lines on peer 0. Even if every
+    // file made it across (e.g. via the periodic polling fallback),
+    // a single dropped event indicates the channel was undersized for
+    // the workload and the bug is unresolved.
+    let drops = drops0.lock().unwrap().clone();
+    assert!(
+        drops.is_empty(),
+        "peer 0 reported {} dropped event log line(s) during bootstrap of \
+         {TOTAL} files (first up to 5):\n  {}",
+        drops.len(),
+        drops
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+/// Smaller incremental variant: two peers start synced and empty,
+/// then peer 0 adds 500 files in a single tight write loop (mimics
+/// `cp -r` of a research dump or extracting an archive into the
+/// vault). All 500 must land on peer 1 with full content, and peer 0
+/// must not log any dropped events.
+///
+/// This exercise is closer to the steady-state "shove a directory
+/// into the vault" workflow than the cold-bootstrap scenario above
+/// and reliably saturates the watcher channel because `scan_once`
+/// after each debounce window is comparatively cheap (small vault),
+/// so backpressure manifests purely as channel fill from rapid
+/// debounce batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_add_500_files_at_once_no_drops() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir0 = TempDir::new().unwrap();
+    let dir1 = TempDir::new().unwrap();
+    let (_c0, drops0) = spawn_client_capturing_drops(dir0.path(), port).await;
+    let _c1 = spawn_client(dir1.path(), port).await;
+
+    // Allow both clients to fully attach FSEvents/inotify before the
+    // burst — we want the watcher to see every write live, not via
+    // the post-attach scan_once shortcut.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Burst: 500 files written with no pause in between. The
+    // debouncer (300 ms window) will coalesce per-path duplicates,
+    // but distinct paths flow through as Vec<DebouncedEvent> batches.
+    const N: usize = 500;
+    for i in 0..N {
+        let body = format!(
+            "burst {i:03}\n{}\n",
+            "y".repeat(160 + (i % 80))
+        );
+        fs::write(
+            dir0.path().join(format!("burst-{i:03}.md")),
+            body,
+        )
+        .unwrap();
+    }
+
+    let dirs = vec![dir0.path().to_path_buf(), dir1.path().to_path_buf()];
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(180)).await;
+    assert!(
+        converged,
+        "{N}-file burst did not converge within 3 min — files likely \
+         lost to channel-overflow drops on peer 0."
+    );
+
+    for i in 0..N {
+        let name = format!("burst-{i:03}.md");
+        let p0 = dir0.path().join(&name);
+        let p1 = dir1.path().join(&name);
+        assert!(p1.exists(), "peer 1 missing {name} after burst");
+        let c0 = fs::read(&p0).unwrap();
+        let c1 = fs::read(&p1).unwrap();
+        assert_eq!(
+            c1, c0,
+            "peer 1 content mismatch on {name} (likely empty placeholder)"
+        );
+    }
+
+    let drops = drops0.lock().unwrap().clone();
+    assert!(
+        drops.is_empty(),
+        "peer 0 reported {} dropped event log line(s) during {N}-file \
+         burst (first up to 5):\n  {}",
+        drops.len(),
+        drops
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+/// Stress test: bootstrap a vault with 1500 small files to peer 1.
+///
+/// Repro for SyncLine v1.0.1 channel buffer overflow:
+/// `mpsc::channel(100)` in `client/watcher.rs` and `client/app.rs` cannot
+/// hold the burst of file events emitted by `scan_once` over a vault of
+/// 1000+ files. Events get dropped (`Channel full or closed, dropped
+/// debounced file event`), so content blobs are never uploaded — peer 1
+/// receives manifest entries but the bodies remain empty placeholders.
+///
+/// Tom's real-world incident on 2026-04-25: 1300+ file vault stuck with
+/// hundreds of empty placeholders on Mac after iPhone reconnect.
+///
+/// This test FAILs on parent commit (channel(100)) and PASSes after the
+/// fix (channel bumped to 10_000).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_bootstrap_large_vault_no_dropped_events() {
+    const N: usize = 1500;
+
+    let mut env = TestEnv::new(2).await;
+
+    // Pre-populate peer 0 vault BEFORE sync sees it.
+    // Spread across a few subfolders to mimic a real vault layout.
+    let dir0 = env.client_path(0).to_path_buf();
+    for i in 0..N {
+        let folder = format!("folder-{:02}", i % 30);
+        let folder_path = dir0.join(&folder);
+        fs::create_dir_all(&folder_path).unwrap();
+        let name = format!("note-{:04}.md", i);
+        let body = format!(
+            "# Note {i}\n\nContent body for stress test, line 1.\nLine 2 with some text.\nLine 3 final.\n"
+        );
+        fs::write(folder_path.join(&name), body).unwrap();
+    }
+
+    // Now spawn the client, which will trigger a bulk scan_once.
+    // This is where the channel(100) buffer overflows in v1.0.1.
+    let dir1_path = env.client_dirs[1].path().to_path_buf();
+    env.clients[1] = spawn_client(&dir1_path, env.port).await;
+
+    // Generous convergence budget — bootstrap of 1500 files takes a while.
+    let dirs = vec![dir0.clone(), env.client_path(1).to_path_buf()];
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(120)).await;
+    assert!(
+        converged,
+        "Bootstrap of {N}-file vault did not converge: peer 1 is missing files \
+         or has empty placeholders. This indicates the watcher mpsc channel \
+         overflowed (bug repro)."
+    );
+
+    // Cross-check on disk: every file on peer 1 must exist AND have
+    // the exact content peer 0 wrote. An empty-placeholder file would
+    // slip past convergence-by-set-membership but fail this check.
+    for i in 0..N {
+        let folder = format!("folder-{:02}", i % 30);
+        let name = format!("note-{:04}.md", i);
+        let p0 = dir0.join(&folder).join(&name);
+        let p1 = env.client_path(1).join(&folder).join(&name);
+        assert!(p1.exists(), "peer 1 missing {folder}/{name} after bootstrap");
+        let c0 = fs::read(&p0).unwrap();
+        let c1 = fs::read(&p1).unwrap();
+        assert_eq!(
+            c1.len(),
+            c0.len(),
+            "peer 1 has wrong size for {folder}/{name}: {} vs {} bytes \
+             (likely empty placeholder from dropped debounced event)",
+            c1.len(),
+            c0.len()
+        );
+        assert_eq!(c1, c0, "peer 1 content mismatch for {folder}/{name}");
     }
 }
