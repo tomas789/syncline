@@ -699,6 +699,42 @@ async fn scan_once(
             continue;
         }
         visited_rel.insert(rel_str.clone());
+
+        // Tombstone-shadow check (§5.2 LWW on `deleted`).
+        //
+        // If the manifest already holds a tombstoned NodeId at this
+        // exact raw path, the on-disk file is a stale copy from
+        // before the delete propagated — typical when a peer
+        // reconnects with files it kept while the network was
+        // deleting them out from under it. The tombstone wins;
+        // remove the local file and skip both the text and binary
+        // create branches below. Without this, scan_once would mint
+        // a *fresh* NodeId for the stale path and broadcast it back
+        // to every peer, resurrecting the file network-wide.
+        //
+        // Modify-wins-over-delete (§6.3) is still honoured: if the
+        // node has a `modify_stamp` strictly newer than its
+        // `delete_stamp`, projection treats it as live and the entry
+        // shows up in `proj.by_path`, so we never reach this branch.
+        if let Some(shadow) = manifest.find_entry_by_path(&rel_str) {
+            if shadow.deleted && !proj.by_path.contains_key(&rel_str) {
+                debug!(
+                    node = ?shadow.id,
+                    path = %rel_str,
+                    "removing stale on-disk file shadowing manifest tombstone",
+                );
+                if let Err(e) = fs::remove_file(abs) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(
+                            path = %rel_str,
+                            "failed to remove stale tombstoned file: {e}",
+                        );
+                    }
+                }
+                continue;
+            }
+        }
+
         let ext = rel
             .extension()
             .and_then(|e| e.to_str())
