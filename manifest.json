@@ -1,7 +1,7 @@
 {
   "id": "syncline",
   "name": "Syncline (live sync)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.0.0",
   "description": "Real-time collaborative editing for your vault using CRDTs.",
   "author": "Tomas Krejci",
