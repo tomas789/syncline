@@ -1,11 +1,13 @@
 import {
   App,
+  ItemView,
   Plugin,
   PluginSettingTab,
   Setting,
   Notice,
   TFile,
   TAbstractFile,
+  WorkspaceLeaf,
   debounce,
 } from "obsidian";
 // @ts-ignore - rollup base64-inlines the .wasm binary at build time.
@@ -30,6 +32,29 @@ const DEFAULT_SETTINGS: SynclineSettings = {
 };
 
 type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
+
+// ---------------------------------------------------------------------------
+// Side-panel view
+// ---------------------------------------------------------------------------
+
+const VIEW_TYPE_SYNCLINE = "syncline-panel";
+const ACTIVITY_LOG_LIMIT = 10;
+
+type ActivityKind =
+  | "created"
+  | "received"
+  | "modified"
+  | "renamed"
+  | "deleted"
+  | "status";
+
+interface ActivityEvent {
+  kind: ActivityKind;
+  path: string;
+  detail?: string;
+  /** Wall-clock timestamp (ms since epoch) for the panel's relative-time display. */
+  at: number;
+}
 
 // ---------------------------------------------------------------------------
 // WASM binding shape (v1)
@@ -163,6 +188,13 @@ export default class SynclinePlugin extends Plugin {
   reconnectTimeout: number | null = null;
   reconnectAttempts = 0;
 
+  /**
+   * Ring buffer of recent sync events shown in the side panel. Capped at
+   * ACTIVITY_LOG_LIMIT so memory stays bounded; older events fall off the
+   * end as new ones arrive at the front.
+   */
+  activityLog: ActivityEvent[] = [];
+
   // ---------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------
@@ -183,6 +215,36 @@ export default class SynclinePlugin extends Plugin {
     );
     this.ribbonIconEl.addClass("syncline-ribbon", "disconnected");
 
+    this.registerView(
+      VIEW_TYPE_SYNCLINE,
+      (leaf) => new SynclineView(leaf, this),
+    );
+
+    this.addCommand({
+      id: "open-panel",
+      name: "Show panel",
+      callback: () => {
+        void this.activateView();
+      },
+    });
+
+    this.addCommand({
+      id: "syncline-reconnect",
+      name: "Reconnect to server",
+      callback: () => {
+        this.disconnect();
+        void this.connect();
+      },
+    });
+
+    this.addCommand({
+      id: "syncline-disconnect",
+      name: "Disconnect from server",
+      callback: () => {
+        this.disconnect();
+      },
+    });
+
     this.registerEvent(this.app.vault.on("modify", this.onFileModify));
     this.registerEvent(this.app.vault.on("create", this.onFileCreate));
     this.registerEvent(this.app.vault.on("delete", this.onFileDelete));
@@ -190,6 +252,49 @@ export default class SynclinePlugin extends Plugin {
 
     if (this.settings.autoSync) {
       await this.connect();
+    }
+  }
+
+  /**
+   * Reveal the Syncline side-panel view, opening it in the right sidebar
+   * if it isn't already. Activated by the "Show Syncline panel" command
+   * and by the ribbon icon's right-click affordance.
+   */
+  async activateView(): Promise<void> {
+    const { workspace } = this.app;
+
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_SYNCLINE);
+    if (existing.length > 0) {
+      await workspace.revealLeaf(existing[0]);
+      return;
+    }
+
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf) {
+      new Notice("Syncline: could not open panel (no right sidebar)");
+      return;
+    }
+    await leaf.setViewState({ type: VIEW_TYPE_SYNCLINE, active: true });
+    await workspace.revealLeaf(leaf);
+  }
+
+  /**
+   * Append an event to the activity log and notify any open panels so
+   * they can refresh. Trims to ACTIVITY_LOG_LIMIT entries.
+   */
+  recordActivity(kind: ActivityKind, path: string, detail?: string): void {
+    this.activityLog.unshift({ kind, path, detail, at: Date.now() });
+    if (this.activityLog.length > ACTIVITY_LOG_LIMIT) {
+      this.activityLog.length = ACTIVITY_LOG_LIMIT;
+    }
+    this.notifyPanels();
+  }
+
+  /** Push current state to every open panel view. */
+  private notifyPanels(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNCLINE)) {
+      const view = leaf.view;
+      if (view instanceof SynclineView) view.refresh();
     }
   }
 
@@ -326,6 +431,7 @@ export default class SynclinePlugin extends Plugin {
   // ---------------------------------------------------------------
 
   updateStatus(status: SyncStatus, text?: string) {
+    const prevStatus = this.syncStatus;
     this.syncStatus = status;
     this.statusIcon.className = `status-icon ${status}`;
     const statusTexts: Record<SyncStatus, string> = {
@@ -340,6 +446,12 @@ export default class SynclinePlugin extends Plugin {
       this.ribbonIconEl.removeClass("synced", "syncing", "error", "disconnected");
       this.ribbonIconEl.addClass(status);
       this.ribbonIconEl.setAttribute("aria-label", newText);
+    }
+    // Log only state transitions, not every 1 Hz tick of "synced (N files)".
+    if (prevStatus !== status) {
+      this.recordActivity("status", status, newText);
+    } else {
+      this.notifyPanels();
     }
   }
 
@@ -576,10 +688,12 @@ export default class SynclinePlugin extends Plugin {
         await this.removeLocalFile(path);
         this.subscribedContent.delete(prev.id);
         void this.removeContentState(prev.id);
+        this.recordActivity("deleted", path);
       } else {
         const current = byId.get(prev.id);
         if (current && current.path !== path) {
           await this.renameLocalFile(path, current.path);
+          this.recordActivity("renamed", current.path, `← ${path}`);
         }
       }
     }
@@ -587,6 +701,7 @@ export default class SynclinePlugin extends Plugin {
     // --- Additions / ensure-subscribed ---
     for (const row of projection) {
       const existing = this.app.vault.getAbstractFileByPath(row.path);
+      const wasKnown = this.lastProjection.has(row.path);
       if (row.kind === "text") {
         if (!(existing instanceof TFile)) {
           // File doesn't exist on disk yet — create placeholder so the
@@ -595,11 +710,15 @@ export default class SynclinePlugin extends Plugin {
             await this.ensureParentFolders(row.path);
             this.ignoreEvents.create.add(row.path);
             await this.app.vault.create(row.path, "");
+            this.recordActivity("created", row.path);
           } catch (e) {
             console.error(`[Syncline] create placeholder ${row.path}:`, e);
           } finally {
             setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
           }
+        } else if (!wasKnown) {
+          // Existing local file gaining a manifest entry — count as a fresh sync.
+          this.recordActivity("created", row.path);
         }
         if (!this.subscribedContent.has(row.id)) {
           this.subscribeToContent(row.id);
@@ -612,6 +731,7 @@ export default class SynclinePlugin extends Plugin {
     }
 
     this.lastProjection = byPath;
+    this.notifyPanels();
   }
 
   private async removeLocalFile(path: string): Promise<void> {
@@ -709,6 +829,7 @@ export default class SynclinePlugin extends Plugin {
         if (current === text) return;
         this.ignoreEvents.modify.add(row.path);
         await this.app.vault.modify(file, text);
+        this.recordActivity("received", row.path);
       } catch (e) {
         console.error(`[Syncline] modify ${row.path}:`, e);
       } finally {
@@ -719,6 +840,7 @@ export default class SynclinePlugin extends Plugin {
         await this.ensureParentFolders(row.path);
         this.ignoreEvents.create.add(row.path);
         await this.app.vault.create(row.path, text);
+        this.recordActivity("received", row.path);
       } catch (e) {
         console.error(`[Syncline] create ${row.path}:`, e);
       } finally {
@@ -788,6 +910,7 @@ export default class SynclinePlugin extends Plugin {
           await this.ensureParentFolders(row.path);
           await this.app.vault.createBinary(row.path, buffer);
         }
+        this.recordActivity("received", row.path);
       } catch (e) {
         console.error(`[Syncline] write blob → ${row.path}:`, e);
       } finally {
@@ -821,6 +944,7 @@ export default class SynclinePlugin extends Plugin {
         this.client.updateContentText(row.id, content);
         this.client.recordModifyText(row.path);
         void this.persistContentState(row.id);
+        this.recordActivity("modified", file.path);
       } catch (e) {
         console.error(`[Syncline] onModify text ${file.path}:`, e);
       }
@@ -832,6 +956,7 @@ export default class SynclinePlugin extends Plugin {
         if (row.blob_hash === hash) return;
         this.client.sendBlob(new Uint8Array(data));
         this.client.recordModifyBinary(row.path, hash, data.byteLength);
+        this.recordActivity("modified", file.path);
       } catch (e) {
         console.error(`[Syncline] onModify binary ${file.path}:`, e);
       }
@@ -881,6 +1006,7 @@ export default class SynclinePlugin extends Plugin {
       this.client.delete(file.path);
       this.subscribedContent.delete(row.id);
       void this.removeContentState(row.id);
+      this.recordActivity("deleted", file.path);
     } catch (e) {
       console.error(`[Syncline] delete ${file.path}:`, e);
     }
@@ -894,6 +1020,7 @@ export default class SynclinePlugin extends Plugin {
     if (row) {
       try {
         this.client.rename(oldPath, file.path);
+        this.recordActivity("renamed", file.path, `← ${oldPath}`);
       } catch (e) {
         console.error(`[Syncline] rename ${oldPath} → ${file.path}:`, e);
       }
@@ -901,6 +1028,160 @@ export default class SynclinePlugin extends Plugin {
       void this.ingestNewFile(file);
     }
   };
+}
+
+// ---------------------------------------------------------------------------
+// Side-panel view
+// ---------------------------------------------------------------------------
+
+const STATUS_LABELS: Record<SyncStatus, string> = {
+  synced: "Synced",
+  syncing: "Syncing…",
+  error: "Error",
+  disconnected: "Disconnected",
+};
+
+const ACTIVITY_LABELS: Record<ActivityKind, string> = {
+  created: "Created",
+  received: "Received",
+  modified: "Modified",
+  renamed: "Renamed",
+  deleted: "Deleted",
+  status: "Status",
+};
+
+/**
+ * Right-sidebar view showing live sync status, file count, recent activity,
+ * and a manual reconnect button. Rebuilt every time the plugin calls
+ * `notifyPanels()`; the plugin owns all state and the view is purely a
+ * projection of it.
+ */
+class SynclineView extends ItemView {
+  private plugin: SynclinePlugin;
+  private statusEl!: HTMLElement;
+  private statusDot!: HTMLElement;
+  private statusLabel!: HTMLElement;
+  private fileCountEl!: HTMLElement;
+  private activityEl!: HTMLElement;
+  private serverEl!: HTMLElement;
+  private actorEl!: HTMLElement;
+
+  constructor(leaf: WorkspaceLeaf, plugin: SynclinePlugin) {
+    super(leaf);
+    this.plugin = plugin;
+  }
+
+  getViewType(): string {
+    return VIEW_TYPE_SYNCLINE;
+  }
+
+  getDisplayText(): string {
+    return "Syncline";
+  }
+
+  getIcon(): string {
+    return "sync";
+  }
+
+  async onOpen(): Promise<void> {
+    const container = this.containerEl.children[1] as HTMLElement;
+    container.empty();
+    container.addClass("syncline-panel");
+
+    const header = container.createDiv({ cls: "syncline-panel-header" });
+    header.createEl("h4", { text: "Syncline" });
+
+    // --- Status block ---
+    this.statusEl = container.createDiv({ cls: "syncline-panel-status" });
+    this.statusDot = this.statusEl.createDiv({ cls: "status-icon disconnected" });
+    this.statusLabel = this.statusEl.createDiv({
+      cls: "syncline-panel-status-label",
+      text: STATUS_LABELS.disconnected,
+    });
+
+    // --- File count + server info ---
+    const meta = container.createDiv({ cls: "syncline-panel-meta" });
+    this.fileCountEl = meta.createDiv({ cls: "syncline-panel-meta-row" });
+    this.serverEl = meta.createDiv({ cls: "syncline-panel-meta-row" });
+    this.actorEl = meta.createDiv({ cls: "syncline-panel-meta-row" });
+
+    // --- Action buttons ---
+    const actions = container.createDiv({ cls: "syncline-panel-actions" });
+    const reconnectBtn = actions.createEl("button", {
+      cls: "mod-cta syncline-panel-button",
+      text: "Reconnect",
+    });
+    reconnectBtn.addEventListener("click", () => {
+      this.plugin.disconnect();
+      void this.plugin.connect();
+    });
+    const disconnectBtn = actions.createEl("button", {
+      cls: "syncline-panel-button",
+      text: "Disconnect",
+    });
+    disconnectBtn.addEventListener("click", () => this.plugin.disconnect());
+
+    // --- Activity feed ---
+    container.createEl("h5", { text: "Recent activity", cls: "syncline-panel-activity-heading" });
+    this.activityEl = container.createDiv({ cls: "syncline-panel-activity" });
+
+    this.refresh();
+  }
+
+  async onClose(): Promise<void> {
+    // Nothing to tear down — the plugin keeps the activity log; the view's
+    // DOM lives inside containerEl which Obsidian disposes for us.
+  }
+
+  /** Re-render from current plugin state. Called by `plugin.notifyPanels()`. */
+  refresh(): void {
+    if (!this.statusEl) return;
+    const status = this.plugin.syncStatus;
+    this.statusDot.className = `status-icon ${status}`;
+    this.statusLabel.setText(STATUS_LABELS[status]);
+
+    const count = this.plugin.lastProjection.size;
+    this.fileCountEl.setText(
+      `Tracked files: ${count}`,
+    );
+    this.serverEl.setText(`Server: ${this.plugin.settings.serverUrl}`);
+    const actor = this.plugin.settings.actorId;
+    this.actorEl.setText(
+      `Actor: ${actor ? actor.slice(0, 8) + "…" : "(not minted)"}`,
+    );
+
+    this.activityEl.empty();
+    if (this.plugin.activityLog.length === 0) {
+      this.activityEl.createDiv({
+        cls: "syncline-panel-activity-empty",
+        text: "No activity yet.",
+      });
+      return;
+    }
+    for (const ev of this.plugin.activityLog) {
+      const row = this.activityEl.createDiv({ cls: `syncline-panel-activity-row kind-${ev.kind}` });
+      row.createSpan({
+        cls: "syncline-panel-activity-kind",
+        text: ACTIVITY_LABELS[ev.kind],
+      });
+      row.createSpan({
+        cls: "syncline-panel-activity-path",
+        text: ev.detail ? `${ev.path} (${ev.detail})` : ev.path,
+      });
+      row.createSpan({
+        cls: "syncline-panel-activity-time",
+        text: formatRelativeTime(ev.at),
+      });
+    }
+  }
+}
+
+function formatRelativeTime(at: number): string {
+  const diff = Date.now() - at;
+  if (diff < 5_000) return "just now";
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  return `${Math.floor(diff / 3_600_000)}h ago`;
 }
 
 // ---------------------------------------------------------------------------
