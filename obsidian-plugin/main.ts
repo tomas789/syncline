@@ -979,6 +979,12 @@ export default class SynclinePlugin extends Plugin {
 
   private async ingestNewFile(file: TFile): Promise<void> {
     if (!this.client) return;
+    // The path is already managed by the manifest (e.g. Obsidian fired
+    // a synthetic create event during initial vault indexing for files
+    // that were already on disk). The reconcile loop will pick up any
+    // content drift via ensureBinaryInSync / onContentChanged — nothing
+    // to do here.
+    if (this.lastProjection.has(file.path)) return;
     try {
       if (isTextFile(file)) {
         const content = await this.app.vault.read(file);
@@ -997,7 +1003,17 @@ export default class SynclinePlugin extends Plugin {
         const data = await this.app.vault.readBinary(file);
         const hash = await sha256Hex(data);
         this.client.sendBlob(new Uint8Array(data));
-        this.client.createBinary(file.path, hash, data.byteLength);
+        try {
+          this.client.createBinary(file.path, hash, data.byteLength);
+        } catch (e) {
+          // Path race: between the lastProjection check and now, the
+          // manifest sprouted an entry at this path (likely a remote
+          // update arrived mid-ingest). The blob we just sent is still
+          // useful — the existing manifest entry's blob_hash will pull
+          // it down on the next reconcile if hashes match. Nothing more
+          // to do.
+          console.debug(`[Syncline] createBinary collision for ${file.path}:`, e);
+        }
       }
     } catch (e) {
       console.error(`[Syncline] ingestNewFile ${file.path}:`, e);
