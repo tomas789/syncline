@@ -153,6 +153,17 @@ function isMissingFileError(e: unknown): boolean {
   return /ENOENT|no such file or directory/i.test(msg);
 }
 
+/**
+ * Transient WebSocket-not-yet-up errors thrown by the WASM client.
+ * Reconcile fires before the WS handshake completes during cold sync,
+ * and the same passes will re-fire once the server has replayed the
+ * manifest, so "not connected" is benign here.
+ */
+function isNotConnectedError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("not connected");
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -873,20 +884,40 @@ export default class SynclinePlugin extends Plugin {
         const data = await this.app.vault.readBinary(file);
         const localHash = await sha256Hex(data);
         if (localHash === row.blob_hash) return;
-        if (this.requestedBlobs.has(row.blob_hash)) return;
-        this.requestedBlobs.add(row.blob_hash);
-        this.client.requestBlob(row.blob_hash);
+        this.tryRequestBlob(row.blob_hash);
       } catch (e) {
+        // Disk-side I/O on a stale TFile — nothing to do.
+        if (isMissingFileError(e)) return;
         console.error(`[Syncline] ensureBinaryInSync ${row.path}:`, e);
       }
     } else {
-      if (this.requestedBlobs.has(row.blob_hash)) return;
-      this.requestedBlobs.add(row.blob_hash);
-      try {
-        this.client.requestBlob(row.blob_hash);
-      } catch (e) {
-        console.error(`[Syncline] requestBlob ${row.blob_hash}:`, e);
-      }
+      this.tryRequestBlob(row.blob_hash);
+    }
+  }
+
+  /**
+   * Request a blob from the server, but only if the WebSocket is
+   * actually connected. The reconcile loop runs eagerly after the
+   * manifest is loaded from disk — well before the WS handshake
+   * completes — so a naive call throws "request_blob: not connected"
+   * for every binary row. We must NOT mark the hash as requested in
+   * that case, otherwise the post-connect reconcile pass skips it.
+   * "not connected" is a transient state; the next reconcile (which
+   * fires once the server replays the manifest after handshake) picks
+   * it up.
+   */
+  private tryRequestBlob(hash: string): void {
+    if (!this.client) return;
+    if (this.requestedBlobs.has(hash)) return;
+    if (!this.client.isConnected()) return;
+    try {
+      this.client.requestBlob(hash);
+      this.requestedBlobs.add(hash);
+    } catch (e) {
+      // The connect state may have flipped between isConnected() and
+      // requestBlob; treat as transient so the next reconcile retries.
+      if (isNotConnectedError(e)) return;
+      console.error(`[Syncline] requestBlob ${hash}:`, e);
     }
   }
 
