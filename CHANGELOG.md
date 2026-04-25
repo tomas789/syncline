@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/tomas789/syncline/compare/v1.0.0...v1.0.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* **client:** scan_once respects tombstones on reconnect ([13b7843](https://github.com/tomas789/syncline/commit/13b7843076e1a09e3630c7ef4f5ee889cbc06ab2))
+* **plugin:** address ObsidianReviewBot lint findings ([d8302cf](https://github.com/tomas789/syncline/commit/d8302cf456f54dc11a0a5e9d1f58c1c3046e7e5c))
+
 ## [0.6.0](https://github.com/tomas789/syncline/compare/v0.5.2...v0.6.0) (2026-04-15)
 
 
