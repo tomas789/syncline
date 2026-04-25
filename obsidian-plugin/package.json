@@ -7,7 +7,8 @@
   "scripts": {
     "build:wasm": "cd ../syncline && wasm-pack build --target web --out-dir ../obsidian-plugin/wasm",
     "build": "npm run build:wasm && rollup --config rollup.config.js",
-    "dev": "rollup --config rollup.config.js --watch"
+    "dev": "rollup --config rollup.config.js --watch",
+    "lint": "eslint ."
   },
   "keywords": [
     "obsidian",

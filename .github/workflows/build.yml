@@ -68,11 +68,25 @@ jobs:
         with:
           node-version: 18
 
-      - name: Build Obsidian Plugin
+      - name: Install Obsidian Plugin dependencies
         run: |
           cd obsidian-plugin
           npm ci
-          npm run build
+
+      - name: Build Obsidian Plugin WASM
+        run: |
+          cd obsidian-plugin
+          npm run build:wasm
+
+      - name: Lint Obsidian Plugin (obsidianmd/eslint-plugin)
+        run: |
+          cd obsidian-plugin
+          npm run lint
+
+      - name: Build Obsidian Plugin
+        run: |
+          cd obsidian-plugin
+          npx rollup --config rollup.config.js
 
       - name: Run E2E Tests
         run: |
