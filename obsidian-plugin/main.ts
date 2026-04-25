@@ -114,12 +114,6 @@ const IGNORE_CHANGES_TIMEOUT_MS = 1000;
 /** Extensions that project as text nodes (Y.Text CRDT). Everything else is binary. */
 const TEXT_EXTENSIONS = new Set(["md", "txt"]);
 
-function isTextPath(path: string): boolean {
-  const dot = path.lastIndexOf(".");
-  if (dot < 0) return false;
-  return TEXT_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
-}
-
 function isTextFile(file: TFile): boolean {
   return TEXT_EXTENSIONS.has((file.extension ?? "").toLowerCase());
 }
@@ -278,7 +272,7 @@ export default class SynclinePlugin extends Plugin {
         snap.byteOffset + snap.byteLength,
       ) as ArrayBuffer;
       await this.app.vault.adapter.writeBinary(this.manifestPath, buffer);
-      const lamport = this.client.lamport().toString();
+      const lamport = String(this.client.lamport());
       await this.app.vault.adapter.write(this.lamportPath, lamport);
     } catch (e) {
       console.error("[Syncline] Failed to persist manifest:", e);
@@ -407,10 +401,10 @@ export default class SynclinePlugin extends Plugin {
       // so the borrow is released before we read.
       this.client.onManifestChanged(() => {
         this.persistManifestDebounced();
-        Promise.resolve().then(() => this.reconcileProjection());
+        void Promise.resolve().then(() => this.reconcileProjection());
       });
       this.client.onContentChanged((nodeId) => {
-        Promise.resolve().then(() => this.onContentChanged(nodeId));
+        void Promise.resolve().then(() => this.onContentChanged(nodeId));
       });
       this.client.onBlob((hash, bytes) => {
         void this.onBlobReceived(hash, bytes);
@@ -963,7 +957,7 @@ class SynclineSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Identity").setHeading();
     new Setting(containerEl)
       .setName("Actor ID")
-      .setDesc("Stable per-installation identifier used for CRDT authorship.")
+      .setDesc("Stable per-installation identifier used for sync authorship.")
       .addText((text) => {
         text
           .setPlaceholder("(minted on first connect)")
