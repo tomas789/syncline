@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0](https://github.com/tomas789/syncline/compare/v1.0.1...v1.1.0) (2026-04-25)
+
+
+### Features
+
+* **cli:** sync hidden files with .synclineignore filter ([04669d7](https://github.com/tomas789/syncline/commit/04669d7626fead8681d328d02d6cccb194ab9050))
+
+
+### Bug Fixes
+
+* **client:** bump scan_once channel buffer 16 → 10000 + blocking_send backpressure ([9d145eb](https://github.com/tomas789/syncline/commit/9d145eb8ae20990f26cef2b2667820e794eebdd6))
+
 ## [1.0.1](https://github.com/tomas789/syncline/compare/v1.0.0...v1.0.1) (2026-04-25)
 
 
