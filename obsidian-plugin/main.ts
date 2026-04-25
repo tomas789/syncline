@@ -139,6 +139,20 @@ function isAlreadyExistsError(e: unknown): boolean {
   return msg.includes("already exists");
 }
 
+/**
+ * "ENOENT: no such file or directory" — the inverse of the above. The
+ * vault index disagrees with disk in the other direction: Obsidian
+ * thinks a file/state-blob is there, the underlying syscall says no.
+ * Surfaces during vault.read on a stale TFile, fileManager.trashFile
+ * on a path that vanished, and adapter.remove racing with adapter.exists.
+ * These are recoverable: the desired post-state ("file is gone" or
+ * "content not loadable") matches reality, so treat as benign.
+ */
+function isMissingFileError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e));
+  return /ENOENT|no such file or directory/i.test(msg);
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -315,6 +329,9 @@ export default class SynclinePlugin extends Plugin {
     try {
       return new Uint8Array(await adapter.readBinary(p));
     } catch (e) {
+      // exists() returned true but read raced with a concurrent
+      // removeContentState — treat as "no state" and move on.
+      if (isMissingFileError(e)) return null;
       console.error(`[Syncline] Failed to load content state ${nodeId}:`, e);
       return null;
     }
@@ -343,6 +360,8 @@ export default class SynclinePlugin extends Plugin {
       try {
         await adapter.remove(p);
       } catch (e) {
+        // Concurrent remove already cleaned this up — that's fine.
+        if (isMissingFileError(e)) return;
         console.error(`[Syncline] Failed to remove content state ${nodeId}:`, e);
       }
     }
@@ -686,6 +705,9 @@ export default class SynclinePlugin extends Plugin {
     try {
       await this.app.fileManager.trashFile(file);
     } catch (e) {
+      // Disk doesn't have it — Obsidian's index will catch up. The
+      // CRDT-side removal already happened, so this is a no-op locally.
+      if (isMissingFileError(e)) return;
       console.error(`[Syncline] trash ${path}:`, e);
     } finally {
       setTimeout(() => this.ignoreEvents.delete.delete(path), IGNORE_CHANGES_TIMEOUT_MS);
@@ -701,6 +723,12 @@ export default class SynclinePlugin extends Plugin {
       this.ignoreEvents.rename.add(to);
       await this.app.fileManager.renameFile(file, to);
     } catch (e) {
+      // Source no longer on disk (Obsidian's index hadn't caught up) —
+      // the rename target either already exists or doesn't matter.
+      if (isMissingFileError(e)) return;
+      // Target already exists / is a folder collision — also benign,
+      // we'll converge on the next reconcile pass.
+      if (isAlreadyExistsError(e)) return;
       console.error(`[Syncline] rename ${from} → ${to}:`, e);
     } finally {
       setTimeout(() => {
@@ -777,7 +805,20 @@ export default class SynclinePlugin extends Plugin {
     void this.persistContentState(nodeId);
     if (file instanceof TFile) {
       try {
-        const current = await this.app.vault.read(file);
+        let current: string;
+        try {
+          current = await this.app.vault.read(file);
+        } catch (e) {
+          if (!isMissingFileError(e)) throw e;
+          // Vault index has the TFile but the underlying file was
+          // deleted out from under us. Treat it as "needs to be (re-)
+          // written" — fall through to write the CRDT content via the
+          // adapter so the file is restored on disk.
+          this.ignoreEvents.modify.add(row.path);
+          await this.ensureParentFolders(row.path);
+          await this.app.vault.adapter.write(row.path, text);
+          return;
+        }
         if (current === text) return;
         this.ignoreEvents.modify.add(row.path);
         await this.app.vault.modify(file, text);
@@ -910,6 +951,9 @@ export default class SynclinePlugin extends Plugin {
         this.client.recordModifyText(row.path);
         void this.persistContentState(row.id);
       } catch (e) {
+        // Stale TFile in the index for a file that's no longer on disk
+        // — Obsidian will fire a delete event soon; nothing to do here.
+        if (isMissingFileError(e)) return;
         console.error(`[Syncline] onModify text ${file.path}:`, e);
       }
     } else if (row.kind === "binary") {
@@ -921,6 +965,7 @@ export default class SynclinePlugin extends Plugin {
         this.client.sendBlob(new Uint8Array(data));
         this.client.recordModifyBinary(row.path, hash, data.byteLength);
       } catch (e) {
+        if (isMissingFileError(e)) return;
         console.error(`[Syncline] onModify binary ${file.path}:`, e);
       }
     }
