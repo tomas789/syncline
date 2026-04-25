@@ -126,6 +126,19 @@ async function sha256Hex(data: ArrayBuffer): Promise<string> {
     .join("");
 }
 
+/**
+ * Obsidian's vault.create / vault.createFolder throw with a message that
+ * contains "already exists" when the target is on disk. This happens when
+ * the vault's in-memory file tree is desynced from disk (folders created
+ * by an external process, by adapter.mkdir, or differing in case/Unicode).
+ * Treat these as a no-op rather than rethrowing — the path is exactly
+ * what we wanted.
+ */
+function isAlreadyExistsError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("already exists");
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -158,6 +171,20 @@ export default class SynclinePlugin extends Plugin {
   subscribedContent: Set<string> = new Set();
   /** Blob hashes we've already fetched this session (to avoid re-requests). */
   requestedBlobs: Set<string> = new Set();
+
+  /**
+   * Single-flight guard for reconcileProjection. The manifest CRDT can
+   * fire `onManifestChanged` hundreds of times in a row (one per remote
+   * update during a cold sync); each fire scheduled a fresh reconcile,
+   * and concurrent reconciles raced on createFolder/create — flooding
+   * the console with spurious "already exists" errors.
+   *
+   * - `runningReconcile` holds the in-flight reconcile (or null).
+   * - `reconcilePending` collapses any further requests into one trailing
+   *   run that fires after the current one settles.
+   */
+  private runningReconcile: Promise<void> | null = null;
+  private reconcilePending: boolean = false;
 
   statusCheckInterval: number | null = null;
   reconnectTimeout: number | null = null;
@@ -456,6 +483,7 @@ export default class SynclinePlugin extends Plugin {
     this.lastProjection.clear();
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
+    this.reconcilePending = false;
     this.updateStatus("disconnected");
   }
 
@@ -560,7 +588,39 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
+  /**
+   * Reconcile the manifest projection with the on-disk vault. Single-
+   * flighted: if a reconcile is already running when this is called,
+   * mark a trailing reconcile and return; the trailing reconcile picks
+   * up any state that landed during the in-flight one.
+   */
   async reconcileProjection(): Promise<void> {
+    if (this.runningReconcile) {
+      this.reconcilePending = true;
+      return this.runningReconcile;
+    }
+    const run = (async () => {
+      try {
+        do {
+          this.reconcilePending = false;
+          try {
+            await this.reconcileProjectionInner();
+          } catch (e) {
+            // A throw here would strand the single-flight guard and
+            // also drop any pending trailing reconcile. Log and keep
+            // looping so subsequent manifest updates still get applied.
+            console.error("[Syncline] reconcile error:", e);
+          }
+        } while (this.reconcilePending && this.client);
+      } finally {
+        this.runningReconcile = null;
+      }
+    })();
+    this.runningReconcile = run;
+    return run;
+  }
+
+  private async reconcileProjectionInner(): Promise<void> {
     if (!this.client) return;
     const projection = this.readProjection();
     const byPath = new Map<string, ProjectionRow>();
@@ -596,7 +656,12 @@ export default class SynclinePlugin extends Plugin {
             this.ignoreEvents.create.add(row.path);
             await this.app.vault.create(row.path, "");
           } catch (e) {
-            console.error(`[Syncline] create placeholder ${row.path}:`, e);
+            // The placeholder may already be on disk even though Obsidian's
+            // in-memory tree didn't surface it via getAbstractFileByPath;
+            // that's a benign desync, not a sync failure.
+            if (!isAlreadyExistsError(e)) {
+              console.error(`[Syncline] create placeholder ${row.path}:`, e);
+            }
           } finally {
             setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
           }
@@ -651,15 +716,22 @@ export default class SynclinePlugin extends Plugin {
     let cur = "";
     for (const part of parts) {
       cur = cur ? `${cur}/${part}` : part;
-      if (!this.app.vault.getAbstractFileByPath(cur)) {
-        try {
-          await this.app.vault.createFolder(cur);
-        } catch (e) {
-          if (!this.app.vault.getAbstractFileByPath(cur)) {
-            console.error(`[Syncline] create folder ${cur}:`, e);
-            throw e;
-          }
-        }
+      if (this.app.vault.getAbstractFileByPath(cur)) continue;
+      // The in-memory file tree may be out of sync with disk (e.g. folder
+      // created externally, by adapter.mkdir, or differing in
+      // case/Unicode). Fall back to a direct adapter.exists() probe before
+      // attempting createFolder so we don't spam errors on every reconcile.
+      try {
+        if (await this.app.vault.adapter.exists(cur)) continue;
+      } catch {
+        // adapter.exists itself shouldn't throw, but if it does we'll
+        // still try createFolder below.
+      }
+      try {
+        await this.app.vault.createFolder(cur);
+      } catch (e) {
+        if (isAlreadyExistsError(e)) continue;
+        throw e;
       }
     }
   }
@@ -718,7 +790,16 @@ export default class SynclinePlugin extends Plugin {
       try {
         await this.ensureParentFolders(row.path);
         this.ignoreEvents.create.add(row.path);
-        await this.app.vault.create(row.path, text);
+        try {
+          await this.app.vault.create(row.path, text);
+        } catch (e) {
+          if (!isAlreadyExistsError(e)) throw e;
+          // The file is on disk but Obsidian's in-memory tree didn't see
+          // it. We still need the content written; fall back to the
+          // adapter so we don't silently drop the update. Obsidian's
+          // file-watcher will reconcile its tree shortly after.
+          await this.app.vault.adapter.write(row.path, text);
+        }
       } catch (e) {
         console.error(`[Syncline] create ${row.path}:`, e);
       } finally {
@@ -786,7 +867,14 @@ export default class SynclinePlugin extends Plugin {
           await this.app.vault.modifyBinary(file, buffer);
         } else {
           await this.ensureParentFolders(row.path);
-          await this.app.vault.createBinary(row.path, buffer);
+          try {
+            await this.app.vault.createBinary(row.path, buffer);
+          } catch (e) {
+            if (!isAlreadyExistsError(e)) throw e;
+            // Disk has the file even though the vault index doesn't —
+            // write through the adapter so we don't drop the blob.
+            await this.app.vault.adapter.writeBinary(row.path, buffer);
+          }
         }
       } catch (e) {
         console.error(`[Syncline] write blob → ${row.path}:`, e);
