@@ -325,7 +325,7 @@ async fn run_session(
     // (network mounts, some VM filesystems, fsevents quirks).
     let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<
         std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>,
-    >(16);
+    >(10000);
     let mut watcher = match DebouncedWatcher::new(watcher_tx, Duration::from_millis(DEBOUNCE_MS)) {
         Ok(w) => Some(w),
         Err(e) => {
