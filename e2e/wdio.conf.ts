@@ -31,8 +31,11 @@ export const config = {
         // Per-test budget. The cold-build setup runs in `before()` (which
         // has its own 180s timeout); each test only waits for one
         // cross-process sync round-trip and finishes in seconds.
-        // Bumped to 120s as a safety margin for slow CI (Linux scan
-        // detection of unlinks can lag a noticeable bit on the GHA runner).
-        timeout: 120000
+        // Linux GHA runners occasionally drift past the previous 120s
+        // budget on the "propagates deletes CLI → Obsidian" test (the
+        // unlink → 5s scanner poll → manifest broadcast → plugin
+        // reconcile → vault trash chain stacks several debounces).
+        // 240s gives generous headroom without changing semantics.
+        timeout: 240000
     },
 };
