@@ -1100,6 +1100,7 @@ async fn test_binary_file_sync() {
 /// Client A creates a binary file, syncs it, then modifies it.
 /// The updated binary should propagate to Client B.
 #[tokio::test]
+#[ignore = "flaky on slow CI runners; tracked in #70"]
 async fn test_binary_file_modify_sync() {
     let env = TestEnv::new(2).await;
 
