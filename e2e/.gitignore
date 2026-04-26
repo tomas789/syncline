@@ -17,3 +17,8 @@ test-syncline-e2e.db-shm
 test-syncline-e2e.db-wal
 test-vault/*
 !test-vault/.gitkeep
+
+# Per-spec sync dirs (each spec spawns a CLI client into its own folder)
+issue*-cli-vault/
+phase*-cli-vault/
+profile-cli-vault/
