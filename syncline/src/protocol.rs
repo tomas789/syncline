@@ -42,8 +42,16 @@ pub const MANIFEST_UPDATE: u8 = 2;
 pub const V1_PROTOCOL_MAJOR: u8 = 1;
 pub const V1_PROTOCOL_MINOR: u8 = 0;
 
-/// Maximum blob size in bytes (50 MB).
-pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;
+/// Maximum size of a single blob frame on the wire (5 MiB).
+///
+/// Sized to sit safely under the WebSocket frame ceiling that
+/// `tokio-tungstenite` enforces by default (16 MiB) — see issue #59
+/// for the failure mode this constant prevents. Files larger than the
+/// per-chunk cap go through the [`v1::chunker`] which slices them into
+/// pieces of at most [`v1::chunker::MAX_CHUNK_SIZE`] (4 MiB) before
+/// they reach this layer, so this 5 MiB ceiling is in practice an
+/// overrun-detector rather than a hard limit on user content.
+pub const MAX_BLOB_SIZE: usize = 5 * 1024 * 1024;
 
 pub fn encode_message(msg_type: u8, doc_id: &str, payload: &[u8]) -> Vec<u8> {
     let doc_id_bytes = doc_id.as_bytes();

@@ -13,7 +13,14 @@
 //! | `parent`     | String  | parent NodeId, empty string = vault root         |
 //! | `deleted`    | bool    | tombstone flag                                   |
 //! | `kind`       | String  | `"text"` / `"binary"` / `"directory"`            |
-//! | `blob`       | String  | hex SHA-256, absent unless `kind == "binary"`    |
+//! | `chunks`     | String  | comma-separated hex SHA-256 chunk hashes; only   |
+//! |              |         | meaningful when `kind == "binary"`. Length 0 =   |
+//! |              |         | empty placeholder; 1 = small file (single chunk);|
+//! |              |         | 2+ = chunked large file (FastCDC).               |
+//! | `blob`       | String  | **legacy field**, single hash. Read for          |
+//! |              |         | back-compat with manifests written before #59;   |
+//! |              |         | new writes always go through `chunks`. Decoded   |
+//! |              |         | as a length-1 `chunks` list.                     |
 //! | `size`       | i64     | bytes (hint for UI / GC)                         |
 //! | `created_at` | i64     | lamport of the create event (immutable)          |
 //! | `c_actor`    | String  | actor that created the entry (immutable)         |
@@ -66,7 +73,17 @@ pub struct NodeEntry {
     pub parent: Option<NodeId>,
     pub deleted: bool,
     pub kind: NodeKind,
-    pub blob_hash: Option<String>,
+    /// SHA-256 hex hashes of the file's content-defined chunks, in
+    /// file order. Empty for non-binary entries and for binaries with
+    /// no content yet (e.g. zero-byte placeholders).
+    ///
+    /// - `len() == 0` — no content
+    /// - `len() == 1` — small binary (single chunk holds the whole file)
+    /// - `len() >= 2` — chunked large binary (each chunk ≤ MAX_CHUNK_SIZE)
+    ///
+    /// Concatenating the bytes of each chunk in order reproduces the
+    /// original file. See [`v1::chunker`].
+    pub chunk_hashes: Vec<String>,
     pub size: u64,
     pub created_at: Lamport,
     pub created_by: ActorId,
@@ -81,6 +98,23 @@ impl NodeEntry {
         let create = Stamp::new(self.created_at, self.created_by);
         let candidates = [Some(create), self.delete_stamp, self.modify_stamp];
         candidates.into_iter().flatten().max().unwrap()
+    }
+
+    /// Backwards-compatible accessor: returns `Some(&hash)` only when
+    /// the entry has exactly one chunk (the legacy single-blob shape).
+    /// Multi-chunk binaries return `None` here — callers that need to
+    /// reason about multi-chunk content must look at [`chunk_hashes`]
+    /// directly.
+    ///
+    /// Used by sites that pre-date #59 and just want "the hash that
+    /// identifies this binary's bytes", and by sites that haven't yet
+    /// been generalised to handle multi-chunk binaries.
+    pub fn single_blob_hash(&self) -> Option<&str> {
+        if self.chunk_hashes.len() == 1 {
+            Some(self.chunk_hashes[0].as_str())
+        } else {
+            None
+        }
     }
 }
 
@@ -182,12 +216,16 @@ impl Manifest {
     // ------------------------------------------------------------------
 
     /// Insert a brand-new node. Returns the chosen `NodeId`.
+    ///
+    /// `chunk_hashes` carries the chunked content layout (see
+    /// [`NodeEntry::chunk_hashes`]). Pass an empty slice for non-binary
+    /// nodes or for binaries that have no content yet.
     pub fn create_node(
         &mut self,
         name: &str,
         parent: Option<NodeId>,
         kind: NodeKind,
-        blob_hash: Option<&str>,
+        chunk_hashes: &[String],
         size: u64,
     ) -> NodeId {
         let id = NodeId::new();
@@ -202,10 +240,7 @@ impl Manifest {
             ("parent", Any::from(parent_str)),
             ("deleted", Any::from(false)),
             ("kind", Any::from(kind.as_str().to_string())),
-            (
-                "blob",
-                Any::from(blob_hash.unwrap_or("").to_string()),
-            ),
+            ("chunks", Any::from(encode_chunk_list(chunk_hashes))),
             ("size", Any::from(size as i64)),
             ("created_at", Any::from(lamp.get() as i64)),
             ("c_actor", Any::from(actor.to_string_hyphenated())),
@@ -279,16 +314,29 @@ impl Manifest {
         true
     }
 
-    /// Update a binary's blob hash (after CAS push). Also stamps modify.
-    pub fn set_blob_hash(&mut self, id: NodeId, hash: &str, size: u64) -> bool {
+    /// Update a binary's chunk-hash list (after CAS push of every chunk).
+    /// Also stamps modify.
+    ///
+    /// `total_size` is the byte count of the assembled file (sum of all
+    /// chunk lengths), used by UI / GC; the manifest does not derive it
+    /// from `chunks` because chunk byte counts aren't stored here.
+    pub fn set_chunk_hashes(
+        &mut self,
+        id: NodeId,
+        chunk_hashes: &[String],
+        total_size: u64,
+    ) -> bool {
         let lamp = self.lamport.tick();
         let actor_str = self.actor.to_string_hyphenated();
         let mut txn = self.doc.transact_mut();
         let Some(entry) = get_entry_map(&self.nodes, &txn, id) else {
             return false;
         };
-        entry.insert(&mut txn, "blob", hash.to_string());
-        entry.insert(&mut txn, "size", size as i64);
+        entry.insert(&mut txn, "chunks", encode_chunk_list(chunk_hashes));
+        // Clear the legacy field so an old reader doesn't conflate the
+        // pre-#59 single-hash with the new chunked content.
+        entry.insert(&mut txn, "blob", String::new());
+        entry.insert(&mut txn, "size", total_size as i64);
         entry.insert(&mut txn, "mod_lamp", lamp.get() as i64);
         entry.insert(&mut txn, "mod_actor", actor_str);
         true
@@ -427,11 +475,26 @@ fn decode_entry<T: ReadTxn>(id: NodeId, m: &MapRef, txn: &T) -> Option<NodeEntry
         Some(Out::Any(Any::String(s))) => NodeKind::from_str(&s)?,
         _ => return None,
     };
-    let blob_str = match m.get(txn, "blob") {
+    let chunks_str = match m.get(txn, "chunks") {
         Some(Out::Any(Any::String(s))) => s.to_string(),
         _ => String::new(),
     };
-    let blob_hash = if blob_str.is_empty() { None } else { Some(blob_str) };
+    let chunk_hashes = if !chunks_str.is_empty() {
+        decode_chunk_list(&chunks_str)
+    } else {
+        // Legacy fallback: an entry written before #59 carries its
+        // single-blob hash in the `blob` field. Read it and project as
+        // a length-1 chunk list so downstream code is uniform.
+        let blob_str = match m.get(txn, "blob") {
+            Some(Out::Any(Any::String(s))) => s.to_string(),
+            _ => String::new(),
+        };
+        if blob_str.is_empty() {
+            Vec::new()
+        } else {
+            vec![blob_str]
+        }
+    };
     let size = read_u64(m, txn, "size").unwrap_or(0);
     let created_at = read_u64(m, txn, "created_at")
         .map(Lamport)
@@ -449,13 +512,38 @@ fn decode_entry<T: ReadTxn>(id: NodeId, m: &MapRef, txn: &T) -> Option<NodeEntry
         parent,
         deleted,
         kind,
-        blob_hash,
+        chunk_hashes,
         size,
         created_at,
         created_by,
         delete_stamp,
         modify_stamp,
     })
+}
+
+/// Encode a chunk-hash list for the manifest's `chunks` field.
+///
+/// Hashes are joined with `,` — a single character that never appears
+/// in a hex SHA-256 digest, so the encoding is unambiguous and trivial
+/// to decode. An empty list encodes as `""`, distinguishing
+/// "no content" from a single zero-length chunk (which is impossible
+/// because chunks always cover ≥ 1 byte; a truly empty file produces
+/// an empty list).
+fn encode_chunk_list(chunks: &[String]) -> String {
+    chunks.join(",")
+}
+
+/// Decode a chunk-hash list from the manifest's `chunks` field.
+///
+/// Tolerant of empty input (returns empty list) and stray whitespace,
+/// since the encoding is internal but having a defensive decoder costs
+/// nothing.
+fn decode_chunk_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
 }
 
 fn read_stamp<T: ReadTxn>(
@@ -494,14 +582,14 @@ mod tests {
     #[test]
     fn create_node_returns_retrievable_entry() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("note.md", None, NodeKind::Text, None, 42);
+        let id = m.create_node("note.md", None, NodeKind::Text, &[], 42);
         let e = m.get_entry(id).expect("entry must exist");
         assert_eq!(e.id, id);
         assert_eq!(e.name, "note.md");
         assert_eq!(e.parent, None);
         assert!(!e.deleted);
         assert_eq!(e.kind, NodeKind::Text);
-        assert_eq!(e.blob_hash, None);
+        assert!(e.chunk_hashes.is_empty());
         assert_eq!(e.size, 42);
     }
 
@@ -509,16 +597,16 @@ mod tests {
     fn create_node_bumps_lamport() {
         let mut m = Manifest::new(ActorId::new());
         assert_eq!(m.lamport(), Lamport::ZERO);
-        m.create_node("a.md", None, NodeKind::Text, None, 0);
+        m.create_node("a.md", None, NodeKind::Text, &[], 0);
         assert_eq!(m.lamport(), Lamport(1));
-        m.create_node("b.md", None, NodeKind::Text, None, 0);
+        m.create_node("b.md", None, NodeKind::Text, &[], 0);
         assert_eq!(m.lamport(), Lamport(2));
     }
 
     #[test]
     fn rename_updates_name_preserves_id() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("old.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("old.md", None, NodeKind::Text, &[], 0);
         assert!(m.set_name(id, "new.md"));
         let e = m.get_entry(id).unwrap();
         assert_eq!(e.name, "new.md");
@@ -529,8 +617,8 @@ mod tests {
     #[test]
     fn set_parent_updates_parent() {
         let mut m = Manifest::new(ActorId::new());
-        let dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
-        let file = m.create_node("file.md", None, NodeKind::Text, None, 0);
+        let dir = m.create_node("folder", None, NodeKind::Directory, &[], 0);
+        let file = m.create_node("file.md", None, NodeKind::Text, &[], 0);
         assert!(m.set_parent(file, Some(dir)));
         let e = m.get_entry(file).unwrap();
         assert_eq!(e.parent, Some(dir));
@@ -539,7 +627,7 @@ mod tests {
     #[test]
     fn delete_sets_flag_and_stamp() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("doomed.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("doomed.md", None, NodeKind::Text, &[], 0);
         assert!(m.delete(id));
         let e = m.get_entry(id).unwrap();
         assert!(e.deleted);
@@ -551,7 +639,7 @@ mod tests {
     #[test]
     fn record_modify_sets_mod_stamp() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("f.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("f.md", None, NodeKind::Text, &[], 0);
         let before = m.get_entry(id).unwrap().modify_stamp;
         m.record_modify(id);
         let after = m.get_entry(id).unwrap().modify_stamp;
@@ -570,7 +658,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let mut m1 = Manifest::new(ActorId::new());
-        let id = m1.create_node("r.md", None, NodeKind::Text, None, 7);
+        let id = m1.create_node("r.md", None, NodeKind::Text, &[], 7);
         let state = m1.encode_state_as_update();
 
         let m2 = Manifest::from_update(ActorId::new(), Lamport::ZERO, &state).unwrap();
@@ -582,9 +670,9 @@ mod tests {
     #[test]
     fn apply_update_advances_lamport() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a", None, NodeKind::Text, None, 0);
-        m1.create_node("b", None, NodeKind::Text, None, 0);
-        m1.create_node("c", None, NodeKind::Text, None, 0);
+        m1.create_node("a", None, NodeKind::Text, &[], 0);
+        m1.create_node("b", None, NodeKind::Text, &[], 0);
+        m1.create_node("c", None, NodeKind::Text, &[], 0);
         assert_eq!(m1.lamport(), Lamport(3));
 
         let mut m2 = Manifest::new(ActorId::new());
@@ -595,28 +683,100 @@ mod tests {
     }
 
     #[test]
-    fn binary_node_preserves_blob_hash() {
+    fn binary_node_preserves_chunk_hashes() {
         let mut m = Manifest::new(ActorId::new());
         let id = m.create_node(
             "img.png",
             None,
             NodeKind::Binary,
-            Some("abcd1234"),
+            &["abcd1234".to_string()],
             1024,
         );
         let e = m.get_entry(id).unwrap();
         assert_eq!(e.kind, NodeKind::Binary);
-        assert_eq!(e.blob_hash.as_deref(), Some("abcd1234"));
-        m.set_blob_hash(id, "ef567890", 2048);
+        assert_eq!(e.chunk_hashes, vec!["abcd1234".to_string()]);
+        assert_eq!(e.single_blob_hash(), Some("abcd1234"));
+
+        // Replace with a multi-chunk list, the new shape for >1 MiB files.
+        m.set_chunk_hashes(
+            id,
+            &[
+                "chunk_a".to_string(),
+                "chunk_b".to_string(),
+                "chunk_c".to_string(),
+            ],
+            6_000_000,
+        );
         let e = m.get_entry(id).unwrap();
-        assert_eq!(e.blob_hash.as_deref(), Some("ef567890"));
-        assert_eq!(e.size, 2048);
+        assert_eq!(e.chunk_hashes.len(), 3);
+        assert_eq!(e.chunk_hashes[1], "chunk_b");
+        assert_eq!(e.size, 6_000_000);
+        // Multi-chunk binaries have no "single" hash to expose.
+        assert_eq!(e.single_blob_hash(), None);
+    }
+
+    #[test]
+    fn legacy_blob_field_is_decoded_as_single_chunk() {
+        // Simulate a manifest entry written by a pre-#59 client: the
+        // hash sits in the old `blob` field and `chunks` is absent.
+        // Decoder must still surface it via `chunk_hashes`.
+        use yrs::{Any, Doc, Map, MapPrelim, Transact};
+        let doc = Doc::new();
+        let nodes = doc.get_or_insert_map("nodes");
+        let nid = NodeId::new();
+        let actor = ActorId::new();
+        let entry = MapPrelim::from([
+            ("name", Any::from("legacy.png".to_string())),
+            ("parent", Any::from(String::new())),
+            ("deleted", Any::from(false)),
+            ("kind", Any::from("binary".to_string())),
+            ("blob", Any::from("LEGACYHASH".to_string())),
+            ("size", Any::from(42i64)),
+            ("created_at", Any::from(0i64)),
+            ("c_actor", Any::from(actor.to_string_hyphenated())),
+        ]);
+        {
+            let mut txn = doc.transact_mut();
+            nodes.insert(&mut txn, nid.to_string_hyphenated(), entry);
+        }
+        let txn = doc.transact();
+        let map = match nodes.get(&txn, &nid.to_string_hyphenated()).unwrap() {
+            yrs::Out::YMap(m) => m,
+            _ => panic!("expected map"),
+        };
+        let decoded = decode_entry(nid, &map, &txn).unwrap();
+        assert_eq!(decoded.chunk_hashes, vec!["LEGACYHASH".to_string()]);
+        assert_eq!(decoded.single_blob_hash(), Some("LEGACYHASH"));
+    }
+
+    #[test]
+    fn empty_chunk_hashes_round_trip() {
+        let mut m = Manifest::new(ActorId::new());
+        let id = m.create_node("placeholder.png", None, NodeKind::Binary, &[], 0);
+        let e = m.get_entry(id).unwrap();
+        assert!(e.chunk_hashes.is_empty());
+        assert_eq!(e.single_blob_hash(), None);
+    }
+
+    #[test]
+    fn chunk_list_codec_roundtrips_and_tolerates_whitespace() {
+        let original = vec!["aaaa".to_string(), "bbbb".to_string(), "cccc".to_string()];
+        let encoded = encode_chunk_list(&original);
+        assert_eq!(encoded, "aaaa,bbbb,cccc");
+        assert_eq!(decode_chunk_list(&encoded), original);
+        // Defensive: stray whitespace gets stripped.
+        assert_eq!(
+            decode_chunk_list(" aaaa , bbbb ,cccc"),
+            vec!["aaaa", "bbbb", "cccc"]
+        );
+        // Empty input → empty list, NOT a single empty string.
+        assert!(decode_chunk_list("").is_empty());
     }
 
     #[test]
     fn find_entry_by_path_returns_tombstoned() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("ghost.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("ghost.md", None, NodeKind::Text, &[], 0);
         m.delete(id);
         let found = m.find_entry_by_path("ghost.md").expect("tombstone reachable");
         assert_eq!(found.id, id);
@@ -626,7 +786,7 @@ mod tests {
     #[test]
     fn find_entry_by_path_returns_live() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("alive.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("alive.md", None, NodeKind::Text, &[], 0);
         let found = m.find_entry_by_path("alive.md").unwrap();
         assert_eq!(found.id, id);
         assert!(!found.deleted);
@@ -641,9 +801,9 @@ mod tests {
     #[test]
     fn find_entry_by_path_prefers_live_over_tombstoned() {
         let mut m = Manifest::new(ActorId::new());
-        let dead = m.create_node("collide.md", None, NodeKind::Text, None, 0);
+        let dead = m.create_node("collide.md", None, NodeKind::Text, &[], 0);
         m.delete(dead);
-        let live = m.create_node("collide.md", None, NodeKind::Text, None, 0);
+        let live = m.create_node("collide.md", None, NodeKind::Text, &[], 0);
         let found = m.find_entry_by_path("collide.md").unwrap();
         assert_eq!(found.id, live);
         assert!(!found.deleted);
@@ -652,8 +812,8 @@ mod tests {
     #[test]
     fn find_entry_by_path_walks_directory_chain() {
         let mut m = Manifest::new(ActorId::new());
-        let dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
-        let file = m.create_node("note.md", Some(dir), NodeKind::Text, None, 0);
+        let dir = m.create_node("folder", None, NodeKind::Directory, &[], 0);
+        let file = m.create_node("note.md", Some(dir), NodeKind::Text, &[], 0);
         m.delete(file);
         let found = m.find_entry_by_path("folder/note.md").unwrap();
         assert_eq!(found.id, file);
@@ -665,7 +825,7 @@ mod tests {
         // A directory's "path" must not collide with a file lookup —
         // directories are emergent (§5.6), never projected as files.
         let mut m = Manifest::new(ActorId::new());
-        let _dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
+        let _dir = m.create_node("folder", None, NodeKind::Directory, &[], 0);
         assert!(m.find_entry_by_path("folder").is_none());
     }
 
@@ -674,8 +834,8 @@ mod tests {
         let mut m1 = Manifest::new(ActorId::new());
         let mut m2 = Manifest::new(ActorId::new());
 
-        let id1 = m1.create_node("one.md", None, NodeKind::Text, None, 10);
-        let id2 = m2.create_node("two.md", None, NodeKind::Text, None, 20);
+        let id1 = m1.create_node("one.md", None, NodeKind::Text, &[], 10);
+        let id2 = m2.create_node("two.md", None, NodeKind::Text, &[], 20);
 
         // Exchange updates
         let u1 = m1.encode_state_as_update();

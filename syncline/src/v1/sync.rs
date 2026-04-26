@@ -161,7 +161,21 @@ pub fn projection_hash(manifest: &Manifest) -> [u8; 32] {
         hasher.update([0u8]);
         hasher.update(entry.kind.as_str().as_bytes());
         hasher.update([0u8]);
-        hasher.update(entry.blob_hash.as_deref().unwrap_or("").as_bytes());
+        // Fold every chunk hash into the projection hash, joined by a
+        // delimiter that can't appear in a hex digest. A length-0 list
+        // hashes as the empty string (matching pre-#59 `blob_hash =
+        // None`); a length-1 list hashes as the bare hash with no
+        // separator (matching pre-#59 `blob_hash = Some(h)`); only
+        // length-2+ lists introduce comma separators. That keeps the
+        // projection hash bit-stable for every doc that was already
+        // single-blob — a rolling deploy doesn't trigger spurious
+        // verify mismatches.
+        for (i, h) in entry.chunk_hashes.iter().enumerate() {
+            if i > 0 {
+                hasher.update([b',']);
+            }
+            hasher.update(h.as_bytes());
+        }
         hasher.update([0u8]);
         hasher.update(entry.size.to_be_bytes());
         hasher.update([0u8]);
@@ -266,7 +280,7 @@ mod tests {
     #[test]
     fn step1_payload_reflects_current_state() {
         let mut m = Manifest::new(ActorId::new());
-        m.create_node("a.md", None, NodeKind::Text, None, 0);
+        m.create_node("a.md", None, NodeKind::Text, &[], 0);
         let payload = manifest_step1_payload(&m);
         let (sub, sv_bytes) = split_manifest_payload(&payload).unwrap();
         assert_eq!(sub, MANIFEST_STEP_1);
@@ -279,7 +293,7 @@ mod tests {
         // m1 has an entry; m2 is empty. m2 sends its SV to m1; m1 replies
         // with a Step2 containing what m2 is missing.
         let mut m1 = Manifest::new(ActorId::new());
-        let id = m1.create_node("hello.md", None, NodeKind::Text, None, 5);
+        let id = m1.create_node("hello.md", None, NodeKind::Text, &[], 5);
 
         let mut m2 = Manifest::new(ActorId::new());
         let step1 = manifest_step1_payload(&m2);
@@ -298,7 +312,7 @@ mod tests {
     #[test]
     fn step2_and_update_produce_no_response() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("x.md", None, NodeKind::Text, None, 0);
+        m1.create_node("x.md", None, NodeKind::Text, &[], 0);
 
         let mut m2 = Manifest::new(ActorId::new());
         // Craft a step2 payload from m1's full state.
@@ -333,8 +347,8 @@ mod tests {
         let mut m1 = Manifest::new(ActorId::new());
         let mut m2 = Manifest::new(ActorId::new());
 
-        let id1 = m1.create_node("from_m1.md", None, NodeKind::Text, None, 1);
-        let id2 = m2.create_node("from_m2.md", None, NodeKind::Text, None, 2);
+        let id1 = m1.create_node("from_m1.md", None, NodeKind::Text, &[], 1);
+        let id2 = m2.create_node("from_m2.md", None, NodeKind::Text, &[], 2);
 
         // Each peer asks the other for what it's missing.
         let m1_step1 = manifest_step1_payload(&m1);
@@ -373,8 +387,8 @@ mod tests {
         let mut m2 = Manifest::new(a2);
 
         // Both create a node while disconnected.
-        let id1 = m1.create_node("a.md", None, NodeKind::Text, None, 10);
-        let id2 = m2.create_node("b.md", None, NodeKind::Text, None, 20);
+        let id1 = m1.create_node("a.md", None, NodeKind::Text, &[], 10);
+        let id2 = m2.create_node("b.md", None, NodeKind::Text, &[], 20);
 
         // Round 1: mutual SyncStep1 / SyncStep2.
         let s1 = manifest_step1_payload(&m1);
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn wire_framed_sync_roundtrip() {
         let mut m1 = Manifest::new(ActorId::new());
-        let id = m1.create_node("wire.md", None, NodeKind::Text, None, 0);
+        let id = m1.create_node("wire.md", None, NodeKind::Text, &[], 0);
         let mut m2 = Manifest::new(ActorId::new());
 
         // m2 sends a framed SyncStep1.
@@ -443,8 +457,8 @@ mod tests {
     #[test]
     fn projection_hash_is_deterministic() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 10);
-        m1.create_node("b.md", None, NodeKind::Text, None, 20);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 10);
+        m1.create_node("b.md", None, NodeKind::Text, &[], 20);
         let h1 = projection_hash(&m1);
         let h2 = projection_hash(&m1);
         assert_eq!(h1, h2);
@@ -453,11 +467,11 @@ mod tests {
     #[test]
     fn projection_hash_differs_when_content_differs() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 10);
         let h1 = projection_hash(&m1);
 
         let mut m2 = Manifest::new(ActorId::new());
-        m2.create_node("a.md", None, NodeKind::Text, None, 11);
+        m2.create_node("a.md", None, NodeKind::Text, &[], 11);
         let h2 = projection_hash(&m2);
 
         assert_ne!(h1, h2, "size difference must affect projection hash");
@@ -466,11 +480,11 @@ mod tests {
     #[test]
     fn projection_hash_matches_after_full_sync() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 10);
-        m1.create_node("b.md", None, NodeKind::Text, None, 20);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 10);
+        m1.create_node("b.md", None, NodeKind::Text, &[], 20);
 
         let mut m2 = Manifest::new(ActorId::new());
-        m2.create_node("c.md", None, NodeKind::Text, None, 30);
+        m2.create_node("c.md", None, NodeKind::Text, &[], 30);
 
         // Full bidirectional sync via the manifest protocol.
         let s1 = manifest_step1_payload(&m1);
@@ -507,7 +521,7 @@ mod tests {
     #[test]
     fn handle_verify_on_match_returns_none() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 0);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 0);
         let mut m2 = Manifest::new(ActorId::new());
         // Seed m2 with the same state.
         m2.apply_update(&m1.encode_state_as_update()).unwrap();
@@ -521,9 +535,9 @@ mod tests {
     #[test]
     fn handle_verify_on_mismatch_returns_step1() {
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 0);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 0);
         let mut m2 = Manifest::new(ActorId::new());
-        m2.create_node("different.md", None, NodeKind::Text, None, 0);
+        m2.create_node("different.md", None, NodeKind::Text, &[], 0);
 
         let remote_hash = projection_hash(&m2);
         let payload = encode_verify_payload(&remote_hash);
@@ -548,9 +562,9 @@ mod tests {
         // originator then responds with a SyncStep2, and both peers
         // should now share a matching projection hash.
         let mut m1 = Manifest::new(ActorId::new());
-        m1.create_node("a.md", None, NodeKind::Text, None, 10);
+        m1.create_node("a.md", None, NodeKind::Text, &[], 10);
         let mut m2 = Manifest::new(ActorId::new());
-        m2.create_node("b.md", None, NodeKind::Text, None, 20);
+        m2.create_node("b.md", None, NodeKind::Text, &[], 20);
 
         // m2 heartbeats its projection hash to m1.
         let verify_payload = encode_verify_payload(&projection_hash(&m2));
@@ -585,7 +599,7 @@ mod tests {
     #[test]
     fn node_id_survives_manifest_sync() {
         let mut m1 = Manifest::new(ActorId::new());
-        let id = m1.create_node("id.md", None, NodeKind::Text, None, 0);
+        let id = m1.create_node("id.md", None, NodeKind::Text, &[], 0);
         let mut m2 = Manifest::new(ActorId::new());
         let s1 = manifest_step1_payload(&m2);
         let r = handle_manifest_payload(&mut m1, &s1).unwrap().unwrap();
