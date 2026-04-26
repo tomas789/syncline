@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4](https://github.com/tomas789/syncline/compare/v1.1.3...v1.1.4) (2026-04-26)
+
+
+### Bug Fixes
+
+* **server:** cap per-doc broadcast channel at 64 to prevent OOM ([#73](https://github.com/tomas789/syncline/issues/73)) ([2c9bdb5](https://github.com/tomas789/syncline/commit/2c9bdb5436ef85ca0a380c1dd14372c09d5b3302))
+
 ## [1.1.3](https://github.com/tomas789/syncline/compare/v1.1.2...v1.1.3) (2026-04-26)
 
 
