@@ -1,11 +1,13 @@
 import {
   App,
+  ItemView,
   Plugin,
   PluginSettingTab,
   Setting,
   Notice,
   TFile,
   TAbstractFile,
+  WorkspaceLeaf,
   debounce,
 } from "obsidian";
 // @ts-ignore - rollup base64-inlines the .wasm binary at build time.
@@ -165,6 +167,129 @@ function isNotConnectedError(e: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Sidebar view (Phase 1 of #65 — mirrors the status bar's four states,
+// adds file count + relative "last sync" timestamp; nothing else yet)
+// ---------------------------------------------------------------------------
+
+const VIEW_TYPE_SYNCLINE = "syncline-sidebar";
+
+const STATUS_LABELS: Record<SyncStatus, string> = {
+  synced: "Synced",
+  syncing: "Syncing…",
+  error: "Error",
+  disconnected: "Disconnected",
+};
+
+/** Format a "N seconds/minutes/hours ago" timestamp for the sidebar. */
+function formatRelativeTime(epochMs: number | null, nowMs: number): string {
+  if (epochMs === null) return "never";
+  const deltaMs = Math.max(0, nowMs - epochMs);
+  const seconds = Math.floor(deltaMs / 1000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+class SynclineSidebarView extends ItemView {
+  plugin: SynclinePlugin;
+  private statusDot!: HTMLElement;
+  private statusLabel!: HTMLElement;
+  private fileCountEl!: HTMLElement;
+  private lastSyncEl!: HTMLElement;
+  private tickInterval: number | null = null;
+
+  constructor(leaf: WorkspaceLeaf, plugin: SynclinePlugin) {
+    super(leaf);
+    this.plugin = plugin;
+  }
+
+  getViewType(): string {
+    return VIEW_TYPE_SYNCLINE;
+  }
+
+  getDisplayText(): string {
+    return "Syncline";
+  }
+
+  getIcon(): string {
+    return "sync";
+  }
+
+  async onOpen(): Promise<void> {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("syncline-sidebar");
+
+    const statusRow = root.createDiv({ cls: "syncline-sidebar-status" });
+    this.statusDot = statusRow.createDiv({
+      cls: `syncline-sidebar-dot ${this.plugin.syncStatus}`,
+    });
+    this.statusLabel = statusRow.createDiv({
+      cls: "syncline-sidebar-status-label",
+      text: STATUS_LABELS[this.plugin.syncStatus],
+    });
+
+    const meta = root.createDiv({ cls: "syncline-sidebar-meta" });
+    const filesRow = meta.createDiv({ cls: "syncline-sidebar-row" });
+    filesRow.createSpan({ cls: "syncline-sidebar-row-label", text: "Files" });
+    this.fileCountEl = filesRow.createSpan({
+      cls: "syncline-sidebar-row-value",
+      text: "—",
+    });
+
+    const lastSyncRow = meta.createDiv({ cls: "syncline-sidebar-row" });
+    lastSyncRow.createSpan({
+      cls: "syncline-sidebar-row-label",
+      text: "Last sync",
+    });
+    this.lastSyncEl = lastSyncRow.createSpan({
+      cls: "syncline-sidebar-row-value",
+      text: "never",
+    });
+
+    this.render();
+
+    // Repaint relative timestamp every few seconds while the view is open;
+    // status / file count are pushed via render() from the plugin instead.
+    this.tickInterval = window.setInterval(() => {
+      this.renderLastSync();
+    }, 5000);
+    this.registerInterval(this.tickInterval);
+  }
+
+  async onClose(): Promise<void> {
+    if (this.tickInterval !== null) {
+      window.clearInterval(this.tickInterval);
+      this.tickInterval = null;
+    }
+  }
+
+  /** Push current plugin state into the DOM. Called by the plugin on every
+   *  status change and after the manifest reconcile updates the file count. */
+  render(): void {
+    if (!this.statusDot) return;
+    const status = this.plugin.syncStatus;
+    this.statusDot.className = `syncline-sidebar-dot ${status}`;
+    this.statusLabel.setText(STATUS_LABELS[status]);
+    const count = this.plugin.lastProjection.size;
+    this.fileCountEl.setText(String(count));
+    this.renderLastSync();
+  }
+
+  private renderLastSync(): void {
+    if (!this.lastSyncEl) return;
+    this.lastSyncEl.setText(
+      formatRelativeTime(this.plugin.lastSyncedAt, Date.now()),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -175,6 +300,9 @@ export default class SynclinePlugin extends Plugin {
   statusText!: HTMLElement;
   ribbonIconEl!: HTMLElement;
   syncStatus: SyncStatus = "disconnected";
+  /** Wall-clock ms of the most recent transition into `synced` from the
+   *  status-bar pipeline. Used by the sidebar's relative timestamp. */
+  lastSyncedAt: number | null = null;
 
   client: SynclineV1Client | null = null;
   /**
@@ -234,6 +362,21 @@ export default class SynclinePlugin extends Plugin {
       this.showStatusDetails(),
     );
     this.ribbonIconEl.addClass("syncline-ribbon", "disconnected");
+
+    // Sidebar (Phase 1 of #65). Opt-in: registered here, but only opened
+    // when the user runs the "Open sidebar" command — keeps right-leaf
+    // real estate untouched for existing users.
+    this.registerView(
+      VIEW_TYPE_SYNCLINE,
+      (leaf) => new SynclineSidebarView(leaf, this),
+    );
+    this.addCommand({
+      id: "open-sidebar",
+      name: "Open sidebar",
+      callback: () => {
+        void this.activateSidebar();
+      },
+    });
 
     this.registerEvent(this.app.vault.on("modify", this.onFileModify));
     this.registerEvent(this.app.vault.on("create", this.onFileCreate));
@@ -384,6 +527,9 @@ export default class SynclinePlugin extends Plugin {
 
   updateStatus(status: SyncStatus, text?: string) {
     this.syncStatus = status;
+    if (status === "synced") {
+      this.lastSyncedAt = Date.now();
+    }
     this.statusIcon.className = `status-icon ${status}`;
     const statusTexts: Record<SyncStatus, string> = {
       synced: "Syncline: synced",
@@ -398,6 +544,32 @@ export default class SynclinePlugin extends Plugin {
       this.ribbonIconEl.addClass(status);
       this.ribbonIconEl.setAttribute("aria-label", newText);
     }
+    this.refreshSidebar();
+  }
+
+  /** Push current state into any open sidebar leaves. Cheap no-op when
+   *  the user hasn't opened the sidebar via the command palette. */
+  private refreshSidebar(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNCLINE)) {
+      const view = leaf.view;
+      if (view instanceof SynclineSidebarView) {
+        view.render();
+      }
+    }
+  }
+
+  /** Open or reveal the Syncline sidebar in the right leaf. */
+  async activateSidebar(): Promise<void> {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_SYNCLINE);
+    if (existing.length > 0) {
+      await workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({ type: VIEW_TYPE_SYNCLINE, active: true });
+    await workspace.revealLeaf(leaf);
   }
 
   showStatusDetails() {
