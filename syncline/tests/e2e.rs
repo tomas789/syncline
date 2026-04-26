@@ -1922,3 +1922,169 @@ async fn test_cli_restart_no_duplicate_manifest_entries() {
         N
     );
 }
+
+// ---------------------------------------------------------------------------
+// #59 — chunked-blob sync end-to-end
+// ---------------------------------------------------------------------------
+//
+// Before chunking, any single binary file > 16 MiB exceeded
+// `tokio-tungstenite`'s default `max_frame_size` and the connection
+// got dropped silently — the user-visible failure mode in #59 (the
+// scanner retries forever without ever logging on the server side).
+//
+// With FastCDC chunking, the file is split into pieces of at most
+// MAX_CHUNK_SIZE (4 MiB) on the wire, well under the 5 MiB
+// `MAX_BLOB_SIZE` cap. These tests pin the new behaviour with vault
+// content over the old 16 MiB threshold.
+
+/// Deterministic pseudo-random bytes — no `rand` dep, bit-exact across
+/// runs so test failures are reproducible.
+fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.max(1);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// 20 MiB binary file syncs end-to-end. Pre-#59 fix this hung the
+/// scanner forever on the >16 MiB WebSocket frame limit; with chunking
+/// the file flows as a handful of chunk frames, each ≤ 4 MiB, with
+/// the same bit-for-bit integrity guarantee as a small blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_large_binary_over_16mib_syncs_via_chunks() {
+    let env = TestEnv::new(2).await;
+
+    let payload = pseudo_random_bytes(0xC0FFEE, 20 * 1024 * 1024);
+    let src = env.client_path(0).join("big.bin");
+    fs::write(&src, &payload).expect("write 20 MiB source");
+
+    // 25-second budget — large blob bootstrap on a slow CI runner can
+    // take a while. The signal we're after is "eventually equal", not
+    // "equal in 5s".
+    let dst = env.client_path(1).join("big.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        if dst.exists() {
+            if let Ok(landed) = fs::read(&dst) {
+                if landed == payload {
+                    return;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "20 MiB binary did not converge to peer within 25s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Both peers concurrently write *different* large binaries to the
+/// same path. Eventual-consistency contract: one peer's bytes win the
+/// canonical name, the other peer's bytes are preserved as a
+/// `.conflict-…` sibling. Multi-chunk content uses the same projection
+/// rule as single-blob content (§6.4 of the design doc).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_large_binary_writes_converge_with_conflict() {
+    let env = TestEnv::new(2).await;
+
+    // Different bytes on each peer at the same path. 8 MiB is enough
+    // to force ≥ 2 chunks per file under the 4 MiB ceiling.
+    let bytes_a = pseudo_random_bytes(0xAAAA, 8 * 1024 * 1024);
+    let bytes_b = pseudo_random_bytes(0xBBBB, 8 * 1024 * 1024);
+    fs::write(env.client_path(0).join("clash.bin"), &bytes_a).unwrap();
+    fs::write(env.client_path(1).join("clash.bin"), &bytes_b).unwrap();
+
+    // Wait for convergence: both peers must end up with the same set
+    // of files (canonical + conflict sibling) holding the same byte
+    // strings. Polling instead of a fixed sleep — multi-MiB sync on a
+    // CI VM is timing-sensitive.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let conflict_a = find_conflict_sibling(env.client_path(0), "clash", "bin");
+        let conflict_b = find_conflict_sibling(env.client_path(1), "clash", "bin");
+        let canonical_a = env.client_path(0).join("clash.bin");
+        let canonical_b = env.client_path(1).join("clash.bin");
+
+        if let (Some(ca), Some(cb)) = (conflict_a.as_ref(), conflict_b.as_ref()) {
+            if canonical_a.exists() && canonical_b.exists() {
+                let canon_a_bytes = fs::read(&canonical_a).unwrap_or_default();
+                let canon_b_bytes = fs::read(&canonical_b).unwrap_or_default();
+                let conf_a_bytes = fs::read(ca).unwrap_or_default();
+                let conf_b_bytes = fs::read(cb).unwrap_or_default();
+                // Both peers agree on canonical bytes.
+                if canon_a_bytes == canon_b_bytes
+                    && !canon_a_bytes.is_empty()
+                    // The conflict sibling holds the loser's bytes;
+                    // both peers materialise the same conflict bytes.
+                    && conf_a_bytes == conf_b_bytes
+                    && !conf_a_bytes.is_empty()
+                    // The two byte-strings together must be exactly
+                    // the two peers' original payloads — no third
+                    // value invented mid-sync.
+                    && {
+                        let pair = [&canon_a_bytes[..], &conf_a_bytes[..]];
+                        let originals = [&bytes_a[..], &bytes_b[..]];
+                        pair.iter().all(|b| originals.contains(b))
+                    }
+                {
+                    return;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clash didn't converge within 30s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Edit a large binary in-place and confirm the new content lands on
+/// the peer. The bandwidth-saving property (only changed chunks are
+/// re-uploaded) is unit-tested in `client_v1::tests`; this test just
+/// pins the end-to-end correctness path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_chunked_binary_modify_propagates() {
+    let env = TestEnv::new(2).await;
+
+    // Initial: 6 MiB on peer 0 → ≥ 2 chunks under the 4 MiB cap.
+    let v1_bytes = pseudo_random_bytes(0x1111, 6 * 1024 * 1024);
+    fs::write(env.client_path(0).join("doc.bin"), &v1_bytes).unwrap();
+
+    let dst = env.client_path(1).join("doc.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if dst.exists() && fs::read(&dst).map(|b| b == v1_bytes).unwrap_or(false) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "initial chunked binary did not propagate within 20s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Modify: same approximate size, different seed so most chunks
+    // change. Same convergence shape.
+    let v2_bytes = pseudo_random_bytes(0x2222, 6 * 1024 * 1024);
+    fs::write(env.client_path(0).join("doc.bin"), &v2_bytes).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if dst.exists() && fs::read(&dst).map(|b| b == v2_bytes).unwrap_or(false) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "modified chunked binary did not propagate within 20s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}

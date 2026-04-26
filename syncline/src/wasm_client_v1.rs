@@ -371,6 +371,12 @@ impl SynclineV1Client {
         })
     }
 
+    /// Create a binary entry from a **single** blob hash. Convenience
+    /// wrapper around the chunk-aware API for callers that don't (yet)
+    /// chunk their inputs — the hash becomes the sole entry in the new
+    /// node's `chunk_hashes` list. New callers should prefer
+    /// [`create_binary_chunked`] so files > 4 MiB don't blow the WS
+    /// frame ceiling.
     #[wasm_bindgen(js_name = createBinary)]
     pub fn create_binary(
         &self,
@@ -378,8 +384,32 @@ impl SynclineV1Client {
         blob_hash_hex: String,
         size: f64,
     ) -> Result<String, JsValue> {
+        let chunk_hashes = vec![blob_hash_hex];
         with_manifest_mut(&self.manifest, |m| {
-            ops::create_binary(m, &path, &blob_hash_hex, size as u64)
+            ops::create_binary(m, &path, &chunk_hashes, size as u64)
+                .map(|id| id.to_string_hyphenated())
+                .map_err(to_js)
+        })
+    }
+
+    /// Create a binary entry from an explicit list of chunk hashes.
+    /// `chunk_hashes_csv` is a comma-separated list of lowercase hex
+    /// SHA-256 digests — one per FastCDC chunk, in file order.
+    #[wasm_bindgen(js_name = createBinaryChunked)]
+    pub fn create_binary_chunked(
+        &self,
+        path: String,
+        chunk_hashes_csv: String,
+        size: f64,
+    ) -> Result<String, JsValue> {
+        let chunk_hashes: Vec<String> = chunk_hashes_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        with_manifest_mut(&self.manifest, |m| {
+            ops::create_binary(m, &path, &chunk_hashes, size as u64)
                 .map(|id| id.to_string_hyphenated())
                 .map_err(to_js)
         })
@@ -400,6 +430,9 @@ impl SynclineV1Client {
         })
     }
 
+    /// Record a single-blob modification. See [`create_binary`] —
+    /// thin wrapper that lifts the single hash into a length-1 chunk
+    /// list. Prefer [`record_modify_binary_chunked`] in new code.
     #[wasm_bindgen(js_name = recordModifyBinary)]
     pub fn record_modify_binary(
         &self,
@@ -407,8 +440,30 @@ impl SynclineV1Client {
         blob_hash_hex: String,
         size: f64,
     ) -> Result<(), JsValue> {
+        let chunk_hashes = vec![blob_hash_hex];
         with_manifest_mut(&self.manifest, |m| {
-            ops::record_modify_binary(m, &path, &blob_hash_hex, size as u64).map_err(to_js)
+            ops::record_modify_binary(m, &path, &chunk_hashes, size as u64).map_err(to_js)
+        })
+    }
+
+    /// Record a multi-chunk modification. `chunk_hashes_csv` is a
+    /// comma-separated list of lowercase hex SHA-256 digests in file
+    /// order.
+    #[wasm_bindgen(js_name = recordModifyBinaryChunked)]
+    pub fn record_modify_binary_chunked(
+        &self,
+        path: String,
+        chunk_hashes_csv: String,
+        size: f64,
+    ) -> Result<(), JsValue> {
+        let chunk_hashes: Vec<String> = chunk_hashes_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        with_manifest_mut(&self.manifest, |m| {
+            ops::record_modify_binary(m, &path, &chunk_hashes, size as u64).map_err(to_js)
         })
     }
 
@@ -416,9 +471,15 @@ impl SynclineV1Client {
     // Manifest read API (projection)
     // ---------------------------------------------------------------
 
-    /// Projection as JSON — array of `{id, path, kind, blob_hash,
-    /// size, is_conflict_copy}` sorted by path. Deterministic across
-    /// peers.
+    /// Projection as JSON — array of
+    /// `{id, path, kind, blob_hash, chunk_hashes, size,
+    ///  is_conflict_copy}` sorted by path. Deterministic across peers.
+    ///
+    /// `chunk_hashes` is the canonical content addressing (always an
+    /// array, even for small files where it has length 1). `blob_hash`
+    /// is preserved as a backwards-compat field — it's the single hash
+    /// when `chunk_hashes.length == 1`, `null` otherwise. New plugin
+    /// code should consume `chunk_hashes`.
     #[wasm_bindgen(js_name = projectionJson)]
     pub fn projection_json(&self) -> Result<String, JsValue> {
         let manifest = self.manifest.borrow();
@@ -431,11 +492,13 @@ impl SynclineV1Client {
         let json: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
+                let single_blob: Option<&str> = r.single_blob_hash();
                 serde_json::json!({
                     "id": r.id.to_string_hyphenated(),
                     "path": r.path,
                     "kind": r.kind.as_str(),
-                    "blob_hash": r.blob_hash,
+                    "blob_hash": single_blob,
+                    "chunk_hashes": r.chunk_hashes,
                     "size": r.size,
                     "is_conflict_copy": r.is_conflict_copy,
                 })

@@ -17,11 +17,26 @@ pub struct ProjectedEntry {
     pub id: NodeId,
     pub path: String,
     pub kind: NodeKind,
-    pub blob_hash: Option<String>,
+    /// FastCDC chunk-hash list of this binary's content, in file order.
+    /// See [`super::NodeEntry::chunk_hashes`] for the size buckets.
+    pub chunk_hashes: Vec<String>,
     pub size: u64,
     /// `true` if this row was moved into the conflict name-space
     /// because another entry already owns the winning path.
     pub is_conflict_copy: bool,
+}
+
+impl ProjectedEntry {
+    /// Convenience for callers that pre-date #59 and only handle
+    /// single-chunk binaries: returns the lone hash if `chunk_hashes`
+    /// has exactly one entry, else `None`.
+    pub fn single_blob_hash(&self) -> Option<&str> {
+        if self.chunk_hashes.len() == 1 {
+            Some(self.chunk_hashes[0].as_str())
+        } else {
+            None
+        }
+    }
 }
 
 /// Full projection of a manifest. Keyed by the final (post-conflict-
@@ -107,7 +122,7 @@ pub fn project(manifest: &Manifest) -> Projection {
                 id: row.entry.id,
                 path: final_path.clone(),
                 kind: row.entry.kind,
-                blob_hash: row.entry.blob_hash.clone(),
+                chunk_hashes: row.entry.chunk_hashes.clone(),
                 size: row.entry.size,
                 is_conflict_copy: is_conflict,
             };
@@ -209,7 +224,7 @@ mod tests {
     #[test]
     fn single_file_projects_to_its_name() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("hello.md", None, NodeKind::Text, None, 5);
+        let id = m.create_node("hello.md", None, NodeKind::Text, &[], 5);
         let p = project(&m);
         assert_eq!(p.len(), 1);
         let row = p.get_by_id(id).unwrap();
@@ -220,8 +235,8 @@ mod tests {
     #[test]
     fn file_under_directory_has_joined_path() {
         let mut m = Manifest::new(ActorId::new());
-        let dir = m.create_node("folder", None, NodeKind::Directory, None, 0);
-        let f = m.create_node("note.md", Some(dir), NodeKind::Text, None, 0);
+        let dir = m.create_node("folder", None, NodeKind::Directory, &[], 0);
+        let f = m.create_node("note.md", Some(dir), NodeKind::Text, &[], 0);
         let p = project(&m);
         // Directory itself is not projected as a file.
         assert_eq!(p.len(), 1);
@@ -232,10 +247,10 @@ mod tests {
     #[test]
     fn deep_nesting_assembles_full_path() {
         let mut m = Manifest::new(ActorId::new());
-        let l1 = m.create_node("l1", None, NodeKind::Directory, None, 0);
-        let l2 = m.create_node("l2", Some(l1), NodeKind::Directory, None, 0);
-        let l3 = m.create_node("l3", Some(l2), NodeKind::Directory, None, 0);
-        let leaf = m.create_node("leaf.md", Some(l3), NodeKind::Text, None, 0);
+        let l1 = m.create_node("l1", None, NodeKind::Directory, &[], 0);
+        let l2 = m.create_node("l2", Some(l1), NodeKind::Directory, &[], 0);
+        let l3 = m.create_node("l3", Some(l2), NodeKind::Directory, &[], 0);
+        let leaf = m.create_node("leaf.md", Some(l3), NodeKind::Text, &[], 0);
         let p = project(&m);
         assert_eq!(p.get_by_id(leaf).unwrap().path, "l1/l2/l3/leaf.md");
     }
@@ -243,7 +258,7 @@ mod tests {
     #[test]
     fn deleted_file_is_not_projected() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("gone.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("gone.md", None, NodeKind::Text, &[], 0);
         m.delete(id);
         let p = project(&m);
         assert!(p.is_empty());
@@ -252,7 +267,7 @@ mod tests {
     #[test]
     fn modify_after_delete_resurrects() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("phoenix.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("phoenix.md", None, NodeKind::Text, &[], 0);
         m.delete(id); // delete with some lamport
         m.record_modify(id); // modify with a later lamport → resurrects
         let p = project(&m);
@@ -263,7 +278,7 @@ mod tests {
     #[test]
     fn delete_after_modify_stays_deleted() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("rip.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("rip.md", None, NodeKind::Text, &[], 0);
         m.record_modify(id);
         m.delete(id);
         let p = project(&m);
@@ -275,10 +290,10 @@ mod tests {
         // Two nodes created independently with the same (parent, name).
         // Rebuild by merging two manifests.
         let mut m1 = Manifest::new(ActorId::new());
-        let id1 = m1.create_node("same.md", None, NodeKind::Text, None, 0);
+        let id1 = m1.create_node("same.md", None, NodeKind::Text, &[], 0);
 
         let mut m2 = Manifest::new(ActorId::new());
-        let id2 = m2.create_node("same.md", None, NodeKind::Text, None, 0);
+        let id2 = m2.create_node("same.md", None, NodeKind::Text, &[], 0);
 
         // Merge
         let u1 = m1.encode_state_as_update();
@@ -326,19 +341,20 @@ mod tests {
     }
 
     #[test]
-    fn binary_with_blob_hash_projected_correctly() {
+    fn binary_with_chunk_hashes_projected_correctly() {
         let mut m = Manifest::new(ActorId::new());
         let id = m.create_node(
             "image.png",
             None,
             NodeKind::Binary,
-            Some("cafebabe"),
+            &["cafebabe".to_string()],
             1024,
         );
         let p = project(&m);
         let row = p.get_by_id(id).unwrap();
         assert_eq!(row.kind, NodeKind::Binary);
-        assert_eq!(row.blob_hash.as_deref(), Some("cafebabe"));
+        assert_eq!(row.chunk_hashes, vec!["cafebabe".to_string()]);
+        assert_eq!(row.single_blob_hash(), Some("cafebabe"));
         assert_eq!(row.size, 1024);
         assert_eq!(row.path, "image.png");
     }
@@ -346,7 +362,7 @@ mod tests {
     #[test]
     fn rename_reflected_in_projection() {
         let mut m = Manifest::new(ActorId::new());
-        let id = m.create_node("old.md", None, NodeKind::Text, None, 0);
+        let id = m.create_node("old.md", None, NodeKind::Text, &[], 0);
         m.set_name(id, "new.md");
         let p = project(&m);
         assert_eq!(p.get_by_id(id).unwrap().path, "new.md");
@@ -355,9 +371,9 @@ mod tests {
     #[test]
     fn move_to_new_parent_reflected() {
         let mut m = Manifest::new(ActorId::new());
-        let a = m.create_node("A", None, NodeKind::Directory, None, 0);
-        let b = m.create_node("B", None, NodeKind::Directory, None, 0);
-        let f = m.create_node("f.md", Some(a), NodeKind::Text, None, 0);
+        let a = m.create_node("A", None, NodeKind::Directory, &[], 0);
+        let b = m.create_node("B", None, NodeKind::Directory, &[], 0);
+        let f = m.create_node("f.md", Some(a), NodeKind::Text, &[], 0);
         assert_eq!(project(&m).get_by_id(f).unwrap().path, "A/f.md");
         m.set_parent(f, Some(b));
         assert_eq!(project(&m).get_by_id(f).unwrap().path, "B/f.md");
@@ -366,8 +382,8 @@ mod tests {
     #[test]
     fn orphan_with_deleted_parent_dir_is_hidden() {
         let mut m = Manifest::new(ActorId::new());
-        let dir = m.create_node("doomed", None, NodeKind::Directory, None, 0);
-        let f = m.create_node("child.md", Some(dir), NodeKind::Text, None, 0);
+        let dir = m.create_node("doomed", None, NodeKind::Directory, &[], 0);
+        let f = m.create_node("child.md", Some(dir), NodeKind::Text, &[], 0);
         m.delete(dir);
         let p = project(&m);
         // Child becomes unprojectable under the cascade-safety net.

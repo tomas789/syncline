@@ -97,11 +97,21 @@ pub fn migrate_v0_vault(vault_root: &Path, actor: ActorId) -> Result<Migration> 
                     NodeKind::Directory => 0,
                 };
 
+                // v0 stored a single blob hash per file. Project it as
+                // a length-1 chunk list — the new schema's small-file
+                // representation. Files large enough to need chunking
+                // get re-chunked the next time the scanner sees them.
+                let chunk_hashes: Vec<String> = v0
+                    .blob_hash
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|h| vec![h.to_string()])
+                    .unwrap_or_default();
                 let node_id = manifest.create_node(
                     &leaf_name,
                     parent,
                     v0.kind,
-                    v0.blob_hash.as_deref(),
+                    &chunk_hashes,
                     size,
                 );
 
@@ -249,7 +259,7 @@ fn ensure_parent_chain(
         let id = if let Some(id) = dir_nodes.get(&accum) {
             *id
         } else {
-            let id = manifest.create_node(seg, parent, NodeKind::Directory, None, 0);
+            let id = manifest.create_node(seg, parent, NodeKind::Directory, &[], 0);
             dir_nodes.insert(accum.clone(), id);
             id
         };
@@ -371,7 +381,8 @@ mod tests {
         assert_eq!(m.manifest.live_entries().len(), 1);
         let entry = &m.manifest.live_entries()[0];
         assert_eq!(entry.kind, NodeKind::Binary);
-        assert_eq!(entry.blob_hash.as_deref(), Some("cafebabe"));
+        assert_eq!(entry.chunk_hashes, vec!["cafebabe".to_string()]);
+        assert_eq!(entry.single_blob_hash(), Some("cafebabe"));
         assert_eq!(
             m.binary_hashes.get(&entry.id).map(|s| s.as_str()),
             Some("cafebabe")
@@ -424,8 +435,8 @@ mod tests {
         assert!(p.by_path.contains_key("folder/sub.md"));
         assert!(p.by_path.contains_key("folder/pic.png"));
         assert_eq!(
-            p.by_path["folder/pic.png"].blob_hash.as_deref(),
-            Some("deadbeef")
+            p.by_path["folder/pic.png"].chunk_hashes,
+            vec!["deadbeef".to_string()],
         );
     }
 

@@ -4,9 +4,9 @@
 //! The manifest mutators in `manifest.rs` operate on `NodeId`s; this
 //! module translates user-facing *paths* into those writes and owns
 //! the emergent-directory rule (§5.6 of the design doc). Name /
-//! parent changes go through `set_name` / `set_parent`; blob updates
-//! go through `set_blob_hash` and stamp modify. Conflict handling
-//! (§6) remains projection-time.
+//! parent changes go through `set_name` / `set_parent`; binary content
+//! updates go through `set_chunk_hashes` and stamp modify. Conflict
+//! handling (§6) remains projection-time.
 //!
 //! All operations are idempotent only in the CRDT sense: a second
 //! call with the same intent may produce a second write and bump
@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 /// - `path` is empty or has an empty segment.
 /// - a live entry already projects to `path`.
 pub fn create_text(manifest: &mut Manifest, path: &str, size: u64) -> Result<NodeId> {
-    create_at_path(manifest, path, NodeKind::Text, None, size)
+    create_at_path(manifest, path, NodeKind::Text, &[], size)
 }
 
 /// Create a text entry at `path` even when another live entry already
@@ -38,17 +38,19 @@ pub fn create_text_allowing_collision(
     path: &str,
     size: u64,
 ) -> Result<NodeId> {
-    create_at_path_allowing_collision(manifest, path, NodeKind::Text, None, size)
+    create_at_path_allowing_collision(manifest, path, NodeKind::Text, &[], size)
 }
 
-/// Create a fresh binary entry at `path` with its CAS blob hash.
+/// Create a fresh binary entry at `path` with its FastCDC chunk-hash
+/// list. Pass an empty slice to record a binary placeholder whose
+/// content has not been chunked yet.
 pub fn create_binary(
     manifest: &mut Manifest,
     path: &str,
-    blob_hash: &str,
+    chunk_hashes: &[String],
     size: u64,
 ) -> Result<NodeId> {
-    create_at_path(manifest, path, NodeKind::Binary, Some(blob_hash), size)
+    create_at_path(manifest, path, NodeKind::Binary, chunk_hashes, size)
 }
 
 /// Mark the entry currently projected at `path` as deleted.
@@ -107,16 +109,16 @@ pub fn record_modify_text(manifest: &mut Manifest, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Update the blob hash of a binary entry at `path`. Also stamps
-/// modify so a stale delete can't resurrect an older blob.
+/// Update the chunk-hash list of a binary entry at `path`. Also stamps
+/// modify so a stale delete can't resurrect older content.
 pub fn record_modify_binary(
     manifest: &mut Manifest,
     path: &str,
-    blob_hash: &str,
+    chunk_hashes: &[String],
     size: u64,
 ) -> Result<()> {
     let id = resolve_path(manifest, path)?;
-    manifest.set_blob_hash(id, blob_hash, size);
+    manifest.set_chunk_hashes(id, chunk_hashes, size);
     Ok(())
 }
 
@@ -136,7 +138,7 @@ fn create_at_path(
     manifest: &mut Manifest,
     path: &str,
     kind: NodeKind,
-    blob_hash: Option<&str>,
+    chunk_hashes: &[String],
     size: u64,
 ) -> Result<NodeId> {
     if path.is_empty() {
@@ -153,14 +155,14 @@ fn create_at_path(
         return Err(anyhow!("path {:?} has empty leaf", path));
     }
     let parent = ensure_parent_chain(manifest, parent_path)?;
-    Ok(manifest.create_node(leaf, parent, kind, blob_hash, size))
+    Ok(manifest.create_node(leaf, parent, kind, chunk_hashes, size))
 }
 
 fn create_at_path_allowing_collision(
     manifest: &mut Manifest,
     path: &str,
     kind: NodeKind,
-    blob_hash: Option<&str>,
+    chunk_hashes: &[String],
     size: u64,
 ) -> Result<NodeId> {
     if path.is_empty() {
@@ -171,7 +173,7 @@ fn create_at_path_allowing_collision(
         return Err(anyhow!("path {:?} has empty leaf", path));
     }
     let parent = ensure_parent_chain(manifest, parent_path)?;
-    Ok(manifest.create_node(leaf, parent, kind, blob_hash, size))
+    Ok(manifest.create_node(leaf, parent, kind, chunk_hashes, size))
 }
 
 fn split_path(path: &str) -> (&str, &str) {
@@ -210,7 +212,7 @@ fn find_or_create_directory(
     if let Some(e) = existing {
         e.id
     } else {
-        manifest.create_node(name, parent, NodeKind::Directory, None, 0)
+        manifest.create_node(name, parent, NodeKind::Directory, &[], 0)
     }
 }
 
@@ -262,13 +264,35 @@ mod tests {
     }
 
     #[test]
-    fn create_binary_preserves_blob() {
+    fn create_binary_preserves_chunks() {
         let mut m = Manifest::new(ActorId::new());
-        let id = create_binary(&mut m, "img.png", "deadbeef", 1024).unwrap();
+        let id = create_binary(
+            &mut m,
+            "img.png",
+            &["deadbeef".to_string()],
+            1024,
+        )
+        .unwrap();
         let e = m.get_entry(id).unwrap();
         assert_eq!(e.kind, NodeKind::Binary);
-        assert_eq!(e.blob_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(e.chunk_hashes, vec!["deadbeef".to_string()]);
         assert_eq!(e.size, 1024);
+    }
+
+    #[test]
+    fn create_binary_preserves_multi_chunk() {
+        let mut m = Manifest::new(ActorId::new());
+        let id = create_binary(
+            &mut m,
+            "big.png",
+            &["aaa".to_string(), "bbb".to_string(), "ccc".to_string()],
+            6_000_000,
+        )
+        .unwrap();
+        let e = m.get_entry(id).unwrap();
+        assert_eq!(e.chunk_hashes.len(), 3);
+        assert_eq!(e.chunk_hashes[1], "bbb");
+        assert_eq!(e.size, 6_000_000);
     }
 
     #[test]
@@ -368,12 +392,18 @@ mod tests {
     }
 
     #[test]
-    fn record_modify_binary_updates_blob_and_size() {
+    fn record_modify_binary_updates_chunks_and_size() {
         let mut m = Manifest::new(ActorId::new());
-        let id = create_binary(&mut m, "pic.png", "aaaa", 10).unwrap();
-        record_modify_binary(&mut m, "pic.png", "bbbb", 42).unwrap();
+        let id = create_binary(&mut m, "pic.png", &["aaaa".to_string()], 10).unwrap();
+        record_modify_binary(
+            &mut m,
+            "pic.png",
+            &["bbbb".to_string(), "cccc".to_string()],
+            42,
+        )
+        .unwrap();
         let e = m.get_entry(id).unwrap();
-        assert_eq!(e.blob_hash.as_deref(), Some("bbbb"));
+        assert_eq!(e.chunk_hashes, vec!["bbbb".to_string(), "cccc".to_string()]);
         assert_eq!(e.size, 42);
         assert!(e.modify_stamp.is_some());
     }
