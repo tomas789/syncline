@@ -52,7 +52,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::Instant;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
 };
@@ -66,7 +66,13 @@ type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_CAP_MS: u64 = 30_000;
-const SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to wait *after a scan completes* before starting the next
+/// periodic scan. Measured end-to-start, not start-to-start, so a long
+/// scan can never back-to-back into the next one and pin a CPU on a
+/// totally idle vault. The watcher (debounced inotify/fsevents) is the
+/// responsive path; this periodic scan only exists as a belt-and-braces
+/// fallback for platforms where the watcher misses events.
+const SCAN_INTERVAL: Duration = Duration::from_secs(300);
 /// Debounce window for the inotify/fsevents watcher. Batches the flurry
 /// of events that an editor save-dance produces (Obsidian writes a
 /// `.tmp`, fsyncs, renames over the target; multi-event under the hood)
@@ -310,19 +316,20 @@ async fn run_session(
         .context("send manifest step1")?;
 
     // --- Read loop + polling scanner ---------------------------------------
-    let mut scan_timer = interval(SCAN_INTERVAL);
-    scan_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // `interval` emits its first tick immediately; consume it so our
-    // first *scheduled* scan is SCAN_INTERVAL from now. The explicit
-    // initial scan below covers startup.
-    scan_timer.tick().await;
+    // The scan timer fires SCAN_INTERVAL after the *previous* scan ends,
+    // not at a fixed cadence. Reset on both periodic and watcher-driven
+    // scans so any scan we just ran counts as the new starting point —
+    // this guarantees the periodic scanner can never back-to-back into
+    // itself or stack on top of a watcher-driven scan.
+    let next_scan = tokio::time::sleep(SCAN_INTERVAL);
+    tokio::pin!(next_scan);
 
     // --- Filesystem watcher (3.3d) -----------------------------------------
     // Debounced notify watcher: the OS produces multi-event bursts for an
     // editor save (tmp-write → fsync → rename), so we coalesce them over
-    // DEBOUNCE_MS before triggering a scan. The 5 s polling timer above
-    // stays in place as a fallback for platforms where notify is unreliable
-    // (network mounts, some VM filesystems, fsevents quirks).
+    // DEBOUNCE_MS before triggering a scan. The periodic SCAN_INTERVAL
+    // above stays in place as a fallback for platforms where notify is
+    // unreliable (network mounts, some VM filesystems, fsevents quirks).
     let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<
         std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>,
     >(10000);
@@ -573,26 +580,26 @@ async fn run_session(
 
                 debug!("dropping frame for unknown doc_id={}", doc_id);
             }
-            _ = scan_timer.tick() => {
-                if !did_initial_scan {
-                    // Manifest STEP_2 hasn't arrived yet — holding off
-                    // any scan avoids recording local files as new
-                    // nodes before we know what the server already has.
-                    continue;
+            _ = &mut next_scan => {
+                if did_initial_scan {
+                    if let Err(e) = scan_once(
+                        folder,
+                        syncline_dir,
+                        manifest,
+                        content,
+                        blobs,
+                        &mut write,
+                        &mut content_subscribed,
+                    )
+                    .await
+                    {
+                        warn!("periodic scan failed: {e:?}");
+                    }
                 }
-                if let Err(e) = scan_once(
-                    folder,
-                    syncline_dir,
-                    manifest,
-                    content,
-                    blobs,
-                    &mut write,
-                    &mut content_subscribed,
-                )
-                .await
-                {
-                    warn!("periodic scan failed: {e:?}");
-                }
+                // If the bootstrap STEP_2 hasn't landed yet, the
+                // dedicated path at the STEP_2 handler runs the first
+                // scan; we just keep the periodic timer rolling.
+                next_scan.as_mut().reset(Instant::now() + SCAN_INTERVAL);
             }
             batch_opt = watcher_rx.recv(), if watcher.is_some() => {
                 match batch_opt {
@@ -622,6 +629,9 @@ async fn run_session(
                         {
                             warn!("watcher-driven scan failed: {e:?}");
                         }
+                        // A watcher-driven scan resets the periodic
+                        // scan's "5 minutes from end-of-last" clock.
+                        next_scan.as_mut().reset(Instant::now() + SCAN_INTERVAL);
                     }
                     Some(Err(e)) => {
                         warn!("watcher reported error: {e:?}");
