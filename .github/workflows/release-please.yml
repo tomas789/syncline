@@ -90,7 +90,7 @@ jobs:
         if: matrix.build_plugin
         run: |
           cp obsidian-plugin/main.js artifacts/main.js
-          cp manifest.json artifacts/manifest.json
+          cp obsidian-plugin/manifest.json artifacts/manifest.json
           cp obsidian-plugin/styles.css artifacts/styles.css
 
       - name: Upload Release Assets

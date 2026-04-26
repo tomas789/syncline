@@ -16,7 +16,10 @@ if [ ! -d "$VAULT_PATH" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_DIR="$VAULT_PATH/.obsidian/plugins/syncline-obsidian"
+# Plugin id is "syncline" (see obsidian-plugin/manifest.json). Keep this
+# directory name in lockstep with manifest.json#id; the consistency check in
+# .github/workflows/plugin-id-consistency.yml enforces the match.
+PLUGIN_DIR="$VAULT_PATH/.obsidian/plugins/syncline"
 
 echo "Installing Syncline Obsidian Plugin..."
 echo "  Vault: $VAULT_PATH"

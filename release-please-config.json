@@ -28,11 +28,6 @@
           "type": "json",
           "path": "obsidian-plugin/manifest.json",
           "jsonpath": "$.version"
-        },
-        {
-          "type": "json",
-          "path": "manifest.json",
-          "jsonpath": "$.version"
         }
       ]
     }
