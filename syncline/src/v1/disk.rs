@@ -179,8 +179,9 @@ fn write_content_subdoc(content_dir: &Path, node_id: NodeId, body: &str) -> Resu
     Ok(())
 }
 
-/// Atomic write: temp file + fsync + rename, same convention as
-/// `client::storage::save_doc`.
+/// Atomic write: temp file + rename. Skips fsync — see the longer
+/// note in `client_v1.rs::atomic_write` for rationale (bulk bootstrap
+/// fsync-per-file was the dominant cost; recovery is via re-sync).
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -190,7 +191,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         let mut file = fs::File::create(&tmp).context("creating temp file")?;
         file.write_all(bytes).context("writing temp file")?;
-        file.sync_all().context("fsync temp file")?;
     }
     fs::rename(&tmp, path).context("atomically renaming temp file")?;
     Ok(())

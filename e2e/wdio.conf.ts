@@ -28,14 +28,13 @@ export const config = {
     reporters: ['spec'],
     mochaOpts: {
         ui: 'bdd',
-        // Per-test budget. The cold-build setup runs in `before()` (which
-        // has its own 180s timeout); each test only waits for one
-        // cross-process sync round-trip and finishes in seconds.
-        // Linux GHA runners occasionally drift past the previous 120s
-        // budget on the "propagates deletes CLI → Obsidian" test (the
-        // unlink → 5s scanner poll → manifest broadcast → plugin
-        // reconcile → vault trash chain stacks several debounces).
-        // 240s gives generous headroom without changing semantics.
-        timeout: 240000
+        // Per-test budget. Most tests finish in seconds; the phase1-4
+        // big-vault tests use `this.timeout()` to extend per-test, but
+        // some mocha+wdio versions don't honour the override on async
+        // functions reliably, so we set a generous default that covers
+        // the slowest legitimate path (45 min settle on a ~1300-file
+        // vault). Individual fast tests still finish in milliseconds;
+        // only failures pay the wait.
+        timeout: 60 * 60_000
     },
 };

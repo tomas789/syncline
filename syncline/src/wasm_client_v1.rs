@@ -82,6 +82,12 @@ pub struct SynclineV1Client {
     is_connected: Rc<RefCell<bool>>,
     closures: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>>,
     requested_blobs: Rc<RefCell<HashSet<String>>>,
+    /// Content node ids whose STEP_1 was deferred because the WebSocket
+    /// hadn't completed its handshake yet. Drained on `onopen`. Without
+    /// this, `subscribeContent` calls during the connect() → onopen
+    /// gap would silently no-op and the matching node would never see
+    /// remote updates (#57).
+    pending_step1: Rc<RefCell<HashSet<NodeId>>>,
     on_manifest_changed: Rc<RefCell<Option<Function>>>,
     on_content_changed: Rc<RefCell<Option<Function>>>,
     on_blob: Rc<RefCell<Option<Function>>>,
@@ -113,6 +119,7 @@ impl SynclineV1Client {
             is_connected: Rc::new(RefCell::new(false)),
             closures: Rc::new(RefCell::new(Vec::new())),
             requested_blobs: Rc::new(RefCell::new(HashSet::new())),
+            pending_step1: Rc::new(RefCell::new(HashSet::new())),
             on_manifest_changed: Rc::new(RefCell::new(None)),
             on_content_changed: Rc::new(RefCell::new(None)),
             on_blob: Rc::new(RefCell::new(None)),
@@ -247,12 +254,34 @@ impl SynclineV1Client {
         let ws_open = ws.clone();
         let is_connected_open = self.is_connected.clone();
         let on_status_open = self.on_status.clone();
+        let pending_step1_open = self.pending_step1.clone();
+        let content_open = self.content.clone();
         let onopen = Closure::wrap(Box::new(move |_| {
             let payload = encode_version_handshake();
             let frame = encode_message(MSG_VERSION, MANIFEST_DOC_ID, &payload);
             send_frame(&ws_open, &frame);
             *is_connected_open.borrow_mut() = true;
             fire_status(&on_status_open, "connected");
+
+            // Flush any STEP_1s that were queued while we were
+            // disconnected (#57). Each entry corresponds to a content
+            // subdoc the caller asked us to subscribe to before the
+            // WebSocket finished its handshake — without this drain
+            // their first sync round never starts.
+            let to_send: Vec<NodeId> =
+                pending_step1_open.borrow_mut().drain().collect();
+            for node_id in to_send {
+                let sv_bytes = match content_open.borrow().get(&node_id) {
+                    Some(cd) => cd.doc.transact().state_vector().encode_v1(),
+                    None => continue,
+                };
+                let frame = encode_message(
+                    MSG_SYNC_STEP_1,
+                    &content_doc_id(node_id),
+                    &sv_bytes,
+                );
+                send_frame(&ws_open, &frame);
+            }
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         self.closures.borrow_mut().push(onopen);
@@ -516,6 +545,14 @@ impl SynclineV1Client {
                 let frame = encode_message(MSG_SYNC_STEP_1, &content_doc_id(node_id), &sv_bytes);
                 send_frame(ws, &frame);
             }
+        } else {
+            // WS hasn't completed handshake yet (or has disconnected
+            // and not yet reconnected). Queue this subscribe; it will
+            // be flushed by `onopen`. Without this, the STEP_1 is
+            // silently dropped, the TS wrapper still records the node
+            // as subscribed, and the content for this node never
+            // arrives until a full client recreate (#57).
+            self.pending_step1.borrow_mut().insert(node_id);
         }
 
         Ok(())
@@ -526,6 +563,7 @@ impl SynclineV1Client {
         let node_id = NodeId::parse_str(&node_id_hex)
             .ok_or_else(|| JsValue::from_str(&format!("bad node id {node_id_hex}")))?;
         self.content.borrow_mut().remove(&node_id);
+        self.pending_step1.borrow_mut().remove(&node_id);
         Ok(())
     }
 

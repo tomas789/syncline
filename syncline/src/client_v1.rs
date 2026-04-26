@@ -1360,8 +1360,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("create tmp {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("write tmp {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync tmp {}", tmp.display()))?;
+        // Intentionally no fsync. On a real-world bulk bootstrap (~1300
+        // files into an empty vault) fsync-per-write was 6 ms/file ≈ 7s
+        // of pure fsync wall-time on macOS APFS, dominating scan_once
+        // and crowding out everything else. The state we're writing
+        // here (manifest snapshots, content subdoc caches, placeholder
+        // seeds) is fully recoverable from the server on next sync, so
+        // the durability fsync provides isn't load-bearing — a crash
+        // resyncs from the server, which is the source of truth. We
+        // still keep the tmp+rename pattern so a concurrent reader
+        // sees either the old file or the new one, never a half-
+        // written one.
     }
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;

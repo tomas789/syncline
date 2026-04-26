@@ -472,9 +472,41 @@ export default class SynclinePlugin extends Plugin {
 
       this.client.connect();
 
+      // Wait for the WS handshake to complete before scanning the local
+      // vault or running the first reconcile. Without this, two races
+      // fire on every restart with a populated cache:
+      //
+      //   * scanLocalVault sees an empty manifest (the server's STEP_2
+      //     hasn't arrived yet) and re-ingests every existing vault
+      //     file as a "new" manifest entry. When the server's STEP_2
+      //     lands moments later, the merge produces a conflict copy
+      //     of every file (#58).
+      //
+      //   * ingestNewFile fired synthetically during Obsidian's vault
+      //     bootstrap hits the same empty live projection and falls
+      //     through to createText, with the same conflict-copy
+      //     fallout (#58, second surface).
+      //
+      // Polling `isConnected()` is the simplest signal — `onStatus`
+      // fires with "connected" at the same time, so they're equivalent
+      // observability-wise.
+      await new Promise<void>((resolve, reject) => {
+        const start = Date.now();
+        const HANDSHAKE_TIMEOUT_MS = 30_000;
+        const tick = () => {
+          if (this.client?.isConnected()) return resolve();
+          if (Date.now() - start > HANDSHAKE_TIMEOUT_MS) {
+            return reject(new Error("WebSocket handshake timed out"));
+          }
+          window.setTimeout(tick, 50);
+        };
+        tick();
+      });
+
       // Ingest any vault files not yet in the manifest (first run, or a
       // file created while offline). Done after the handshake completes,
-      // so scanLocalVault below just walks what's on disk.
+      // so scanLocalVault below sees the server's full projection and
+      // doesn't re-ingest paths the server already knows about.
       await this.scanLocalVault();
       await this.reconcileProjection();
 
@@ -575,15 +607,31 @@ export default class SynclinePlugin extends Plugin {
   async scanLocalVault(): Promise<void> {
     if (!this.client) return;
     const projection = this.readProjection();
-    const pathsInManifest = new Set(projection.map((r) => r.path));
+    // Case-insensitive lookup. On case-insensitive filesystems
+    // (macOS APFS default, Windows NTFS default), two manifest paths
+    // that differ only in case fold to the same disk file. The vault's
+    // getFiles() returns whatever case macOS preserved, which can
+    // differ from the manifest entry's case (e.g. when the manifest
+    // came from a Linux peer). A byte-equal lookup misses the match
+    // and re-uploads the file as a fresh manifest entry — silently
+    // growing the manifest on every reconnect (#56). Lowercase is
+    // good enough for ASCII; Unicode-NFC normalisation can layer on
+    // top later if a non-ASCII case-only collision shows up.
+    const pathsInManifest = new Set(projection.map((r) => r.path.toLowerCase()));
     for (const file of this.app.vault.getFiles()) {
-      if (pathsInManifest.has(file.path)) continue;
+      if (pathsInManifest.has(file.path.toLowerCase())) continue;
       try {
         if (isTextFile(file)) {
           const content = await this.app.vault.read(file);
           const size = new TextEncoder().encode(content).byteLength;
           const nodeId = this.client.createTextAllowingCollision(file.path, size);
-          this.subscribeToContent(nodeId, content);
+          // knownState=null: this is a brand-new node, no prior `.bin`
+          // can exist on disk. Passing null skips the loadContentState
+          // await — keeping the sync `subscribedContent.add` and the
+          // WASM `subscribeContent`/`updateContentText` in the same
+          // synchronous turn so a manifest-observer-triggered reconcile
+          // can't race-create an empty doc (#63).
+          void this.subscribeToContent(nodeId, content, null);
         } else {
           const data = await this.app.vault.readBinary(file);
           const hash = await sha256Hex(data);
@@ -674,21 +722,56 @@ export default class SynclinePlugin extends Plugin {
       }
     }
 
+    // Publish the new projection BEFORE the additions loop. The loop
+    // awaits per-file vault.create / ensureBinaryInSync, which yields
+    // to the event loop and lets WS frames land. STEP_2 responses to
+    // subscribes we fire here arrive mid-loop and dispatch through
+    // onContentChanged, which calls findRowById against
+    // this.lastProjection. If we leave the assignment until after the
+    // loop, those callbacks miss every row whose subscribe completed
+    // before the loop ended — silently dropping content for ~all files
+    // on a real-world (~1k+ file) vault.
+    this.lastProjection = byPath;
+
     // --- Additions / ensure-subscribed ---
+    //
+    // Pre-create unique parent dirs once (they're shared between many
+    // siblings; 1k+ rows under nested dirs burns redundant ensureParent
+    // lookups otherwise). Then iterate per-row serially.
+    //
+    // Tried Promise.all over the per-row loop; it was *slower* on real
+    // vaults — desktop adapter contention + 1k concurrent setTimeouts
+    // for ignoreEvents cleanup added more wall time than it saved.
+    // The serial loop also yields between rows so STEP_2/blob frames
+    // can land and be processed mid-walk, which is itself a win.
+    const parentDirs = new Set<string>();
+    for (const row of projection) {
+      const parts = row.path.split("/");
+      parts.pop();
+      let cur = "";
+      for (const part of parts) {
+        cur = cur ? `${cur}/${part}` : part;
+        parentDirs.add(cur);
+      }
+    }
+    const sortedDirs = [...parentDirs].sort((a, b) => a.split("/").length - b.split("/").length);
+    for (const dir of sortedDirs) {
+      if (this.app.vault.getAbstractFileByPath(dir)) continue;
+      try {
+        await this.app.vault.createFolder(dir);
+      } catch (e) {
+        if (!isAlreadyExistsError(e)) console.error(`[Syncline] mkdir ${dir}:`, e);
+      }
+    }
+
     for (const row of projection) {
       const existing = this.app.vault.getAbstractFileByPath(row.path);
       if (row.kind === "text") {
         if (!(existing instanceof TFile)) {
-          // File doesn't exist on disk yet — create placeholder so the
-          // subdoc subscription can write content into it on first sync.
           try {
-            await this.ensureParentFolders(row.path);
             this.ignoreEvents.create.add(row.path);
             await this.app.vault.create(row.path, "");
           } catch (e) {
-            // The placeholder may already be on disk even though Obsidian's
-            // in-memory tree didn't surface it via getAbstractFileByPath;
-            // that's a benign desync, not a sync failure.
             if (!isAlreadyExistsError(e)) {
               console.error(`[Syncline] create placeholder ${row.path}:`, e);
             }
@@ -697,7 +780,7 @@ export default class SynclinePlugin extends Plugin {
           }
         }
         if (!this.subscribedContent.has(row.id)) {
-          this.subscribeToContent(row.id);
+          void this.subscribeToContent(row.id);
         }
       } else if (row.kind === "binary") {
         if (row.blob_hash) {
@@ -705,8 +788,6 @@ export default class SynclinePlugin extends Plugin {
         }
       }
     }
-
-    this.lastProjection = byPath;
   }
 
   private async removeLocalFile(path: string): Promise<void> {
@@ -781,29 +862,38 @@ export default class SynclinePlugin extends Plugin {
 
   /**
    * Subscribe to the content subdoc for `nodeId`. If `initialContent`
-   * is given (from the local-file scanner), seed the subdoc so our
-   * first update carries the file's bytes.
+   * is given (from the local-file scanner / ingestNewFile), seed the
+   * subdoc so our first update carries the file's bytes.
+   *
+   * Adds to `subscribedContent` SYNCHRONOUSLY before any await so a
+   * concurrent caller (e.g. a reconcile triggered by the manifest
+   * observer that fired in createText) sees the membership and bails.
+   * Without that guard, two IIFEs race on `subscribeContent` — the
+   * second call replaces the freshly-seeded WASM doc with an empty
+   * one, dropping `initialContent` on the floor (#63).
    */
-  private subscribeToContent(nodeId: string, initialContent?: string): void {
+  private async subscribeToContent(nodeId: string, initialContent?: string, knownState?: Uint8Array | null): Promise<void> {
     if (!this.client) return;
     if (this.subscribedContent.has(nodeId)) return;
-    void (async () => {
-      if (!this.client) return;
-      const state = await this.loadContentState(nodeId);
-      try {
-        this.client.subscribeContent(nodeId, state ?? null);
-      } catch (e) {
-        console.error(`[Syncline] subscribe_content ${nodeId}:`, e);
-        return;
+    this.subscribedContent.add(nodeId);
+    let state = knownState;
+    if (state === undefined) {
+      state = await this.loadContentState(nodeId);
+    }
+    if (!this.client) return;
+    try {
+      this.client.subscribeContent(nodeId, state ?? null);
+    } catch (e) {
+      console.error(`[Syncline] subscribe_content ${nodeId}:`, e);
+      this.subscribedContent.delete(nodeId);
+      return;
+    }
+    if (initialContent !== undefined) {
+      const current = this.client.getContentText(nodeId) ?? "";
+      if (current !== initialContent) {
+        this.client.updateContentText(nodeId, initialContent);
       }
-      this.subscribedContent.add(nodeId);
-      if (initialContent !== undefined) {
-        const current = this.client.getContentText(nodeId) ?? "";
-        if (current !== initialContent) {
-          this.client.updateContentText(nodeId, initialContent);
-        }
-      }
-    })();
+    }
   }
 
   private async onContentChanged(nodeId: string): Promise<void> {
@@ -891,7 +981,20 @@ export default class SynclinePlugin extends Plugin {
         console.error(`[Syncline] ensureBinaryInSync ${row.path}:`, e);
       }
     } else {
-      this.tryRequestBlob(row.blob_hash);
+      // File missing on disk — request unconditionally. tryRequestBlob
+      // dedupes per-hash, but for the missing-file branch that's wrong:
+      // a previous request for this hash only wrote to whichever rows
+      // happened to be in lastProjection when the blob landed. Rows
+      // arriving in later manifest batches need their own delivery.
+      // Server still has the bytes; re-request is cheap.
+      if (!this.client.isConnected()) return;
+      try {
+        this.client.requestBlob(row.blob_hash);
+        this.requestedBlobs.add(row.blob_hash);
+      } catch (e) {
+        if (isNotConnectedError(e)) return;
+        console.error(`[Syncline] requestBlob ${row.blob_hash}:`, e);
+      }
     }
   }
 
@@ -1015,7 +1118,21 @@ export default class SynclinePlugin extends Plugin {
     // that were already on disk). The reconcile loop will pick up any
     // content drift via ensureBinaryInSync / onContentChanged — nothing
     // to do here.
-    if (this.lastProjection.has(file.path)) return;
+    //
+    // Use the LIVE projection (snapshot from the WASM client) rather
+    // than `lastProjection`. `lastProjection` lags behind the live
+    // manifest by one reconcile cycle, and during the first reconcile
+    // after a cache wipe + reopen, every synthetic onFileCreate fires
+    // before reconcile populates `lastProjection` — falling through to
+    // `createText` for paths the LIVE projection already has, which
+    // mints conflict copies of every existing file (#58).
+    //
+    // Comparison is case-insensitive (lowercase) so a case-folded disk
+    // path (e.g. macOS preserved `CaseTest/` for a manifest entry at
+    // `casetest/`) doesn't fall through to createText (#56).
+    const live = this.readProjection();
+    const filePathLower = file.path.toLowerCase();
+    if (live.some((r) => r.path.toLowerCase() === filePathLower)) return;
     try {
       if (isTextFile(file)) {
         const content = await this.app.vault.read(file);
@@ -1029,7 +1146,8 @@ export default class SynclinePlugin extends Plugin {
           console.debug(`[Syncline] createText collision for ${file.path}:`, e);
           nodeId = this.client.createTextAllowingCollision(file.path, size);
         }
-        this.subscribeToContent(nodeId, content);
+        // knownState=null — see comment in scanLocalVault for why.
+        void this.subscribeToContent(nodeId, content, null);
       } else {
         const data = await this.app.vault.readBinary(file);
         const hash = await sha256Hex(data);

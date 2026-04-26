@@ -107,8 +107,10 @@ impl BlobStore {
                 .with_context(|| format!("creating tmp blob {}", tmp_path.display()))?;
             f.write_all(bytes)
                 .with_context(|| format!("writing tmp blob {}", tmp_path.display()))?;
-            f.sync_all()
-                .with_context(|| format!("fsync tmp blob {}", tmp_path.display()))?;
+            // No fsync — blobs are content-addressed, recoverable from
+            // the server (or any peer) on next sync if the local copy
+            // is lost in a crash. See note in client_v1.rs::atomic_write
+            // for why fsync-per-file dominates bulk-bootstrap wall time.
         }
         fs::rename(&tmp_path, &final_path).with_context(|| {
             format!(
