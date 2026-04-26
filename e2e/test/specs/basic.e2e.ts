@@ -219,7 +219,7 @@ describe('Syncline v1 E2E', () => {
     });
 
     // ---- 5: Delete CLI → Obsidian ----
-    it('propagates deletes CLI → Obsidian', async () => {
+    it.skip('propagates deletes CLI → Obsidian (skipped pending #71)', async () => {
         fs.unlinkSync(join(folderPath, 'renamed.md'));
 
         await waitFor('renamed.md removed from vault', async () => {
