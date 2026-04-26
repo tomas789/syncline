@@ -789,20 +789,11 @@ async fn scan_once(
             // Binary path: read bytes, hash, CAS-stash locally, and
             // create/update the manifest entry. Actual upload is batched
             // and sent at the end of the walk.
-            let meta = match fs::metadata(abs) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!("skip unreadable metadata {}: {}", rel_str, e);
-                    continue;
-                }
-            };
-            if meta.len() as usize > MAX_BLOB_SIZE {
-                warn!(
-                    "skipping {} ({} bytes > MAX_BLOB_SIZE {})",
-                    rel_str, meta.len(), MAX_BLOB_SIZE
-                );
-                continue;
-            }
+            // No per-file size limit: the chunker breaks oversized
+            // files into pieces under MAX_CHUNK_SIZE, so each WS frame
+            // stays well under the protocol's MAX_BLOB_SIZE ceiling. A
+            // single multi-GB file is fine; it just produces many
+            // chunks. The original 16 MiB cliff (#59) is gone.
             let bytes = match fs::read(abs) {
                 Ok(b) => b,
                 Err(e) => {
@@ -815,13 +806,19 @@ async fn scan_once(
                 BinaryScanOutcome::Skipped(reason) => {
                     debug!("binary {} skipped: {}", rel_str, reason);
                 }
-                BinaryScanOutcome::Created { hash } => {
+                BinaryScanOutcome::Created {
+                    chunk_hashes: _,
+                    chunks_to_push,
+                } => {
                     new_binary += 1;
-                    pending_blobs.push((hash, bytes));
+                    pending_blobs.extend(chunks_to_push);
                 }
-                BinaryScanOutcome::Rehashed { hash } => {
+                BinaryScanOutcome::Rehashed {
+                    chunk_hashes: _,
+                    chunks_to_push,
+                } => {
                     modified_binary += 1;
-                    pending_blobs.push((hash, bytes));
+                    pending_blobs.extend(chunks_to_push);
                 }
             }
             continue;
@@ -901,13 +898,20 @@ async fn scan_once(
     // hasn't landed yet", not a delete. Directory nodes are emergent
     // and never appear in `by_path`.
     let mut deleted_files = 0usize;
-    let deletion_candidates: Vec<(NodeId, NodeKind, Option<String>, String)> = proj
+    let deletion_candidates: Vec<(NodeId, NodeKind, Vec<String>, String)> = proj
         .by_path
         .iter()
         .filter(|(path, _)| !visited_rel.contains(path.as_str()))
-        .map(|(path, entry)| (entry.id, entry.kind, entry.blob_hash.clone(), path.clone()))
+        .map(|(path, entry)| {
+            (
+                entry.id,
+                entry.kind,
+                entry.chunk_hashes.clone(),
+                path.clone(),
+            )
+        })
         .collect();
-    for (id, kind, blob_hash, path) in deletion_candidates {
+    for (id, kind, chunk_hashes, path) in deletion_candidates {
         match kind {
             NodeKind::Text => {
                 // Only treat a missing on-disk file as a local delete
@@ -921,8 +925,13 @@ async fn scan_once(
                 }
             }
             NodeKind::Binary => {
-                let have_blob = blob_hash.as_deref().map(|h| blobs.has(h)).unwrap_or(false);
-                if have_blob && manifest.delete(id) {
+                // Same gate as text but multi-chunk: only call this a
+                // local delete if every chunk is in our CAS. If any
+                // chunk is missing, this is "remote content hasn't
+                // landed yet", not the user removing the file.
+                let have_all = !chunk_hashes.is_empty()
+                    && chunk_hashes.iter().all(|h| blobs.has(h));
+                if have_all && manifest.delete(id) {
                     debug!(node = ?id, %path, "local binary delete detected");
                     deleted_files += 1;
                 }
@@ -1016,17 +1025,29 @@ async fn scan_once(
 
 /// Outcome of scanning a single binary file on disk. Pure enough to
 /// unit-test against a fake manifest + temp-dir BlobStore.
+///
+/// Carries the chunks the caller still needs to push to the server —
+/// only those chunks whose hashes weren't part of the *previous* entry
+/// at this path. Chunk uploads are content-addressed, so the server's
+/// CAS already deduplicates re-uploads, but we save bandwidth by not
+/// resending the unchanged tail of a partially-modified file.
 #[derive(Debug)]
 enum BinaryScanOutcome {
-    /// Manifest already has a Binary entry at this path with this hash —
-    /// nothing to upload, nothing to record.
+    /// Manifest already has a Binary entry at this path with this exact
+    /// chunk-hash list — nothing to upload, nothing to record.
     Unchanged,
-    /// New path: manifest gained a `Binary` entry; bytes were stashed in
-    /// the local blob store and should be uploaded.
-    Created { hash: String },
-    /// Existing binary path's on-disk content changed: manifest hash
-    /// bumped; bytes were stashed locally and should be uploaded.
-    Rehashed { hash: String },
+    /// New path: manifest gained a `Binary` entry; the listed chunks
+    /// were stashed in the local CAS and should be uploaded.
+    Created {
+        chunk_hashes: Vec<String>,
+        chunks_to_push: Vec<(String, Vec<u8>)>,
+    },
+    /// Existing binary path's on-disk content changed: manifest list
+    /// updated; new chunks were stashed locally and should be uploaded.
+    Rehashed {
+        chunk_hashes: Vec<String>,
+        chunks_to_push: Vec<(String, Vec<u8>)>,
+    },
     /// A local manifest entry exists at this path but is not `Binary`
     /// (e.g. Text) — or creation fell through with a path-level error.
     /// We refuse to clobber the kind. Caller logs and moves on.
@@ -1035,18 +1056,22 @@ enum BinaryScanOutcome {
 
 /// Core per-binary-file logic, factored out so tests can drive it
 /// without a `WsSink`. The caller is responsible for:
-///   * reading `bytes` off disk
-///   * enforcing `MAX_BLOB_SIZE`
-///   * issuing the `MSG_BLOB_UPDATE` frame when we return `Created` /
-///     `Rehashed`
+///   * reading `bytes` off disk (no `MAX_BLOB_SIZE` check needed —
+///     chunking caps every individual frame at `MAX_CHUNK_SIZE`)
+///   * issuing one `MSG_BLOB_UPDATE` frame per `(hash, bytes)` in
+///     `chunks_to_push` when we return `Created` / `Rehashed`
 ///
-/// This helper hashes the bytes, CAS-stashes them in `blobs` (idempotent),
-/// then reconciles against the current manifest projection:
-///   * no existing entry at `rel_path` → `create_binary`, emit `Created`
-///   * existing Binary entry with the same hash → `Unchanged`
-///   * existing Binary entry with a different hash → `set_blob_hash`,
-///     emit `Rehashed`
-///   * existing Text/Directory entry at that path → `Skipped("kind")`
+/// This helper:
+///   1. Splits `bytes` into FastCDC chunks (single chunk for small files).
+///   2. CAS-stashes every chunk locally (idempotent).
+///   3. Diffs the new chunk-hash list against the current manifest entry:
+///      * no entry → `create_binary`, emit `Created` (push all chunks).
+///      * Binary entry with the **same** chunk list → `Unchanged`.
+///      * Binary entry with a **different** chunk list → `set_chunk_hashes`,
+///        emit `Rehashed` (push only chunks whose hash isn't in the
+///        previous list — the FastCDC small-edit-locality property
+///        means an edit at one position only touches nearby chunks).
+///      * Text/Directory entry at that path → `Skipped("kind_mismatch")`.
 fn process_binary_file(
     rel_path: &str,
     bytes: &[u8],
@@ -1054,30 +1079,55 @@ fn process_binary_file(
     manifest: &mut Manifest,
     blobs: &BlobStore,
 ) -> Result<BinaryScanOutcome> {
-    let hash = hash_hex(bytes);
+    use crate::v1::chunker;
+
+    let chunks = chunker::chunks_with_hashes(bytes);
+    let chunk_hashes: Vec<String> = chunks.iter().map(|c| c.hash.clone()).collect();
     let size = bytes.len() as u64;
 
-    // Stash locally first — idempotent, and guarantees that if we
-    // record the hash in the manifest we actually have the blob to
-    // serve to any peer that asks.
-    blobs
-        .insert_bytes(bytes)
-        .with_context(|| format!("stashing blob for {}", rel_path))?;
+    // Stash every chunk locally before recording the hash list — we
+    // must be able to serve any chunk that a peer asks for.
+    for c in &chunks {
+        blobs
+            .insert_bytes(&c.bytes)
+            .with_context(|| {
+                format!("stashing chunk {} for {}", c.hash, rel_path)
+            })?;
+    }
 
-    match proj.by_path.get(rel_path) {
-        None => match crate::v1::ops::create_binary(manifest, rel_path, &hash, size) {
-            Ok(_) => Ok(BinaryScanOutcome::Created { hash }),
+    let existing = proj.by_path.get(rel_path);
+    let old_set: std::collections::HashSet<&str> = match existing {
+        Some(e) if e.kind == NodeKind::Binary => {
+            e.chunk_hashes.iter().map(|s| s.as_str()).collect()
+        }
+        _ => std::collections::HashSet::new(),
+    };
+    let chunks_to_push: Vec<(String, Vec<u8>)> = chunks
+        .iter()
+        .filter(|c| !old_set.contains(c.hash.as_str()))
+        .map(|c| (c.hash.clone(), c.bytes.clone()))
+        .collect();
+
+    match existing {
+        None => match crate::v1::ops::create_binary(manifest, rel_path, &chunk_hashes, size) {
+            Ok(_) => Ok(BinaryScanOutcome::Created {
+                chunk_hashes,
+                chunks_to_push,
+            }),
             Err(e) => {
                 debug!("create_binary({:?}) failed: {}", rel_path, e);
                 Ok(BinaryScanOutcome::Skipped("create_binary_failed"))
             }
         },
-        Some(existing) if existing.kind == NodeKind::Binary => {
-            if existing.blob_hash.as_deref() == Some(hash.as_str()) {
+        Some(e) if e.kind == NodeKind::Binary => {
+            if e.chunk_hashes == chunk_hashes {
                 Ok(BinaryScanOutcome::Unchanged)
             } else {
-                manifest.set_blob_hash(existing.id, &hash, size);
-                Ok(BinaryScanOutcome::Rehashed { hash })
+                manifest.set_chunk_hashes(e.id, &chunk_hashes, size);
+                Ok(BinaryScanOutcome::Rehashed {
+                    chunk_hashes,
+                    chunks_to_push,
+                })
             }
         }
         Some(_) => Ok(BinaryScanOutcome::Skipped("kind_mismatch")),
@@ -1283,10 +1333,10 @@ fn handle_inbound_blob(doc_id: &str, payload: &[u8], blobs: &BlobStore) -> Resul
     Ok(())
 }
 
-/// For each live Binary entry in the manifest projection whose blob we
-/// don't yet have locally and haven't already requested this session,
-/// send a `MSG_BLOB_REQUEST`. The server replies with `MSG_BLOB_UPDATE`
-/// over the same connection.
+/// For each live Binary entry, request every chunk we don't yet have
+/// locally and haven't already requested this session. The server
+/// replies with `MSG_BLOB_UPDATE` per chunk; the request payload
+/// carries the chunk's hash.
 async fn request_missing_blobs(
     write: &mut WsSink,
     manifest: &Manifest,
@@ -1299,24 +1349,25 @@ async fn request_missing_blobs(
         if entry.kind != NodeKind::Binary {
             continue;
         }
-        let Some(hash) = entry.blob_hash.as_deref() else {
-            continue;
-        };
-        if blobs.has(hash) || requested.contains(hash) {
-            continue;
+        for hash in &entry.chunk_hashes {
+            if blobs.has(hash) || requested.contains(hash) {
+                continue;
+            }
+            // Server's handle_blob_request parses the payload as utf8
+            // hash. We echo the hash in doc_id too so the reply is
+            // self-identifying — the server's response carries that
+            // doc_id back, which we use to verify+stash on receipt.
+            let frame = encode_message(MSG_BLOB_REQUEST, hash, hash.as_bytes());
+            write
+                .send(WsMessage::Binary(frame.into()))
+                .await
+                .context("send blob request")?;
+            requested.insert(hash.clone());
+            sent += 1;
         }
-        // Server's handle_blob_request parses the payload as utf8 hash.
-        // We echo the hash in doc_id too so the reply is self-identifying.
-        let frame = encode_message(MSG_BLOB_REQUEST, hash, hash.as_bytes());
-        write
-            .send(WsMessage::Binary(frame.into()))
-            .await
-            .context("send blob request")?;
-        requested.insert(hash.to_string());
-        sent += 1;
     }
     if sent > 0 {
-        debug!("sent {} MSG_BLOB_REQUEST frames", sent);
+        debug!("sent {} MSG_BLOB_REQUEST frames (chunked)", sent);
     }
     Ok(())
 }
@@ -1411,6 +1462,23 @@ fn flush_content_to_disk(
         "flushed content subdoc to disk"
     );
     Ok(())
+}
+
+/// Concatenate the bytes of every chunk in `chunk_hashes`, in order,
+/// from the local CAS [`BlobStore`]. Used by reconcile to materialise
+/// a binary file from the manifest's chunk list.
+///
+/// Errors if any chunk is missing from the store — callers must check
+/// `blobs.has(hash)` for every chunk first to avoid this branch.
+fn assemble_chunks(blobs: &BlobStore, chunk_hashes: &[String]) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, hash) in chunk_hashes.iter().enumerate() {
+        let bytes = blobs
+            .read(hash)
+            .with_context(|| format!("read chunk {} of {}: {}", i + 1, chunk_hashes.len(), hash))?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
 }
 
 /// Shared atomic-write helper (tmp + fsync + rename), used by both the
@@ -1576,31 +1644,39 @@ fn reconcile_projection_to_disk(
                 }
             }
             NodeKind::Binary => {
-                let Some(hash) = entry.blob_hash.as_deref() else {
-                    // A Binary entry with no hash is a manifest-level
-                    // bug on the emitting peer; nothing we can write.
-                    debug!("binary {:?} has no blob_hash, skipping", path);
+                let chunk_hashes = &entry.chunk_hashes;
+                if chunk_hashes.is_empty() {
+                    // Manifest entry with no chunks is a placeholder —
+                    // either the emitting peer hasn't written content
+                    // yet, or it's a truly empty file. Treat as
+                    // "nothing materialised yet" and try again later.
+                    debug!("binary {:?} has no chunks, skipping", path);
                     continue;
-                };
+                }
+                // Need every chunk in local CAS before we can materialise.
+                let missing_chunks =
+                    chunk_hashes.iter().any(|h| !blobs.has(h));
+                if missing_chunks {
+                    pending_binary += 1;
+                    continue;
+                }
+
                 if full.exists() {
                     let local_bytes = fs::read(&full)
                         .with_context(|| format!("read local {}", full.display()))?;
-                    let local_hash = hash_hex(&local_bytes);
-                    if local_hash == hash {
+                    let local_chunk_hashes: Vec<String> =
+                        crate::v1::chunker::chunks_with_hashes(&local_bytes)
+                            .into_iter()
+                            .map(|c| c.hash)
+                            .collect();
+                    if &local_chunk_hashes == chunk_hashes {
                         continue;
                     }
-                    if !blobs.has(hash) {
-                        // Remote blob not fetched yet; keep local bytes
-                        // in place and handle the conflict atomically on
-                        // a later reconcile (once the blob arrives).
-                        pending_binary += 1;
-                        continue;
-                    }
-                    // Disk diverged from manifest and we have the remote
-                    // version. LWW: remote wins (we reach this branch
-                    // only after a remote manifest update landed). Save
-                    // local bytes as a conflict sibling so nothing gets
-                    // silently clobbered.
+                    // Disk diverged from manifest. LWW: remote wins
+                    // (we reach this branch only after a remote
+                    // manifest update landed). Save local bytes as a
+                    // conflict sibling so nothing gets silently
+                    // clobbered.
                     blobs.insert_bytes(&local_bytes).with_context(|| {
                         format!("stash conflict bytes for {:?}", path)
                     })?;
@@ -1608,34 +1684,35 @@ fn reconcile_projection_to_disk(
                     let conflict_rel =
                         conflict_sibling_path(path, &actor_short, &today_ymd());
                     let conflict_full = folder.join(&conflict_rel);
-                    atomic_write(&conflict_full, &local_bytes).with_context(|| {
-                        format!("write conflict copy {}", conflict_full.display())
-                    })?;
-                    let remote_bytes = blobs.read(hash).with_context(|| {
-                        format!("read remote blob {} for {:?}", hash, path)
-                    })?;
+                    atomic_write(&conflict_full, &local_bytes).with_context(
+                        || format!("write conflict copy {}", conflict_full.display()),
+                    )?;
+                    let remote_bytes =
+                        assemble_chunks(blobs, chunk_hashes).with_context(|| {
+                            format!("assemble remote chunks for {:?}", path)
+                        })?;
                     atomic_write(&full, &remote_bytes).with_context(|| {
                         format!("overwrite with remote {}", full.display())
                     })?;
                     warn!(
                         path = %path,
                         conflict_copy = %conflict_rel,
-                        local_hash = %local_hash,
-                        remote_hash = %hash,
+                        local_chunks = local_chunk_hashes.len(),
+                        remote_chunks = chunk_hashes.len(),
                         "binary conflict: local bytes preserved, remote applied"
                     );
                     conflicts_created += 1;
                     continue;
                 }
-                if !blobs.has(hash) {
-                    pending_binary += 1;
-                    continue;
-                }
-                let bytes = blobs
-                    .read(hash)
-                    .with_context(|| format!("read blob {} for {:?}", hash, path))?;
+
+                let bytes = assemble_chunks(blobs, chunk_hashes)
+                    .with_context(|| format!("assemble chunks for {:?}", path))?;
                 atomic_write(&full, &bytes).with_context(|| {
-                    format!("materialize binary {} from blob {}", full.display(), hash)
+                    format!(
+                        "materialize binary {} from {} chunks",
+                        full.display(),
+                        chunk_hashes.len()
+                    )
                 })?;
                 created_binary += 1;
             }
@@ -1934,7 +2011,13 @@ mod tests {
         crate::v1::ops::create_text(&mut m, "top.md", 0).unwrap();
         crate::v1::ops::create_text(&mut m, "notes/deep/sub.md", 0).unwrap();
         // Binary present in manifest but blob is NOT in the local store.
-        crate::v1::ops::create_binary(&mut m, "img/pic.png", "deadbeef", 1024).unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "img/pic.png",
+            &["deadbeef".to_string()],
+            1024,
+        )
+        .unwrap();
 
         reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
@@ -1962,8 +2045,13 @@ mod tests {
         let hash = blobs.insert_bytes(bytes).unwrap();
 
         let mut m = Manifest::new(ActorId::new());
-        crate::v1::ops::create_binary(&mut m, "img/pic.png", &hash, bytes.len() as u64)
-            .unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "img/pic.png",
+            &[hash.clone()],
+            bytes.len() as u64,
+        )
+        .unwrap();
 
         reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
@@ -2005,7 +2093,13 @@ mod tests {
         fs::write(folder.join("img.bin"), local_bytes).unwrap();
 
         let mut m = Manifest::new(ActorId::new());
-        crate::v1::ops::create_binary(&mut m, "img.bin", "deadbeef", 123).unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "img.bin",
+            &["deadbeef".to_string()],
+            123,
+        )
+        .unwrap();
 
         reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 
@@ -2203,31 +2297,45 @@ mod tests {
         let bytes = b"\x89PNG\r\n\x1a\npretend png";
 
         let outcome = process_binary_file("img/pic.png", bytes, &proj, &mut m, &bs).unwrap();
+        // Small blob → single chunk == whole-file hash.
         let expected = hash_hex(bytes);
 
         match outcome {
-            BinaryScanOutcome::Created { hash } => assert_eq!(hash, expected),
+            BinaryScanOutcome::Created {
+                chunk_hashes,
+                chunks_to_push,
+            } => {
+                assert_eq!(chunk_hashes, vec![expected.clone()]);
+                assert_eq!(chunks_to_push.len(), 1);
+                assert_eq!(chunks_to_push[0].0, expected);
+                assert_eq!(chunks_to_push[0].1, bytes);
+            }
             other => panic!("expected Created, got {other:?}"),
         }
-        assert!(bs.has(&expected), "blob must be in local store");
+        assert!(bs.has(&expected), "chunk must be in local store");
 
-        // Manifest now has a Binary entry at that path with matching hash + size.
         let proj2 = project(&m);
         let entry = proj2
             .by_path
             .get("img/pic.png")
             .expect("projection should include img/pic.png");
         assert_eq!(entry.kind, NodeKind::Binary);
-        assert_eq!(entry.blob_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(entry.chunk_hashes, vec![expected.clone()]);
     }
 
     #[test]
-    fn process_binary_unchanged_when_hash_matches() {
+    fn process_binary_unchanged_when_chunks_match() {
         let mut m = Manifest::new(ActorId::new());
         let (_tmp, bs) = fresh_blob_store();
         let bytes = b"same png bytes";
         let h = hash_hex(bytes);
-        crate::v1::ops::create_binary(&mut m, "a.png", &h, bytes.len() as u64).unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "a.png",
+            &[h.clone()],
+            bytes.len() as u64,
+        )
+        .unwrap();
         bs.insert_bytes(bytes).unwrap();
 
         let proj = project(&m);
@@ -2241,7 +2349,13 @@ mod tests {
         let (_tmp, bs) = fresh_blob_store();
         let old = b"old png bytes";
         let h_old = hash_hex(old);
-        crate::v1::ops::create_binary(&mut m, "a.png", &h_old, old.len() as u64).unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "a.png",
+            &[h_old.clone()],
+            old.len() as u64,
+        )
+        .unwrap();
         bs.insert_bytes(old).unwrap();
 
         let new = b"new png bytes, different length and content";
@@ -2250,16 +2364,123 @@ mod tests {
         let outcome = process_binary_file("a.png", new, &proj, &mut m, &bs).unwrap();
 
         match outcome {
-            BinaryScanOutcome::Rehashed { hash } => assert_eq!(hash, h_new),
+            BinaryScanOutcome::Rehashed {
+                chunk_hashes,
+                chunks_to_push,
+            } => {
+                assert_eq!(chunk_hashes, vec![h_new.clone()]);
+                // New chunk wasn't in the old list, so it must be in
+                // the push list.
+                assert_eq!(chunks_to_push.len(), 1);
+                assert_eq!(chunks_to_push[0].0, h_new);
+            }
             other => panic!("expected Rehashed, got {other:?}"),
         }
-        assert!(bs.has(&h_new), "new blob must be stashed");
+        assert!(bs.has(&h_new), "new chunk must be stashed");
         let proj2 = project(&m);
         assert_eq!(
-            proj2.by_path["a.png"].blob_hash.as_deref(),
-            Some(h_new.as_str()),
-            "manifest hash must point to the new blob"
+            proj2.by_path["a.png"].chunk_hashes,
+            vec![h_new.clone()],
+            "manifest list must point to the new chunk"
         );
+    }
+
+    #[test]
+    fn process_binary_chunks_a_large_file_into_many() {
+        // 10 MiB of deterministic bytes — well above MAX_CHUNK_SIZE
+        // (4 MiB), so FastCDC must produce ≥ 2 chunks.
+        let mut bytes = Vec::with_capacity(10 * 1024 * 1024);
+        let mut state: u64 = 0xDEADBEEFCAFEBABE;
+        while bytes.len() < 10 * 1024 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(10 * 1024 * 1024);
+
+        let mut m = Manifest::new(ActorId::new());
+        let proj = project(&m);
+        let (_tmp, bs) = fresh_blob_store();
+
+        let outcome =
+            process_binary_file("big.bin", &bytes, &proj, &mut m, &bs).unwrap();
+        match outcome {
+            BinaryScanOutcome::Created {
+                chunk_hashes,
+                chunks_to_push,
+            } => {
+                assert!(
+                    chunk_hashes.len() >= 2,
+                    "expected ≥ 2 chunks for 10 MiB file, got {}",
+                    chunk_hashes.len()
+                );
+                assert_eq!(chunks_to_push.len(), chunk_hashes.len());
+                // Every chunk must be in local CAS so we can serve it.
+                for h in &chunk_hashes {
+                    assert!(bs.has(h));
+                }
+                // Every chunk must be cap-respecting.
+                for (_, chunk_bytes) in &chunks_to_push {
+                    assert!(
+                        chunk_bytes.len() <= crate::v1::chunker::MAX_CHUNK_SIZE as usize
+                    );
+                }
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_binary_only_pushes_changed_chunks_on_partial_edit() {
+        // Build a large file, register it, then change the first byte
+        // and confirm the rescan only has to upload the chunks that
+        // FastCDC re-cuts at the head — the long unchanged tail must
+        // be skipped (zero bandwidth for unchanged content).
+        let mut bytes = Vec::with_capacity(10 * 1024 * 1024);
+        let mut state: u64 = 0x1234567890ABCDEF;
+        while bytes.len() < 10 * 1024 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(10 * 1024 * 1024);
+
+        let mut m = Manifest::new(ActorId::new());
+        let (_tmp, bs) = fresh_blob_store();
+
+        let proj = project(&m);
+        let first =
+            process_binary_file("big.bin", &bytes, &proj, &mut m, &bs).unwrap();
+        let original_chunks = match first {
+            BinaryScanOutcome::Created { chunk_hashes, .. } => chunk_hashes,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert!(original_chunks.len() >= 2);
+
+        // Single-byte edit at the head. FastCDC's small-edit-locality
+        // property says ≥ 75% of chunks should still hash the same.
+        bytes[0] ^= 0xff;
+
+        let proj = project(&m);
+        let second =
+            process_binary_file("big.bin", &bytes, &proj, &mut m, &bs).unwrap();
+        match second {
+            BinaryScanOutcome::Rehashed {
+                chunk_hashes,
+                chunks_to_push,
+            } => {
+                let total = chunk_hashes.len();
+                let pushed = chunks_to_push.len();
+                assert!(
+                    pushed * 4 <= total * 3 + 4,
+                    "expected most chunks to be reused; pushed {pushed} of {total}"
+                );
+                assert!(pushed > 0, "the changed chunk must be pushed");
+            }
+            other => panic!("expected Rehashed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2384,7 +2605,7 @@ mod tests {
         crate::v1::ops::create_binary(
             &mut m,
             "img.bin",
-            &remote_hash,
+            &[remote_hash.clone()],
             remote_bytes.len() as u64,
         )
         .unwrap();
@@ -2423,7 +2644,13 @@ mod tests {
         fs::write(folder.join("img.bin"), bytes).unwrap();
 
         let mut m = Manifest::new(ActorId::new());
-        crate::v1::ops::create_binary(&mut m, "img.bin", &hash, bytes.len() as u64).unwrap();
+        crate::v1::ops::create_binary(
+            &mut m,
+            "img.bin",
+            &[hash.clone()],
+            bytes.len() as u64,
+        )
+        .unwrap();
 
         reconcile_projection_to_disk(folder, &m, &blobs, &mut HashMap::new(), None).unwrap();
 

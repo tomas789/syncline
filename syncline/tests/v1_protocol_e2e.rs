@@ -119,7 +119,13 @@ fn two_peer_create_converges() {
     let mut b = Peer::new("B");
 
     create_text(&mut a.manifest, "hello.md", 5).unwrap();
-    create_binary(&mut b.manifest, "pic.png", "cafebabe", 1024).unwrap();
+    create_binary(
+        &mut b.manifest,
+        "pic.png",
+        &["cafebabe".to_string()],
+        1024,
+    )
+    .unwrap();
 
     bidirectional_sync(&mut a, &mut b);
     assert_converged(&[&a, &b]);
