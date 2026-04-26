@@ -921,17 +921,48 @@ async fn scan_once(
         }
     }
 
-    // Blobs first, so when the server rebroadcasts the manifest to other
-    // peers they can resolve hashes that would otherwise 404.
-    for (hash, bytes) in pending_blobs {
-        let frame = encode_message(MSG_BLOB_UPDATE, &hash, &bytes);
+    // Persist the manifest BEFORE any of the WS sends below. Without
+    // this, a transport hiccup mid-burst (`Connection reset by peer`,
+    // server crash, kernel-level RST under tcp_recv_window pressure)
+    // leaves the in-memory manifest with the new entries but the on-
+    // disk `manifest.bin` still in the pre-scan state. If the process
+    // is then restarted (rather than an in-loop reconnect that
+    // preserves the in-memory state), the reload yields an empty
+    // manifest. The has-persisted-content check on adoption usually
+    // recovers cleanly because the per-file `content.persist` ran in
+    // the loop above before any send — but in pathological cases
+    // (content cache also gone, or content/*.bin written under a
+    // different actor's NodeIds because a parallel session was active)
+    // it doesn't. Persisting first is durable: the on-disk manifest
+    // matches in-memory state at scan-finish time, regardless of which
+    // send fails next.
+    let post_sv = manifest.doc().transact().state_vector();
+    if post_sv != pre_sv {
+        save_manifest(syncline_dir, manifest)?;
+    }
+
+    // Bulk-send in chunks with `tokio::task::yield_now()` between them.
+    // The naive tight loop starved the runtime: the WS pong-handler
+    // task and the broadcast-channel forward task both share this
+    // worker, and a sustained burst of `write.send().await` calls (no
+    // intervening yields, since `Sink::send` doesn't reliably yield
+    // when the sink's buffer has room) prevents them from running.
+    // Server-side, that lets the broadcast channel grow, the kernel
+    // recv window saturate, and the connection RST under load.
+    // Yielding every BURST_SIZE frames is enough to keep both tasks
+    // alive on the scanner-CLI workload (#60).
+    const BURST_SIZE: usize = 32;
+    for (i, (hash, bytes)) in pending_blobs.iter().enumerate() {
+        let frame = encode_message(MSG_BLOB_UPDATE, hash, bytes);
         write
             .send(WsMessage::Binary(frame.into()))
             .await
             .context("send blob update from scanner")?;
+        if i % BURST_SIZE == BURST_SIZE - 1 {
+            tokio::task::yield_now().await;
+        }
     }
 
-    let post_sv = manifest.doc().transact().state_vector();
     if post_sv != pre_sv {
         let update_bytes = {
             let txn = manifest.doc().transact();
@@ -943,15 +974,17 @@ async fn scan_once(
             .send(WsMessage::Binary(frame.into()))
             .await
             .context("send manifest update from scanner")?;
-        save_manifest(syncline_dir, manifest)?;
     }
 
-    for (node_id, update) in pending_content {
-        let frame = encode_message(MSG_UPDATE, &content_doc_id(node_id), &update);
+    for (i, (node_id, update)) in pending_content.iter().enumerate() {
+        let frame = encode_message(MSG_UPDATE, &content_doc_id(*node_id), update);
         write
             .send(WsMessage::Binary(frame.into()))
             .await
             .context("send content update from scanner")?;
+        if i % BURST_SIZE == BURST_SIZE - 1 {
+            tokio::task::yield_now().await;
+        }
     }
 
     if new_files + modified_files + new_binary + modified_binary + deleted_files > 0 {
