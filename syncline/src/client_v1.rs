@@ -1378,6 +1378,31 @@ fn flush_content_to_disk(
             .with_context(|| format!("mkdir -p {} for content flush", parent.display()))?;
     }
     let body = content.current_text(node_id).unwrap_or_default();
+
+    // Idempotency: skip the atomic_write when on-disk bytes already
+    // match. Without this, every UPDATE we receive — including ones
+    // that don't actually change the document — rewrites the vault
+    // file via tmp + rename, which fires inotify CREATE/MOVED_TO
+    // events. Those events go through `batch_wants_scan` (which
+    // correctly classifies them as outside `.syncline/`) and trigger
+    // a full-vault `scan_once`. The scan finishes, we receive the
+    // next UPDATE, we rewrite the file, the watcher fires again — a
+    // self-amplifying loop that pins the client at 100 % CPU during
+    // and well after bootstrap on a vault with any meaningful churn.
+    //
+    // Reading the file before writing costs one extra `read` per
+    // flush, dwarfed by the work avoided when content is unchanged.
+    if let Ok(current) = fs::read(&full) {
+        if current == body.as_bytes() {
+            debug!(
+                bytes = body.len(),
+                path = %entry.path,
+                "flush content subdoc skipped — disk already matches"
+            );
+            return Ok(());
+        }
+    }
+
     atomic_write(&full, body.as_bytes())
         .with_context(|| format!("atomic_write to {}", full.display()))?;
     debug!(

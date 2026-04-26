@@ -56,57 +56,107 @@ impl SynclineWatcher {
 }
 
 pub struct DebouncedWatcher {
-    debouncer: notify_debouncer_mini::Debouncer<RecommendedWatcher>,
+    _watcher: RecommendedWatcher,
 }
 
 impl DebouncedWatcher {
+    /// Build a watcher whose callbacks **drop `EventKind::Access` events
+    /// at the notify-callback level** before any debouncing happens.
+    ///
+    /// The notify 8.x inotify backend subscribes to read-side events
+    /// (`IN_OPEN`, `IN_ACCESS`, `IN_CLOSE_NOWRITE`) by default. The
+    /// client's `scan_once` opens every file in the vault on each pass,
+    /// so without this filter the watcher delivers a flood of
+    /// `Access(Open(Any))` events that map through `notify-debouncer-mini`
+    /// to discrete `DebouncedEventKind::Any` entries — indistinguishable
+    /// downstream from real writes. That feedback loop pins the client
+    /// at 100% CPU forever (each scan triggers events that trigger
+    /// another scan, etc.). `notify-debouncer-mini` v0.7.0 does *not*
+    /// filter these, so we must do it ourselves.
+    ///
+    /// We also drop the original `notify-debouncer-mini::Debouncer`
+    /// entirely and roll a small time-window debouncer here. That keeps
+    /// the public channel API (`Vec<DebouncedEvent>`) for callers
+    /// unchanged while letting the filter run before any debouncing.
     pub fn new(
         tx: mpsc::Sender<Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>>,
         timeout: std::time::Duration,
     ) -> notify::Result<Self> {
-        let debouncer = notify_debouncer_mini::new_debouncer(
-            timeout,
-            move |res: notify_debouncer_mini::DebounceEventResult| {
-                // Determine whether res has Vec<notify::Error> or notify::Error
-                let mapped_res = match res {
-                    Ok(events) => Ok(events),
-                    Err(e) => {
-                        let errstr = format!("{:?}", e);
-                        Err(notify::Error::generic(&errstr))
+        use notify::EventKind;
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        use std::sync::mpsc as std_mpsc;
+
+        let (raw_tx, raw_rx) = std_mpsc::channel::<notify::Event>();
+
+        let watcher = RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| match res {
+                Ok(event) => {
+                    if matches!(
+                        event.kind,
+                        EventKind::Access(_) | EventKind::Other | EventKind::Any
+                    ) {
+                        return;
                     }
-                };
-                // Apply backpressure: blocking_send is safe here
-                // because notify-debouncer-mini invokes this callback
-                // on its own dedicated std thread, not on a tokio
-                // worker. Blocking when the consumer is busy is the
-                // intended behavior — we'd rather slow the watcher
-                // than silently drop events when the channel fills
-                // (the original v1.0.1 try_send + 16-slot channel
-                // dropped events on vault bootstrap >1k files).
-                if let Err(e) = tx.blocking_send(mapped_res) {
-                    error!(
-                        "Channel closed, dropped debounced file event: {:?}",
-                        e
-                    );
+                    let _ = raw_tx.send(event);
+                }
+                Err(e) => {
+                    error!("Raw watcher error: {:?}", e);
                 }
             },
+            Config::default(),
         )?;
 
-        Ok(Self { debouncer })
+        // Time-window debouncer thread: collect filtered events for
+        // `timeout` after the *first* event of a quiet window, then ship
+        // them as a single batch. This matches the
+        // `notify-debouncer-mini` semantics that callers expect.
+        std::thread::spawn(move || {
+            let mut batch: Vec<DebouncedEvent> = Vec::new();
+            let mut deadline: Option<std::time::Instant> = None;
+            loop {
+                let wait = match deadline {
+                    Some(t) => t.saturating_duration_since(std::time::Instant::now()),
+                    None => std::time::Duration::from_secs(60 * 60),
+                };
+                match raw_rx.recv_timeout(wait) {
+                    Ok(event) => {
+                        if deadline.is_none() {
+                            deadline = Some(std::time::Instant::now() + timeout);
+                        }
+                        for path in event.paths {
+                            batch.push(DebouncedEvent {
+                                path,
+                                kind: DebouncedEventKind::Any,
+                            });
+                        }
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        if !batch.is_empty() {
+                            if let Err(e) = tx.blocking_send(Ok(std::mem::take(&mut batch))) {
+                                error!("Channel closed, dropped debounced file batch: {:?}", e);
+                                break;
+                            }
+                        }
+                        deadline = None;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        Ok(Self { _watcher: watcher })
     }
 
     pub fn watch(&mut self, path: impl AsRef<Path>) -> notify::Result<()> {
         let path = path.as_ref();
         info!("Starting debounced watcher on directory: {:?}", path);
-        self.debouncer
-            .watcher()
-            .watch(path, RecursiveMode::Recursive)
+        self._watcher.watch(path, RecursiveMode::Recursive)
     }
 
     pub fn unwatch(&mut self, path: impl AsRef<Path>) -> notify::Result<()> {
         let path = path.as_ref();
         info!("Stopping debounced watch on directory: {:?}", path);
-        self.debouncer.watcher().unwatch(path)
+        self._watcher.unwatch(path)
     }
 }
 
