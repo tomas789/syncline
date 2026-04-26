@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/tomas789/syncline/compare/v1.1.1...v1.1.2) (2026-04-26)
+
+
+### Bug Fixes
+
+* **server:** drop empty STEP_2 broadcasts to stop delete-resurrection ([85ce6c5](https://github.com/tomas789/syncline/commit/85ce6c55bec81e8050e59f4e142dbf61daff62ef))
+
 ## [1.1.1](https://github.com/tomas789/syncline/compare/v1.1.0...v1.1.1) (2026-04-26)
 
 
