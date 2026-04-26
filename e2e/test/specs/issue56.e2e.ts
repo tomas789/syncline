@@ -60,9 +60,9 @@ describe('Syncline #56 — case-insensitive FS phantom manifest entries', () => 
         await waitFor('server listening', async () => /listening/i.test(serverOut), 30_000, 100);
 
         const obsidianPage = browser.getObsidianPage();
-        try { await obsidianPage.enablePlugin('syncline-obsidian'); } catch {}
+        try { await obsidianPage.enablePlugin('syncline'); } catch {}
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('plugin not found');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -70,7 +70,7 @@ describe('Syncline #56 — case-insensitive FS phantom manifest entries', () => 
             await plugin.connect();
         }, serverUrl);
         await waitFor('plugin connected', async () => browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             return !!(plugin && plugin.client && plugin.client.isConnected());
         }), 30_000, 100);
     });
@@ -87,7 +87,7 @@ describe('Syncline #56 — case-insensitive FS phantom manifest entries', () => 
         // with the mixed-case name FIRST so that subsequent
         // case-insensitive lookups resolve to it.
         const result: any = await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             const adapter = (app as any).vault.adapter;
 
             // Clean any prior bench-foo dirs.

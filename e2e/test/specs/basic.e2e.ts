@@ -124,14 +124,14 @@ describe('Syncline v1 E2E', () => {
 
         const obsidianPage = browser.getObsidianPage();
         try {
-            await obsidianPage.enablePlugin('syncline-obsidian');
+            await obsidianPage.enablePlugin('syncline');
             console.log('Syncline plugin enabled');
         } catch (e: any) {
             console.error('Could not enable plugin or already enabled:', e?.message);
         }
 
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('Syncline plugin not found in app.plugins');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -142,7 +142,7 @@ describe('Syncline v1 E2E', () => {
         // Wait for the plugin's WS client to report isConnected=true.
         await waitFor('plugin connected', async () => {
             return browser.executeObsidian(async ({ app }) => {
-                const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const plugin: any = (app as any).plugins.plugins['syncline'];
                 return !!(plugin && plugin.client && plugin.client.isConnected());
             });
         }, 30000);
