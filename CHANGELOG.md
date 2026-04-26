@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.0](https://github.com/tomas789/syncline/compare/v1.1.5...v1.2.0) (2026-04-26)
+
+
+### Features
+
+* **plugin:** add Syncline sidebar shell ([#79](https://github.com/tomas789/syncline/issues/79)) ([f447688](https://github.com/tomas789/syncline/commit/f447688a438e6128bf3ae9e28e7b3eedc4bb7f42))
+* **v1:** add content-defined chunker for binary blobs ([#80](https://github.com/tomas789/syncline/issues/80)) ([6ffed3c](https://github.com/tomas789/syncline/commit/6ffed3cab04e463cd61fe7cf7e595fcc9e591e0e))
+* **v1:** chunked-blob sync (closes [#59](https://github.com/tomas789/syncline/issues/59)) ([#83](https://github.com/tomas789/syncline/issues/83)) ([d977aa5](https://github.com/tomas789/syncline/commit/d977aa5969f2d872a1e3e457d1ef1d4f1e774b49))
+
+
+### Bug Fixes
+
+* **client:** break watcher feedback loop pinning sync at 100% CPU ([#78](https://github.com/tomas789/syncline/issues/78)) ([743da2b](https://github.com/tomas789/syncline/commit/743da2bcc31472e5f1be03786630b07c2bb59daa))
+* **plugin:** unify plugin id to "syncline" across the repo ([#81](https://github.com/tomas789/syncline/issues/81)) ([a1a928e](https://github.com/tomas789/syncline/commit/a1a928ee5a813fd581c359988dae578d22c256ed))
+
 ## [1.1.5](https://github.com/tomas789/syncline/compare/v1.1.4...v1.1.5) (2026-04-26)
 
 
