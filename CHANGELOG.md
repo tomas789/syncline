@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.1](https://github.com/tomas789/syncline/compare/v1.1.0...v1.1.1) (2026-04-26)
+
+
+### Bug Fixes
+
+* **plugin:** gate blob requests on WS connection state ([b8f7273](https://github.com/tomas789/syncline/commit/b8f72737ce6dd902c108ac96326b18f1b68b82d7))
+* **plugin:** make ingestNewFile idempotent for already-tracked paths ([9bd7104](https://github.com/tomas789/syncline/commit/9bd71046cbb77f4afba153d3702cc74288a8b196))
+* **plugin:** stop "Folder already exists" error flood on reconcile ([0dd1145](https://github.com/tomas789/syncline/commit/0dd114575c94b271880a552a9a80080f8c797be4))
+* **plugin:** treat ENOENT as benign in vault/state operations ([4de283e](https://github.com/tomas789/syncline/commit/4de283e7a0dddd4fadbc3230b69126a6c1d5a5bc))
+* **sync:** reciprocate content STEP_1 to unblock client→server pushes ([70fde18](https://github.com/tomas789/syncline/commit/70fde185d5349db4cda6dd082af6c997d0db111b))
+
 ## [1.1.0](https://github.com/tomas789/syncline/compare/v1.0.1...v1.1.0) (2026-04-25)
 
 
