@@ -61,3 +61,67 @@
 .syncline-ribbon.disconnected {
   color: #9e9e9e;
 }
+
+/* Sidebar view (Phase 1 of #65). Reuses the same four state colors as
+   the status-bar dot above so users get a consistent visual vocabulary. */
+.syncline-sidebar {
+  padding: 12px;
+  font-size: var(--font-ui-small);
+}
+
+.syncline-sidebar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.syncline-sidebar-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.syncline-sidebar-dot.synced {
+  background-color: #4caf50;
+}
+
+.syncline-sidebar-dot.syncing {
+  background-color: #ff9800;
+  animation: pulse 1s infinite;
+}
+
+.syncline-sidebar-dot.error {
+  background-color: #f44336;
+}
+
+.syncline-sidebar-dot.disconnected {
+  background-color: #9e9e9e;
+}
+
+.syncline-sidebar-status-label {
+  font-weight: 600;
+}
+
+.syncline-sidebar-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.syncline-sidebar-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.syncline-sidebar-row-label {
+  color: var(--text-muted);
+}
+
+.syncline-sidebar-row-value {
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
+}
