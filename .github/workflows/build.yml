@@ -16,7 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     # The whole point is to keep rerunning the suite. Avoid bailing out
     # of the matrix or burning credits on early-failed jobs.
-    timeout-minutes: 30
+    # The job runs the e2e spec in a tight inner loop so we don't pay
+    # the apt + cargo + wasm + node setup cost per trial. 6 hours is
+    # the GHA hard cap for a single job, but we exit on the first
+    # test-level failure so we usually finish much sooner.
+    timeout-minutes: 350
 
     env:
       # Crank up logging on the syncline binary spawned by basic.e2e.ts
@@ -92,9 +96,61 @@ jobs:
           cd obsidian-plugin
           npx rollup --config rollup.config.js
 
-      - name: Run only basic.e2e.ts (the spec containing the flaky test)
+      - name: Pre-build syncline binary (so cargo run is a no-op per loop)
+        # basic.e2e.ts spawns `cargo run --bin syncline -- ...`. Without
+        # a pre-build, every iteration of the inner loop relinks the
+        # binary and the test pays 20-40 s of cargo time. With this
+        # step the dev binary is in target/debug and `cargo run`
+        # short-circuits to "Finished in 0.0s".
+        run: cargo build --bin syncline
+
+      - name: Loop basic.e2e.ts until a test-level failure
+        # We're hunting an intermittent test flake. Each `xvfb-run` /
+        # `wdio` invocation costs ~3-4 min; rebuilds + apt + node setup
+        # add another 3-4 min on top. By looping the spec inside ONE
+        # job we amortise the setup across many trials.
+        #
+        # Stop conditions:
+        #   - Test failure (exit non-zero) → save logs, exit the job
+        #     with a non-zero code so the workflow run is marked failed
+        #     and we can inspect the dump from `actions/upload-artifact`.
+        #   - The job's `timeout-minutes` expires (set above).
+        #
+        # Iteration budget: capped at MAX_ITERS so a non-flaky run
+        # eventually returns success rather than running until the
+        # 6 h job limit.
         run: |
           cd e2e
           npm ci
-          xvfb-run --auto-servernum ./node_modules/.bin/wdio run wdio.conf.ts \
-            --spec ./test/specs/basic.e2e.ts
+          MAX_ITERS=80
+          for i in $(seq 1 $MAX_ITERS); do
+            echo "::group::iteration $i / $MAX_ITERS"
+            iter_log=/tmp/wdio-iter-$i.log
+            if xvfb-run --auto-servernum ./node_modules/.bin/wdio run wdio.conf.ts \
+                 --spec ./test/specs/basic.e2e.ts 2>&1 | tee "$iter_log"; then
+              echo "::endgroup::"
+              echo "iter $i passed"
+            else
+              echo "::endgroup::"
+              echo "::error::iter $i FAILED — dumping log tail"
+              tail -300 "$iter_log"
+              # Save all iteration logs (the failing one + any prior)
+              # so we have the full picture if you want to diff.
+              mkdir -p /tmp/wdio-logs
+              cp /tmp/wdio-iter-*.log /tmp/wdio-logs/ || true
+              exit 1
+            fi
+            # Settle ports / chromedriver / Obsidian processes before
+            # the next iteration. Without this, a TIME_WAIT'd 3040
+            # binds intermittently fail.
+            sleep 3
+          done
+          echo "all $MAX_ITERS iterations passed"
+
+      - name: Upload all iteration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdio-iter-logs
+          path: /tmp/wdio-logs/
+          if-no-files-found: ignore
