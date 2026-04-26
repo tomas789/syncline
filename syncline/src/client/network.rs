@@ -1,11 +1,21 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Once;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 use tracing::{error, info};
 use url::Url;
 
 use crate::client::protocol::Message;
+
+// rustls 0.23 has no default CryptoProvider — pick one explicitly so that
+// `wss://` connections work out of the box. Idempotent and cheap to call.
+fn ensure_rustls_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub struct SynclineClient {
     pub url: Url,
@@ -36,6 +46,7 @@ impl SynclineClient {
             task.abort();
         }
 
+        ensure_rustls_provider();
         let (ws_stream, _) = connect_async(self.url.as_str()).await?;
         info!("Successfully connected to server at {}", self.url);
 
@@ -217,5 +228,47 @@ mod tests {
     fn test_invalid_url() {
         let result = SynclineClient::new("invalid_url");
         assert!(result.is_err());
+    }
+
+    // Regression test for #54: released binaries failed against `wss://` URLs
+    // with "TLS support not compiled in" because tokio-tungstenite's TLS
+    // features were disabled. We accept a TCP connection on a local port
+    // (so resolution + TCP connect succeed) and then attempt the WSS
+    // upgrade. Without TLS compiled in, this fails with the "not compiled"
+    // error; with rustls enabled, it fails with a real TLS handshake error
+    // (because our dummy listener doesn't actually speak TLS).
+    #[tokio::test]
+    async fn test_wss_url_does_not_fail_with_tls_not_compiled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept loop — just keep the TCP connection open long enough for
+        // the TLS handshake attempt to fail in the way we expect.
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    drop(stream);
+                });
+            }
+        });
+
+        let url = format!("wss://localhost:{port}/sync");
+        let mut client = SynclineClient::new(&url).unwrap();
+        let (app_tx, _rx) = mpsc::channel(10);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect(app_tx),
+        )
+        .await
+        .expect("connect_async should not hang");
+
+        let err = result.expect_err("wss to non-TLS endpoint must fail");
+        let msg = format!("{:#}", err);
+        assert!(
+            !msg.contains("TLS support not compiled in"),
+            "wss:// must not fail with 'TLS support not compiled in' — got: {msg}"
+        );
     }
 }
