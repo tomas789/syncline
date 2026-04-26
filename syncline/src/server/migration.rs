@@ -111,11 +111,19 @@ pub async fn migrate_server_db(db: &Db) -> Result<ServerMigrationReport> {
             NodeKind::Text => snap.content.as_ref().map(|s| s.len()).unwrap_or(0) as u64,
             _ => 0,
         };
+        // v0 single-hash → length-1 chunk list. Re-chunking happens
+        // the next time a client uploads the file.
+        let chunk_hashes: Vec<String> = snap
+            .blob_hash
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|h| vec![h.to_string()])
+            .unwrap_or_default();
         let node_id = manifest.create_node(
             &leaf,
             parent,
             snap.kind,
-            snap.blob_hash.as_deref(),
+            &chunk_hashes,
             size,
         );
 
@@ -341,7 +349,7 @@ fn ensure_parent_chain(
         let id = if let Some(id) = dir_nodes.get(&prefix) {
             *id
         } else {
-            let id = manifest.create_node(seg, parent, NodeKind::Directory, None, 0);
+            let id = manifest.create_node(seg, parent, NodeKind::Directory, &[], 0);
             dir_nodes.insert(prefix.clone(), id);
             id
         };
@@ -497,7 +505,8 @@ mod tests {
         let entry = m.live_entries().into_iter().next().unwrap();
         assert_eq!(entry.name, "pic.png");
         assert!(matches!(entry.kind, NodeKind::Binary));
-        assert_eq!(entry.blob_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(entry.chunk_hashes, vec!["deadbeef".to_string()]);
+        assert_eq!(entry.single_blob_hash(), Some("deadbeef"));
     }
 
     #[tokio::test]

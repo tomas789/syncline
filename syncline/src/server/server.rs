@@ -203,10 +203,38 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // -----------------------------------------------------------------
         // Step 2 — message loop.
         // -----------------------------------------------------------------
-        while let Some(Ok(msg)) = receiver.next().await {
+        loop {
+            let msg = match receiver.next().await {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    // Critical — without this, an oversized inbound
+                    // frame, a TLS error, or any other protocol-level
+                    // teardown by `tokio-tungstenite` disappears from
+                    // the server log entirely; the client just sees a
+                    // bare `Connection reset by peer`. See #59 for the
+                    // class of failure this log line catches.
+                    tracing::warn!(
+                        conn = %connection_id,
+                        error = %e,
+                        "websocket recv error: tearing down session"
+                    );
+                    break;
+                }
+                None => {
+                    tracing::debug!(conn = %connection_id, "websocket stream ended");
+                    break;
+                }
+            };
             let data = match msg {
                 Message::Binary(b) => b,
-                Message::Close(_) => break,
+                Message::Close(frame) => {
+                    tracing::debug!(
+                        conn = %connection_id,
+                        frame = ?frame,
+                        "peer closed websocket"
+                    );
+                    break;
+                }
                 _ => continue,
             };
             let Some((msg_type, doc_id, payload)) = decode_message(&data) else {
