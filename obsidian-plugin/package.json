@@ -1,6 +1,6 @@
 {
   "name": "syncline-obsidian",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "description": "Syncline sync plugin for Obsidian",
   "type": "module",
   "main": "main.js",
