@@ -400,12 +400,37 @@ async fn handle_content_step1(
     }
 }
 
+/// True iff the encoded Yrs update has no blocks and an empty delete set.
+/// Broadcasting an empty update is wasted bandwidth, and worse: it
+/// triggers `flush_content_to_disk` on every other CLI client, which
+/// can race with a concurrent local-disk delete (the freshly-deleted
+/// file gets re-written from CRDT content before scan_once notices the
+/// unlink, defeating delete propagation entirely).
+fn is_noop_update(payload: &[u8]) -> bool {
+    use yrs::Update;
+    use yrs::updates::decoder::Decode;
+    match Update::decode_v1(payload) {
+        Ok(u) => u.state_vector().is_empty(),
+        // Malformed: not no-op, but also can't apply — let downstream reject.
+        Err(_) => false,
+    }
+}
+
 async fn handle_content_update(
     state: &AppState,
     conn: uuid::Uuid,
     doc_id: &str,
     payload: &[u8],
 ) {
+    // Skip empty STEP_2 replies (typically those that come back from a
+    // client whose state vector matched ours after the handshake — the
+    // client has nothing to add). Without this the bidirectional handshake
+    // produces a thundering-herd of empty broadcasts, each one re-flushing
+    // the content to disk on every peer and shadow-resurrecting freshly
+    // deleted files before scan_once can register them as gone.
+    if is_noop_update(payload) {
+        return;
+    }
     if let Err(e) = state.db.save_update(doc_id, payload).await {
         tracing::error!("persist content update for {}: {}", doc_id, e);
         return;
