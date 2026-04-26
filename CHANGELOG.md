@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.5](https://github.com/tomas789/syncline/compare/v1.1.4...v1.1.5) (2026-04-26)
+
+
+### Bug Fixes
+
+* **client:** periodic scan every 5 min, end-to-start, never overlapping ([#76](https://github.com/tomas789/syncline/issues/76)) ([6bf8a03](https://github.com/tomas789/syncline/commit/6bf8a033f44cb3f1403cfdd5a2239865b9c6dd79))
+
 ## [1.1.4](https://github.com/tomas789/syncline/compare/v1.1.3...v1.1.4) (2026-04-26)
 
 
