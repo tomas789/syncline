@@ -319,6 +319,12 @@ async fn handle_manifest_sync(
                     tracing::error!("persist manifest update failed: {}", e);
                     return;
                 }
+                tracing::info!(
+                    target: "syncline::flake_repro",
+                    %conn,
+                    inner_bytes = inner.len(),
+                    "server: manifest update persisted, broadcasting"
+                );
                 // Rebroadcast as MANIFEST_UPDATE (STEP_2 is peer-
                 // directed; UPDATE is the broadcast form).
                 let mut rebroadcast = Vec::with_capacity(1 + inner.len());
@@ -326,9 +332,21 @@ async fn handle_manifest_sync(
                 rebroadcast.extend_from_slice(inner);
                 let framed =
                     encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &rebroadcast);
-                if let Some(tx) = state.channels.read().await.get(MANIFEST_DOC_ID) {
+                let receivers = if let Some(tx) =
+                    state.channels.read().await.get(MANIFEST_DOC_ID)
+                {
+                    let n = tx.receiver_count();
                     let _ = tx.send((framed, conn));
-                }
+                    n
+                } else {
+                    0
+                };
+                tracing::info!(
+                    target: "syncline::flake_repro",
+                    %conn,
+                    receivers,
+                    "server: manifest update broadcasted"
+                );
             }
         }
         Err(e) => {

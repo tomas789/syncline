@@ -574,6 +574,7 @@ async fn run_session(
                 debug!("dropping frame for unknown doc_id={}", doc_id);
             }
             _ = scan_timer.tick() => {
+                info!(target: "syncline::flake_repro", "select: scan_timer fired");
                 if !did_initial_scan {
                     // Manifest STEP_2 hasn't arrived yet — holding off
                     // any scan avoids recording local files as new
@@ -597,10 +598,24 @@ async fn run_session(
             batch_opt = watcher_rx.recv(), if watcher.is_some() => {
                 match batch_opt {
                     Some(Ok(events)) => {
+                        info!(
+                            target: "syncline::flake_repro",
+                            n = events.len(),
+                            "select: watcher_rx batch received"
+                        );
+                        for ev in events.iter().take(10) {
+                            info!(
+                                target: "syncline::flake_repro",
+                                kind = ?ev.kind,
+                                path = %ev.path.display(),
+                                "select: watcher event"
+                            );
+                        }
                         if !batch_wants_scan(&events, syncline_dir) {
-                            debug!(
-                                "watcher batch of {} events all inside .syncline/; ignoring",
-                                events.len()
+                            info!(
+                                target: "syncline::flake_repro",
+                                n = events.len(),
+                                "select: watcher batch ignored (.syncline/-only)"
                             );
                             continue;
                         }
@@ -608,7 +623,11 @@ async fn run_session(
                             debug!("deferring watcher-driven scan until manifest bootstrap");
                             continue;
                         }
-                        debug!("watcher batch of {} events triggering scan", events.len());
+                        info!(
+                            target: "syncline::flake_repro",
+                            n = events.len(),
+                            "select: watcher batch triggering scan"
+                        );
                         if let Err(e) = scan_once(
                             folder,
                             syncline_dir,
@@ -685,12 +704,19 @@ async fn scan_once(
     write: &mut WsSink,
     subscribed: &mut HashSet<NodeId>,
 ) -> Result<()> {
+    info!(target: "syncline::flake_repro", "scan_once: enter");
+    let scan_started = std::time::Instant::now();
     let pre_sv = manifest.doc().transact().state_vector();
 
     // Snapshot projection once for path lookups. The loop may grow the
     // manifest, but we rely on `create_text` to detect duplicates and
     // on the caller running scan_once single-threaded.
     let proj = project(manifest);
+    info!(
+        target: "syncline::flake_repro",
+        proj_size = proj.by_path.len(),
+        "scan_once: projected"
+    );
 
     let mut pending_content: Vec<(NodeId, Vec<u8>)> = Vec::new();
     // Binary uploads batched until after the walk. (hash_hex, bytes).
@@ -897,6 +923,12 @@ async fn scan_once(
         .filter(|(path, _)| !visited_rel.contains(path.as_str()))
         .map(|(path, entry)| (entry.id, entry.kind, entry.blob_hash.clone(), path.clone()))
         .collect();
+    info!(
+        target: "syncline::flake_repro",
+        visited = visited_rel.len(),
+        candidates = deletion_candidates.len(),
+        "scan_once: deletion-detection start"
+    );
     for (id, kind, blob_hash, path) in deletion_candidates {
         match kind {
             NodeKind::Text => {
@@ -905,9 +937,23 @@ async fn scan_once(
                 // (i.e. have a persisted subdoc). Otherwise this is a
                 // remote-only entry we have yet to materialise, not a
                 // user-driven deletion.
-                if content.has_persisted(id) && manifest.delete(id) {
-                    debug!(node = ?id, %path, "local text delete detected");
-                    deleted_files += 1;
+                let persisted = content.has_persisted(id);
+                if persisted {
+                    let deleted_now = manifest.delete(id);
+                    info!(
+                        target: "syncline::flake_repro",
+                        node = ?id, %path, persisted, deleted_now,
+                        "scan_once: text deletion-candidate result"
+                    );
+                    if deleted_now {
+                        deleted_files += 1;
+                    }
+                } else {
+                    info!(
+                        target: "syncline::flake_repro",
+                        node = ?id, %path,
+                        "scan_once: skipping text delete, content never persisted"
+                    );
                 }
             }
             NodeKind::Binary => {
@@ -939,11 +985,27 @@ async fn scan_once(
         };
         let payload = encode_manifest_update(&update_bytes);
         let frame = encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &payload);
+        info!(
+            target: "syncline::flake_repro",
+            payload_bytes = payload.len(),
+            "scan_once: sending manifest update over WS"
+        );
+        let send_started = std::time::Instant::now();
         write
             .send(WsMessage::Binary(frame.into()))
             .await
             .context("send manifest update from scanner")?;
+        info!(
+            target: "syncline::flake_repro",
+            send_ms = send_started.elapsed().as_millis() as u64,
+            "scan_once: manifest update WS-sent OK"
+        );
         save_manifest(syncline_dir, manifest)?;
+    } else {
+        info!(
+            target: "syncline::flake_repro",
+            "scan_once: manifest unchanged, no update to send"
+        );
     }
 
     for (node_id, update) in pending_content {
@@ -968,6 +1030,12 @@ async fn scan_once(
     // Newly-created entries get a STEP_1 so we also hear concurrent
     // server-side edits that may already be in flight for that doc id.
     subscribe_new_text_content(write, manifest, content, subscribed).await?;
+    info!(
+        target: "syncline::flake_repro",
+        scan_ms = scan_started.elapsed().as_millis() as u64,
+        new_files, modified_files, new_binary, modified_binary, deleted_files,
+        "scan_once: exit"
+    );
     Ok(())
 }
 

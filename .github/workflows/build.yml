@@ -2,14 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [main, release/v1]
+    # debug branch — focused only on reproducing the
+    # `propagates deletes CLI → Obsidian` flake on Linux GHA runners.
+    # Restore the full workflow before merging anywhere.
+    branches: [main, release/v1, 'debug/**']
   pull_request:
     branches: [main, release/v1]
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build and Test
+  flake-repro:
+    name: Reproduce propagates-deletes flake
     runs-on: ubuntu-latest
+    # The whole point is to keep rerunning the suite. Avoid bailing out
+    # of the matrix or burning credits on early-failed jobs.
+    timeout-minutes: 30
+
+    env:
+      # Crank up logging on the syncline binary spawned by basic.e2e.ts
+      # via `cargo run`. Picked up because the binary calls
+      # `tracing_subscriber::fmt::init()`.
+      RUST_LOG: trace,sqlx=warn,hyper=warn,tungstenite=warn,h2=warn
 
     steps:
       - name: Checkout repository
@@ -17,51 +30,42 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-
-      - name: Install macOS/Linux Desktop Dependencies
+      - name: Install Linux desktop deps + xvfb
         run: |
-          if [ "$RUNNER_OS" == "Linux" ]; then
-            sudo apt-get update
-            sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev xvfb
 
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          restore-keys: ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
+          restore-keys: ${{ runner.os }}-cargo-index-
 
       - name: Cache target directory
         uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-
+          restore-keys: ${{ runner.os }}-target-
 
-      - name: Run tests
-        run: cargo test
-
-      - name: Build native binaries
-        run: cargo build --release -p syncline
-
-      - name: Build WASM library
-        run: wasm-pack build syncline --release --target web --out-dir pkg
+      # No `cargo test`, no `cargo build --release`, no wasm-pack,
+      # no plugin lint, no plugin build — basic.e2e.ts spawns the
+      # syncline binary via `cargo run`, which builds dev itself, and
+      # the plugin under test isn't touched.
+      #
+      # Deliberately skipped for this branch so the job is smaller
+      # and we burn fewer cycles per rerun.
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -78,33 +82,14 @@ jobs:
           cd obsidian-plugin
           npm run build:wasm
 
-      - name: Lint Obsidian Plugin (obsidianmd/eslint-plugin)
-        run: |
-          cd obsidian-plugin
-          npm run lint
-
       - name: Build Obsidian Plugin
         run: |
           cd obsidian-plugin
           npx rollup --config rollup.config.js
 
-      - name: Run E2E Tests
+      - name: Run only basic.e2e.ts (the spec containing the flaky test)
         run: |
-          if [ "$RUNNER_OS" == "Linux" ]; then
-            sudo apt-get install -y xvfb
-          fi
           cd e2e
           npm ci
-          xvfb-run --auto-servernum npm test
-
-      - name: Upload syncline artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: syncline
-          path: target/release/syncline
-
-      - name: Upload WASM library artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: syncline-wasm
-          path: syncline/pkg
+          xvfb-run --auto-servernum ./node_modules/.bin/wdio run wdio.conf.ts \
+            --spec ./test/specs/basic.e2e.ts

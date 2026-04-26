@@ -220,11 +220,27 @@ describe('Syncline v1 E2E', () => {
 
     // ---- 5: Delete CLI → Obsidian ----
     it('propagates deletes CLI → Obsidian', async () => {
-        fs.unlinkSync(join(folderPath, 'renamed.md'));
+        const t0 = new Date().toISOString();
+        const target = join(folderPath, 'renamed.md');
+        const existsBefore = fs.existsSync(target);
+        console.log(`[FLAKE-REPRO] ${t0} test: about to unlinkSync ${target} (exists=${existsBefore})`);
+        fs.unlinkSync(target);
+        const tUnlink = new Date().toISOString();
+        console.log(`[FLAKE-REPRO] ${tUnlink} test: unlinkSync done`);
 
+        let pollCount = 0;
+        let lastSeen = true;
         await waitFor('renamed.md removed from vault', async () => {
-            return !(await vaultHas('renamed.md'));
+            pollCount++;
+            const seen = await vaultHas('renamed.md');
+            // Log every poll for the first few, then on transitions only.
+            if (pollCount <= 3 || pollCount % 50 === 0 || seen !== lastSeen) {
+                console.log(`[FLAKE-REPRO] ${new Date().toISOString()} test: poll ${pollCount} vault.has(renamed.md)=${seen}`);
+                lastSeen = seen;
+            }
+            return !seen;
         });
+        console.log(`[FLAKE-REPRO] ${new Date().toISOString()} test: convergence reached after ${pollCount} polls`);
     });
 
     // ---- 6: Binary blob roundtrip CLI → Obsidian ----

@@ -457,6 +457,7 @@ export default class SynclinePlugin extends Plugin {
       // exception, leaving `lastProjection` empty. Defer to a microtask
       // so the borrow is released before we read.
       this.client.onManifestChanged(() => {
+        console.log(`[FLAKE-REPRO] ${new Date().toISOString()} plugin.onManifestChanged fired`);
         this.persistManifestDebounced();
         void Promise.resolve().then(() => this.reconcileProjection());
       });
@@ -660,9 +661,11 @@ export default class SynclinePlugin extends Plugin {
       byId.set(row.id, row);
     }
 
+    console.log(`[FLAKE-REPRO] ${new Date().toISOString()} reconcileProjectionInner: lastProj=${this.lastProjection.size} newProj=${byPath.size}`);
     // --- Removals: paths that were in the prior projection but aren't now ---
     for (const [path, prev] of this.lastProjection) {
       if (!byId.has(prev.id)) {
+        console.log(`[FLAKE-REPRO] ${new Date().toISOString()} reconcile: REMOVAL detected for ${path}`);
         await this.removeLocalFile(path);
         this.subscribedContent.delete(prev.id);
         void this.removeContentState(prev.id);
@@ -711,14 +714,22 @@ export default class SynclinePlugin extends Plugin {
 
   private async removeLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
+    if (!(file instanceof TFile)) {
+      console.log(`[FLAKE-REPRO] ${new Date().toISOString()} removeLocalFile: ${path} — not a TFile, skipping`);
+      return;
+    }
+    console.log(`[FLAKE-REPRO] ${new Date().toISOString()} removeLocalFile: ${path} — calling trashFile`);
     this.ignoreEvents.delete.add(path);
     try {
       await this.app.fileManager.trashFile(file);
+      console.log(`[FLAKE-REPRO] ${new Date().toISOString()} removeLocalFile: ${path} — trashFile DONE`);
     } catch (e) {
       // Disk doesn't have it — Obsidian's index will catch up. The
       // CRDT-side removal already happened, so this is a no-op locally.
-      if (isMissingFileError(e)) return;
+      if (isMissingFileError(e)) {
+        console.log(`[FLAKE-REPRO] ${new Date().toISOString()} removeLocalFile: ${path} — ENOENT, file already gone`);
+        return;
+      }
       console.error(`[Syncline] trash ${path}:`, e);
     } finally {
       setTimeout(() => this.ignoreEvents.delete.delete(path), IGNORE_CHANGES_TIMEOUT_MS);

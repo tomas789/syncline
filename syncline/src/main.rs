@@ -149,9 +149,12 @@ async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
+    // DEBUG branch: keep timestamps + targets so we can correlate
+    // events across CLI / server / plugin processes when reproducing
+    // the propagates-deletes flake on Linux GHA runners.
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .without_time();
+        .with_target(true)
+        .with_timer(tracing_subscriber::fmt::time::SystemTime);
 
     use tracing_subscriber::layer::SubscriberExt;
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
