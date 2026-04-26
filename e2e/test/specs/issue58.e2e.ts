@@ -113,9 +113,9 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         }
 
         const obsidianPage = browser.getObsidianPage();
-        try { await obsidianPage.enablePlugin('syncline-obsidian'); } catch {}
+        try { await obsidianPage.enablePlugin('syncline'); } catch {}
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('plugin not found');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -123,7 +123,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
             await plugin.connect();
         }, serverUrl);
         await waitFor('plugin connected', async () => browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             return !!(plugin && plugin.client && plugin.client.isConnected());
         }), 30_000, 200);
     });
@@ -150,7 +150,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         }, 2 * 60_000, 200);
 
         const initialProjSize: number = await browser.executeObsidian(async ({ app }) => {
-            const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const p: any = (app as any).plugins.plugins['syncline'];
             return p?.lastProjection?.size ?? 0;
         });
         console.log(`[#58] phase A: initial projection size = ${initialProjSize}, expected ${N_FILES}`);
@@ -159,10 +159,10 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         // Phase B: disconnect, wipe manifest cache, keep vault files +
         // content cache (Obsidian still has the TFile tree).
         await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             plugin.disconnect();
         });
-        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline-obsidian', 'v1');
+        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline', 'v1');
         if (fs.existsSync(join(stateDir, 'manifest.bin'))) fs.unlinkSync(join(stateDir, 'manifest.bin'));
         if (fs.existsSync(join(stateDir, 'lamport.txt'))) fs.unlinkSync(join(stateDir, 'lamport.txt'));
         console.log(`[#58] phase B: manifest cache wiped (vault files retained)`);
@@ -175,7 +175,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         // populated the live projection but the plugin's `lastProjection`
         // copy is still empty.
         await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.connect();
         });
         // Wait for live manifest projection (queried straight off the
@@ -183,7 +183,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         // `lastProjection` to update here — that would defeat the race.
         await waitFor('live projection populated', async () => {
             const liveSize: number = await browser.executeObsidian(async ({ app }) => {
-                const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const p: any = (app as any).plugins.plugins['syncline'];
                 if (!p?.client) return 0;
                 try {
                     return JSON.parse(p.client.projectionJson()).length;
@@ -198,7 +198,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         // same executeObsidian call as a `lastProjection.clear()` so
         // the race window is wide:
         const result: any = await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             // Force lastProjection back to empty to mimic the gap between
             // "server pushed manifest" and "plugin's first reconcile
             // populated lastProjection" during a real restart. Without
@@ -220,7 +220,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         let stableTicks = 0;
         await waitFor('reconcile settles', async () => {
             const sz: number = await browser.executeObsidian(async ({ app }) => {
-                const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const p: any = (app as any).plugins.plugins['syncline'];
                 return p?.lastProjection?.size ?? 0;
             });
             if (sz === lastProjSize) stableTicks++; else stableTicks = 0;
@@ -231,7 +231,7 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
 
         // Phase E: assert no conflict copies and projection size matches.
         const finalProjSize: number = await browser.executeObsidian(async ({ app }) => {
-            const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const p: any = (app as any).plugins.plugins['syncline'];
             return p?.lastProjection?.size ?? 0;
         });
         const obs = listVault(vaultPath);

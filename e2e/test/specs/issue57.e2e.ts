@@ -110,9 +110,9 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         }
 
         const obsidianPage = browser.getObsidianPage();
-        try { await obsidianPage.enablePlugin('syncline-obsidian'); } catch {}
+        try { await obsidianPage.enablePlugin('syncline'); } catch {}
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('plugin not found');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -120,7 +120,7 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
             await plugin.connect();
         }, serverUrl);
         await waitFor('plugin connected', async () => browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             return !!(plugin && plugin.client && plugin.client.isConnected());
         }), 30_000, 200);
     });
@@ -155,11 +155,11 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         // Keep manifest.bin so the next connect()'s reconcile sees the
         // full projection synchronously and races the WS handshake.
         await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             plugin.disconnect();
         });
 
-        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline-obsidian', 'v1');
+        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline', 'v1');
         if (fs.existsSync(join(stateDir, 'content'))) {
             for (const f of fs.readdirSync(join(stateDir, 'content'))) {
                 fs.unlinkSync(join(stateDir, 'content', f));
@@ -206,11 +206,11 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
 
         // Phase C: reconnect — race fires.
         await browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.connect();
         });
         await waitFor('plugin re-connected', async () => browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             return !!(plugin && plugin.client && plugin.client.isConnected());
         }), 30_000, 100);
         console.log(`[#57] phase C: reconnected`);
@@ -237,7 +237,7 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
             lastNonEmpty = nonEmpty;
             if (stableTicks % 25 === 0) {
                 const st: any = await browser.executeObsidian(async ({ app }) => {
-                    const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+                    const p: any = (app as any).plugins.plugins['syncline'];
                     return p ? {
                         proj: p.lastProjection?.size ?? 0,
                         subs: p.subscribedContent?.size ?? 0,

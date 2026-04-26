@@ -194,9 +194,9 @@ describe('Syncline Phase 4 — claw.krej.ci-as-server', () => {
 
         // Now connect Obsidian and let it pull from the remote server.
         const obsidianPage = browser.getObsidianPage();
-        try { await obsidianPage.enablePlugin('syncline-obsidian'); } catch {}
+        try { await obsidianPage.enablePlugin('syncline'); } catch {}
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('plugin not found');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -204,7 +204,7 @@ describe('Syncline Phase 4 — claw.krej.ci-as-server', () => {
             await plugin.connect();
         }, serverUrl);
         await waitFor('plugin connected', async () => browser.executeObsidian(async ({ app }) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             return !!(plugin && plugin.client && plugin.client.isConnected());
         }), 60_000);
         const vaultPath: string = await browser.executeObsidian(async ({ app }) => (app as any).vault.adapter.basePath as string);
@@ -219,7 +219,7 @@ describe('Syncline Phase 4 — claw.krej.ci-as-server', () => {
             if (nonEmpty === lastNonEmpty && bin === lastBin) stableTicks++; else stableTicks = 0;
             lastNonEmpty = nonEmpty; lastBin = bin;
             const st: any = await browser.executeObsidian(async ({ app }) => {
-                const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const p: any = (app as any).plugins.plugins['syncline'];
                 return p ? { proj: p.lastProjection?.size ?? 0, subs: p.subscribedContent?.size ?? 0, blobs: p.requestedBlobs?.size ?? 0, conn: p.client?.isConnected?.() ?? false } : null;
             });
             console.log(`[settle] nonEmpty=${nonEmpty}/${expectedNonEmpty} bin=${bin}/161 proj=${st?.proj} subs=${st?.subs} blobs=${st?.blobs} conn=${st?.conn} stable=${stableTicks}`);

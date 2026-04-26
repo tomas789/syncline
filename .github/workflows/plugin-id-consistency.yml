@@ -1,0 +1,63 @@
+name: plugin-id-consistency
+
+# Guards against the bug fixed by #55: a previous version of the repo carried
+# two manifest.json files with different `id` values, plus a hard-coded
+# "syncline-obsidian" literal in main.ts. That drift caused the released
+# plugin to lay down state under a sibling directory, looking like a second
+# plugin install.
+#
+# The repo now has a single source-of-truth manifest at
+# obsidian-plugin/manifest.json. This workflow fails the build if:
+#   1. A second top-level manifest.json reappears at the repo root.
+#   2. The plugin id ever stops being "syncline".
+#   3. A stray "syncline-obsidian" literal sneaks back into main.ts outside
+#      the documented legacy-migration block.
+
+on:
+  push:
+    branches: [main, release/v1]
+  pull_request:
+    branches: [main, release/v1]
+
+jobs:
+  check:
+    name: Plugin id consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if a second manifest.json reappears at repo root
+        run: |
+          if [ -f manifest.json ]; then
+            echo "::error::A manifest.json file exists at the repo root."
+            echo "::error::The single source of truth is obsidian-plugin/manifest.json."
+            echo "::error::Either delete the root file or update this workflow to compare both."
+            exit 1
+          fi
+
+      - name: Verify obsidian-plugin/manifest.json id is "syncline"
+        run: |
+          id=$(jq -r .id obsidian-plugin/manifest.json)
+          if [ "$id" != "syncline" ]; then
+            echo "::error::obsidian-plugin/manifest.json#id is \"$id\"; expected \"syncline\"."
+            echo "::error::See issue #55 for why this id is fixed."
+            exit 1
+          fi
+
+      - name: Grep main.ts for stray "syncline-obsidian" literals
+        # The legacy-migration getter `legacyStateRoot` is the only place that
+        # may legitimately mention the old id. If you legitimately need a new
+        # reference (e.g. extending the migration), bump the expected count.
+        run: |
+          count=$(grep -c "syncline-obsidian" obsidian-plugin/main.ts || true)
+          # Expected occurrences in the legacy-migration block:
+          #  1. comment in stateRoot getter
+          #  2. literal in legacyStateRoot getter
+          #  3. comment in migrateLegacyStateRoot doc-block
+          expected=3
+          if [ "$count" -ne "$expected" ]; then
+            echo "::error::main.ts contains $count occurrences of \"syncline-obsidian\"; expected $expected."
+            echo "::error::Either remove the new reference or update the expected count in this workflow."
+            grep -n "syncline-obsidian" obsidian-plugin/main.ts || true
+            exit 1
+          fi

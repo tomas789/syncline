@@ -223,13 +223,13 @@ describe('Syncline Phase 1 — restore-then-launch', () => {
 
         const obsidianPage = browser.getObsidianPage();
         try {
-            await obsidianPage.enablePlugin('syncline-obsidian');
+            await obsidianPage.enablePlugin('syncline');
         } catch (e: any) {
             console.log('plugin enable:', e?.message);
         }
 
         await browser.executeObsidian(async ({ app }, url) => {
-            const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+            const plugin: any = (app as any).plugins.plugins['syncline'];
             if (!plugin) throw new Error('Syncline plugin not found in app.plugins');
             plugin.settings.serverUrl = url;
             await plugin.saveSettings();
@@ -248,7 +248,7 @@ describe('Syncline Phase 1 — restore-then-launch', () => {
         const expectedSize = listVault(sourceVault).size; // 1305
         await waitFor('plugin projection settles', async () => {
             const size: number = await browser.executeObsidian(async ({ app }) => {
-                const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const plugin: any = (app as any).plugins.plugins['syncline'];
                 return plugin && plugin.lastProjection ? plugin.lastProjection.size : 0;
             });
             console.log(`plugin lastProjection.size = ${size} (expecting ~${expectedSize})`);
@@ -281,7 +281,7 @@ describe('Syncline Phase 1 — restore-then-launch', () => {
             lastBinary = binary;
 
             const pluginState: any = await browser.executeObsidian(async ({ app }) => {
-                const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
+                const plugin: any = (app as any).plugins.plugins['syncline'];
                 if (!plugin) return null;
                 return {
                     projection: plugin.lastProjection?.size ?? 0,

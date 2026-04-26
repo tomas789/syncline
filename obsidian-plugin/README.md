@@ -13,7 +13,7 @@ A CRDT-based synchronization plugin for Obsidian that enables real-time collabor
 ## Installation
 
 1. Download the latest release from [github.com/tomas789/syncline/releases](https://github.com/tomas789/syncline/releases)
-2. Copy the following files to your Obsidian vault's `.obsidian/plugins/syncline-obsidian/` folder:
+2. Copy the following files to your Obsidian vault's `.obsidian/plugins/syncline/` folder:
    - `main.js`
    - `manifest.json`
    - `styles.css`
@@ -89,7 +89,7 @@ npm run build
    - Connect your Android device to your computer via USB
    - Enable "File Transfer" mode on Android
    - Navigate to your Obsidian vault folder on the device
-   - Create the folder `.obsidian/plugins/syncline-obsidian/`
+   - Create the folder `.obsidian/plugins/syncline/`
    - Copy the plugin files (`main.js`, `manifest.json`, `styles.css`)
    - Disconnect the device
 
@@ -116,7 +116,7 @@ npm run build
 2. **Install the plugin using iCloud Drive**:
    - On your computer, locate your Obsidian vault in iCloud Drive
    - Navigate to `.obsidian/plugins/`
-   - Create `syncline-obsidian/` folder
+   - Create `syncline/` folder
    - Copy the plugin files (`main.js`, `manifest.json`, `styles.css`)
    - Wait for iCloud to sync
 

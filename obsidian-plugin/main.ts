@@ -350,6 +350,7 @@ export default class SynclinePlugin extends Plugin {
   async onload() {
     console.debug("[Syncline] Loading plugin (v1)…");
     await this.loadSettings();
+    await this.migrateLegacyStateRoot();
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
     this.statusBarItem = this.addStatusBarItem();
@@ -415,6 +416,13 @@ export default class SynclinePlugin extends Plugin {
 
   /** Root folder for v1 CRDT snapshots — separate from any v0 leftovers. */
   private get stateRoot(): string {
+    // Use the plugin's own manifest id rather than a literal so this never
+    // drifts again. Pre-1.1.6 installs wrote state under "syncline-obsidian";
+    // migrateLegacyStateRoot() handles the relocation on first load.
+    return `${this.app.vault.configDir}/plugins/${this.manifest.id}/v1`;
+  }
+  /** Pre-1.1.6 state-root path. Only consulted by migrateLegacyStateRoot(). */
+  private get legacyStateRoot(): string {
     return `${this.app.vault.configDir}/plugins/syncline-obsidian/v1`;
   }
   private get manifestPath(): string {
@@ -435,6 +443,82 @@ export default class SynclinePlugin extends Plugin {
     const contentDir = `${this.stateRoot}/content`;
     if (!(await adapter.exists(contentDir))) {
       await adapter.mkdir(contentDir);
+    }
+  }
+
+  /**
+   * Pre-1.1.6 the plugin wrote its CRDT state-cache to
+   * `plugins/syncline-obsidian/v1/` while Obsidian itself laid the plugin
+   * down at `plugins/syncline/`. Two sibling dirs that look like two plugins.
+   *
+   * On first load after the rename:
+   *   - if only the legacy dir exists, move it into place;
+   *   - if only the new dir exists, no-op (already migrated or fresh install);
+   *   - if both exist, leave them alone and warn — merging arbitrary CRDT
+   *     state-blobs from two roots is unsafe; the user must pick one.
+   *
+   * This runs from onload before any state is read or written, so a cold
+   * start sees the migrated layout end-to-end.
+   */
+  private async migrateLegacyStateRoot(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const legacy = this.legacyStateRoot;
+    const target = this.stateRoot;
+
+    // If the manifest id ever happens to equal the legacy literal (e.g. a
+    // future revert), legacy === target and there's nothing to migrate.
+    if (legacy === target) return;
+
+    let legacyExists: boolean;
+    let targetExists: boolean;
+    try {
+      legacyExists = await adapter.exists(legacy);
+      targetExists = await adapter.exists(target);
+    } catch (e) {
+      console.error("[Syncline] migrateLegacyStateRoot: stat failed:", e);
+      return;
+    }
+
+    if (!legacyExists) return;
+
+    if (targetExists) {
+      console.warn(
+        `[Syncline] Both ${legacy} and ${target} exist. Skipping migration to ` +
+          "avoid clobbering CRDT state. Manually delete the unwanted directory " +
+          "and reload the plugin.",
+      );
+      return;
+    }
+
+    // Make sure the parent dir exists (it normally does — this plugin is
+    // installed under it — but be defensive on fresh sandboxes).
+    const targetParent = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    try {
+      if (!(await adapter.exists(targetParent))) {
+        await adapter.mkdir(targetParent);
+      }
+    } catch (e) {
+      // mkdir on an existing path can race with the platform layer; tolerate.
+      if (!isAlreadyExistsError(e)) {
+        console.error(`[Syncline] migrateLegacyStateRoot: mkdir ${targetParent} failed:`, e);
+        return;
+      }
+    }
+
+    try {
+      // Obsidian's DataAdapter exposes rename() for both files and folders;
+      // it falls through to the platform fs.rename so a same-volume move is
+      // atomic. No shelling out, no bytewise copy.
+      await adapter.rename(legacy, target);
+      console.debug(
+        `[Syncline] Migrated legacy state-root ${legacy} → ${target}.`,
+      );
+    } catch (e) {
+      console.error(
+        `[Syncline] migrateLegacyStateRoot: rename ${legacy} → ${target} failed. ` +
+          "Plugin will run with an empty state-cache; the legacy directory is untouched.",
+        e,
+      );
     }
   }
 
