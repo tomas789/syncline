@@ -48,6 +48,15 @@ use yrs::{StateVector, updates::decoder::Decode};
 
 type ChannelMap = Arc<RwLock<HashMap<String, broadcast::Sender<(Vec<u8>, uuid::Uuid)>>>>;
 
+// Per-doc broadcast channels are created lazily, one per subscribed doc.
+// `tokio::sync::broadcast::channel(N)` pre-allocates a ring buffer of N
+// slots up front, so this constant is a fixed memory cost multiplied by
+// every subscribed doc — on a 1000-doc vault, 65_536 → ~3 GB of empty
+// ring buffer alone, which OOMs the server during initial fan-out. The
+// buffer only needs to absorb burst lag for a single forwarding task per
+// subscriber, which catches up immediately, so a small cap is plenty.
+const PER_DOC_BROADCAST_CAP: usize = 64;
+
 #[derive(Clone)]
 struct AppState {
     db: Db,
@@ -441,7 +450,7 @@ async fn handle_content_update(
     let mut channels = state.channels.write().await;
     let tx = channels
         .entry(doc_id.to_string())
-        .or_insert_with(|| broadcast::channel(65_536).0);
+        .or_insert_with(|| broadcast::channel(PER_DOC_BROADCAST_CAP).0);
     let _ = tx.send((frame, conn));
 }
 
@@ -508,7 +517,7 @@ async fn ensure_subscribed(
     let rx = {
         let mut channels = state.channels.write().await;
         let tx = channels.entry(doc_id.clone()).or_insert_with(|| {
-            let (tx, _rx) = broadcast::channel(65_536);
+            let (tx, _rx) = broadcast::channel(PER_DOC_BROADCAST_CAP);
             tx
         });
         tx.subscribe()
