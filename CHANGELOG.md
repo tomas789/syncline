@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.3](https://github.com/tomas789/syncline/compare/v1.1.2...v1.1.3) (2026-04-26)
+
+
+### Bug Fixes
+
+* enable TLS in released binaries ([#54](https://github.com/tomas789/syncline/issues/54)) ([2587535](https://github.com/tomas789/syncline/commit/25875351de04c20dd8a343fa03d80647dba93bf9))
+* plugin sync races, case-insensitive paths, bulk-bootstrap perf ([36ab99e](https://github.com/tomas789/syncline/commit/36ab99e059c0a00ae03b6f4f8f0022ac6e8b5712))
+* throttle scanner bulk send and persist manifest before WS sends ([b4a5660](https://github.com/tomas789/syncline/commit/b4a5660ab863c7805e2577385914e172ebda08d1))
+
 ## [1.1.2](https://github.com/tomas789/syncline/compare/v1.1.1...v1.1.2) (2026-04-26)
 
 
