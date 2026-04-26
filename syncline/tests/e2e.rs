@@ -554,6 +554,58 @@ async fn test_filter_ignored_files() {
     );
 }
 
+/// Regression test for the CI failure on `propagates deletes CLI →
+/// Obsidian` after 70fde18 landed bidirectional STEP_1 reciprocation.
+///
+/// The bug: server unconditionally reciprocated STEP_1 with its own
+/// state vector. Clients whose state already matched the server's
+/// answered with a *no-op* STEP_2 (encoded Yrs update with no blocks
+/// and an empty delete-set). The server happily persisted+broadcast
+/// each one. Every other peer's MSG_UPDATE handler then ran
+/// flush_content_to_disk, re-writing the file from CRDT content.
+/// When that broadcast raced against a local-disk delete, the file
+/// got resurrected on disk before scan_once could register the
+/// unlink — so the deletion never propagated.
+///
+/// The fix (see `is_noop_update` in server.rs) drops empty STEP_2
+/// frames at the server's broadcast boundary. This test reproduces
+/// the rename-then-delete scenario across two CLI peers (standing in
+/// for the Obsidian peer in the wdio e2e suite).
+#[tokio::test]
+async fn test_rename_then_delete_propagates() {
+    let mut env = TestEnv::new(2).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let path0 = env.client_path(0).join("doomed.md");
+    fs::write(&path0, "# original\n").unwrap();
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await,
+        "create did not converge"
+    );
+
+    let renamed0 = env.client_path(0).join("renamed.md");
+    fs::rename(&path0, &renamed0).unwrap();
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(10)).await,
+        "rename did not converge"
+    );
+
+    fs::remove_file(&renamed0).unwrap();
+
+    let renamed1 = env.client_path(1).join("renamed.md");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if !renamed1.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "renamed.md still exists on peer 1 15s after delete on peer 0 \
+         (empty STEP_2 broadcast likely re-flushing the file)"
+    );
+}
+
 #[tokio::test]
 async fn test_offline_creation_and_deletion() {
     let mut env = TestEnv::new(2).await;
