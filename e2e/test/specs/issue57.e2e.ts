@@ -186,6 +186,24 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         }
         console.log(`[#57] phase B: cache + vault wiped, manifest.bin retained`);
 
+        // Drain Obsidian's vault watcher (Chokidar on Linux) before
+        // we plug back in. Chokidar batches and aggregates filesystem
+        // events with ~100ms debounces; on a 200-file fs.unlinkSync
+        // burst, the corresponding `delete` events for the vault can
+        // fire as much as a second or two later. If those events land
+        // *after* plugin.connect() has re-instantiated the client and
+        // `lastProjection` is repopulated by reconcile, the plugin's
+        // `onFileDelete` handler propagates each one to the server —
+        // we'd be testing a spurious delete-storm, not the actual
+        // restart-with-cached-manifest race.
+        //
+        // 3s is comfortably past Chokidar's aggregation window; we
+        // also do not register the wiped paths in `ignoreEvents.delete`
+        // because the user's real-world cache-wipe-then-restart flow
+        // doesn't either (Obsidian restart doesn't fire create or
+        // delete events for files it indexes from a cold start).
+        await browser.pause(3000);
+
         // Phase C: reconnect — race fires.
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline-obsidian'];
@@ -197,9 +215,13 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         }), 30_000, 100);
         console.log(`[#57] phase C: reconnected`);
 
-        // Phase D: wait for content to arrive again. Timeout means the bug
-        // is present (some subset of files will never get their STEP_1
-        // resent — see the issue body).
+        // Phase D: wait for content to arrive again. Linux CI under
+        // xvfb + headless chromedriver is several × slower per
+        // vault.modify than a desktop machine, so a tight stable
+        // window false-positives as "stuck" when it's actually just
+        // slow throughput on a fresh runner. 40s of genuine no-
+        // progress remains a reliable bug signal — the original #57
+        // mode was *permanent* loss.
         let lastNonEmpty = -1;
         let stableTicks = 0;
         await waitFor('content reconverged', async () => {
@@ -213,13 +235,19 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
             }
             if (nonEmpty === lastNonEmpty) stableTicks++; else stableTicks = 0;
             lastNonEmpty = nonEmpty;
-            if (stableTicks % 10 === 0) {
-                console.log(`[#57] reconverge progress: ${nonEmpty}/${expected.size} stable=${stableTicks}`);
+            if (stableTicks % 25 === 0) {
+                const st: any = await browser.executeObsidian(async ({ app }) => {
+                    const p: any = (app as any).plugins.plugins['syncline-obsidian'];
+                    return p ? {
+                        proj: p.lastProjection?.size ?? 0,
+                        subs: p.subscribedContent?.size ?? 0,
+                        conn: p.client?.isConnected?.() ?? false,
+                    } : null;
+                });
+                console.log(`[#57] reconverge progress: ${nonEmpty}/${expected.size} stable=${stableTicks} proj=${st?.proj} subs=${st?.subs} conn=${st?.conn}`);
             }
-            // Either we converged OR we've been stable for 10s and never
-            // will (bug fingerprint — bail with a clear failure).
-            return ok || (stableTicks >= 50 && nonEmpty < expected.size);
-        }, 3 * 60_000, 200);
+            return ok || (stableTicks >= 200 && nonEmpty < expected.size);
+        }, 5 * 60_000, 200);
 
         const obs = listVault(vaultPath);
         const missing: string[] = [];
