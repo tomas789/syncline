@@ -1795,3 +1795,130 @@ async fn test_bootstrap_large_vault_no_dropped_events() {
         assert_eq!(c1, c0, "peer 1 content mismatch for {folder}/{name}");
     }
 }
+
+/// Regression test for #60 — bulk-scan upload of a large vault doesn't
+/// duplicate manifest entries when the CLI is killed mid-stream and
+/// restarted.
+///
+/// The bug surface: scan_once's tight write.send().await loop on
+/// thousands of frames could starve the runtime's WS-pong / broadcast-
+/// forward tasks, the server's recv-window saturated, and the
+/// connection RST'd under load. The CLI then reconnected (or the user
+/// restarted it) and re-uploaded everything, doubling the manifest
+/// with `.conflict-` siblings.
+///
+/// The fix has two parts:
+///   1. Throttle the bulk sends with `tokio::task::yield_now()` every
+///      BURST_SIZE frames so the runtime can service the read side.
+///   2. Persist `manifest.bin` BEFORE any WS sends (rather than after
+///      the manifest update send) so a kill mid-burst leaves the on-
+///      disk manifest in a state that matches the in-memory one — a
+///      subsequent restart loads the right NodeIds and the per-file
+///      adoption path skips re-create.
+///
+/// This test pre-populates a 1500-file vault, kills the first CLI mid-
+/// scan, then starts a fresh CLI in the same dir and a fresh observer
+/// peer. It asserts the observer ends up with exactly N files and
+/// zero `.conflict-` siblings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cli_restart_no_duplicate_manifest_entries() {
+    // N must be large enough that the first scan_once still has work
+    // to do when we yank the CLI. Too small → scan completes before
+    // the kill, save_manifest fires under either before-or-after-send
+    // ordering, and the test can't tell the orderings apart.
+    const N: usize = 1500;
+
+    let _ = build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client_dir = TempDir::new().unwrap();
+
+    // Pre-populate dir0 with N files BEFORE the first CLI starts —
+    // forces the initial scan to actually do work, with enough volume
+    // that the scan is still mid-flight at the kill instant.
+    for i in 0..N {
+        let body = format!("# Note {i}\n\nfile-{i} body line 1.\nLine 2.\nLine 3.\n");
+        fs::write(
+            client_dir.path().join(format!("note-{i:04}.md")),
+            body,
+        )
+        .unwrap();
+    }
+
+    // First CLI run: kill mid-stream so that scan_once is interrupted
+    // *during* the WS send phase. The kill window only matters relative
+    // to where save_manifest sits in scan_once: with the bug, save is
+    // *after* the manifest send, so a kill during the burst leaves
+    // manifest.bin in the pre-scan state. With the fix, save is *before*
+    // any send, so manifest.bin reflects the in-memory state regardless
+    // of when the kill lands.
+    //
+    // 800ms is enough for the v1 handshake + the per-file Loop 1
+    // (content.persist) on a 1500-file vault, but well before the
+    // bulk content-update sends finish.
+    {
+        let mut client1 = spawn_client(client_dir.path(), port).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        client1.kill().await.unwrap();
+        drop(client1);
+    }
+
+    // After the kill, manifest.bin should reflect the in-memory state
+    // at the moment scan_once finished its per-file mutations — that's
+    // the persist-before-send invariant. The directory must exist at
+    // minimum.
+    let manifest_bin = client_dir.path().join(".syncline").join("manifest.bin");
+    assert!(
+        manifest_bin.is_file(),
+        "manifest.bin must exist after the first CLI run did any work"
+    );
+
+    // Second CLI run in the same dir: simulates the user restarting
+    // syncline after an alarming-looking error log. With the bug, it
+    // sees an empty (or pre-scan) local manifest and re-mints NodeIds
+    // for every vault file the server already has. With the fix, the
+    // local manifest matches in-memory state and scan_once adopts.
+    let _client2 = spawn_client(client_dir.path(), port).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Spawn an observer peer (fresh dir) — anything not in its
+    // converged view doesn't exist on the server. If `scan_once` had
+    // re-uploaded files as new manifest entries on the second run,
+    // the observer would see ~2N files (N originals + N
+    // `.conflict-…` copies). With the fix, exactly N.
+    let observer_dir = TempDir::new().unwrap();
+    let _observer = spawn_client(observer_dir.path(), port).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut all_md: Vec<String> = fs::read_dir(observer_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.ends_with(".md") { Some(n) } else { None }
+        })
+        .collect();
+    all_md.sort();
+    let conflicts: Vec<&String> = all_md.iter().filter(|n| n.contains(".conflict-")).collect();
+
+    assert_eq!(
+        conflicts.len(),
+        0,
+        "observer saw {} conflict copies after CLI restart — second scan_once \
+         minted fresh NodeIds for paths the server already had (#60). Sample: {:?}",
+        conflicts.len(),
+        conflicts.iter().take(3).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        all_md.len(),
+        N,
+        "observer saw {} .md files, expected {} (extra files indicate \
+         duplicate manifest entries from the second CLI run)",
+        all_md.len(),
+        N
+    );
+}
