@@ -9,6 +9,7 @@
 //!
 //! - [`ids`]        — `NodeId`, `ActorId`, `Lamport` newtypes. (portable)
 //! - [`hash`]       — `hash_hex` SHA-256 helper. (portable)
+//! - [`chunker`]    — content-defined chunking for binary blobs. (portable)
 //! - [`manifest`]   — Yrs-backed manifest Y.Doc with `NodeEntry` CRUD. (portable)
 //! - [`projection`] — projects the manifest into the vault namespace. (portable)
 //! - [`ops`]        — high-level create/delete/rename/modify helpers. (portable)
@@ -20,6 +21,7 @@
 //! The portable core compiles on `wasm32-unknown-unknown` so the Obsidian
 //! plugin can drive a v1 client directly from its WASM build.
 
+pub mod chunker;
 pub mod hash;
 pub mod ids;
 pub mod manifest;
