@@ -21,8 +21,8 @@
 
 use crate::protocol::{
     MANIFEST_DOC_ID, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE, MSG_MANIFEST_SYNC,
-    MSG_MANIFEST_VERIFY, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE, MSG_VERSION,
-    V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
+    MSG_MANIFEST_VERIFY, MSG_SERVER_STATS, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
+    MSG_VERSION, V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR, decode_message, encode_message,
 };
 use crate::server::db::Db;
 use crate::server::migration::migrate_server_db;
@@ -65,6 +65,11 @@ struct AppState {
     /// applying an incoming MANIFEST_STEP_2/UPDATE; held only briefly
     /// for STEP_1 responses (state-vector read + update encoding).
     manifest: Arc<AsyncMutex<Manifest>>,
+    /// Wall-clock instant when this server process started. Used by
+    /// the `MSG_SERVER_STATS` handler (#65 phase 5) to report uptime
+    /// — no cross-restart accumulation, just "how long has this
+    /// process been up", which is the user-visible signal.
+    started_at: std::time::Instant,
 }
 
 pub async fn run_server(db: Db, port: u16) -> anyhow::Result<()> {
@@ -96,6 +101,7 @@ pub async fn run_server(db: Db, port: u16) -> anyhow::Result<()> {
         db,
         channels: Arc::new(RwLock::new(HashMap::new())),
         manifest: Arc::new(AsyncMutex::new(manifest)),
+        started_at: std::time::Instant::now(),
     };
 
     let app = Router::new()
@@ -254,6 +260,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 MSG_MANIFEST_VERIFY if doc_id == MANIFEST_DOC_ID => {
                     handle_manifest_verify(&state_for_recv, &tx_out, payload).await;
                 }
+                MSG_SERVER_STATS if doc_id == MANIFEST_DOC_ID => {
+                    handle_server_stats(&state_for_recv, &tx_out).await;
+                }
                 MSG_SYNC_STEP_1 if doc_id.starts_with("content:") => {
                     handle_content_step1(
                         &state_for_recv,
@@ -392,6 +401,65 @@ async fn handle_manifest_verify(
             tracing::warn!("verify payload rejected: {}", e);
         }
     }
+}
+
+/// Build and reply with a `MSG_SERVER_STATS` JSON payload (#65 §4).
+///
+/// Backwards-compatible with old clients: they send no request, the
+/// server sends no unsolicited reply — the request/response shape
+/// is strictly client-initiated. New clients send an empty payload
+/// and consume the JSON.
+async fn handle_server_stats(
+    state: &AppState,
+    tx_out: &mpsc::UnboundedSender<Vec<u8>>,
+) {
+    // `connected_clients` is the per-vault MANIFEST broadcast channel's
+    // receiver count — i.e. how many WS connections currently subscribe
+    // to manifest updates. That's exactly the count the user cares
+    // about ("how many other clients have my vault open").
+    let connected_clients = {
+        let channels = state.channels.read().await;
+        channels
+            .get(MANIFEST_DOC_ID)
+            .map(|tx| tx.receiver_count())
+            .unwrap_or(0) as u32
+    };
+    // Manifest node count — live entries. Cheap; the manifest is
+    // already in memory.
+    let (manifest_node_count, manifest_total_size) = {
+        let manifest = state.manifest.lock().await;
+        let live = manifest.live_entries();
+        let total: u64 = live.iter().map(|e| e.size).sum();
+        (live.len() as u32, total)
+    };
+    // Blob counts — single SQL aggregate. Cheap on any reasonable
+    // vault because the blobs table tracks `size` as a separate
+    // column.
+    let (blob_count, blob_total_bytes) = state
+        .db
+        .blob_summary()
+        .await
+        .unwrap_or((0, 0));
+
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let payload = serde_json::json!({
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime_secs,
+        "connected_clients": connected_clients,
+        "manifest_node_count": manifest_node_count,
+        "manifest_total_bytes": manifest_total_size,
+        "blob_count": blob_count,
+        "blob_total_bytes": blob_total_bytes,
+    });
+    let body = match serde_json::to_vec(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("server_stats serialise: {}", e);
+            return;
+        }
+    };
+    let frame = encode_message(MSG_SERVER_STATS, MANIFEST_DOC_ID, &body);
+    let _ = tx_out.send(frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +695,7 @@ mod tests {
             db,
             channels: Arc::new(RwLock::new(HashMap::new())),
             manifest: Arc::new(AsyncMutex::new(Manifest::new(ActorId::new()))),
+            started_at: std::time::Instant::now(),
         };
         let app = Router::new()
             .route("/sync", get(ws_handler))

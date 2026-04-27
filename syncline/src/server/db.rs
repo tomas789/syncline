@@ -183,6 +183,19 @@ impl Db {
                 .await?;
         Ok(row.0 > 0)
     }
+
+    /// Single SQL aggregate over the blobs table — `(count, total_bytes)`.
+    /// Used by the `MSG_SERVER_STATS` reply (#65 §4). The blobs table
+    /// has a `size` column populated on insert, so we sum that rather
+    /// than `LENGTH(data)` — saves SQLite from scanning blob pages on
+    /// large vaults.
+    pub async fn blob_summary(&self) -> Result<(u64, u64)> {
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blobs")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((row.0.max(0) as u64, row.1.max(0) as u64))
+    }
 }
 
 #[cfg(test)]
