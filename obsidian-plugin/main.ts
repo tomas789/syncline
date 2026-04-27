@@ -31,7 +31,38 @@ const DEFAULT_SETTINGS: SynclineSettings = {
   actorId: null,
 };
 
-type SyncStatus = "synced" | "syncing" | "error" | "disconnected";
+/**
+ * Sidebar status states. The four "classic" states drive both the
+ * status-bar dot and the sidebar banner; `degraded` and `read-only`
+ * are sidebar-only refinements added in #65 phase 6:
+ *
+ * - `degraded` — connected, but the most recent `MSG_MANIFEST_VERIFY`
+ *   reported a hash mismatch. We've auto-resynced via SyncStep1, but
+ *   if it keeps recurring something upstream is generating divergent
+ *   state. Surfaces silent divergence the user would otherwise miss.
+ * - `read-only` — connected, but the WS handshake is still in
+ *   progress. Local writes are being queued (#57 / #63 class). The
+ *   plugin still honours user edits but the sidebar shows the queue
+ *   so the user knows their edits aren't on the wire yet.
+ */
+type SyncStatus =
+  | "synced"
+  | "syncing"
+  | "error"
+  | "disconnected"
+  | "degraded"
+  | "read-only";
+
+/** Activity-feed entry shape (#65 §5). One row per discrete event. */
+interface SyncEvent {
+  kind: "blob_down" | "blob_up" | "node_modified" | "error";
+  path?: string | null;
+  hash?: string | null;
+  bytes?: number;
+  error?: string;
+  /** Wall-clock ms when we received the event. */
+  at: number;
+}
 
 // ---------------------------------------------------------------------------
 // WASM binding shape (v1)
@@ -66,6 +97,11 @@ interface SynclineV1Client {
   onContentChanged(cb: (nodeId: string) => void): void;
   onBlob(cb: (hash: string, data: Uint8Array) => void): void;
   onStatus(cb: (status: string) => void): void;
+  /** #65 phase 2 — fires (count, bytes) when the pending-blob set changes. */
+  onBlobQueueChange(cb: (count: number, bytes: number) => void): void;
+  /** #65 phase 4 — fires per discrete sync event for the activity feed.
+   *  Argument is a JSON string, parse to {@link SyncEvent}-shaped object. */
+  onSyncEvent(cb: (json: string) => void): void;
   connect(): void;
   disconnect(): void;
   isConnected(): boolean;
@@ -86,7 +122,33 @@ interface SynclineV1Client {
   contentSnapshot(nodeIdHex: string): Uint8Array | undefined;
   sendBlob(bytes: Uint8Array): string;
   requestBlob(blobHashHex: string): void;
+  /** #65 phase 2 sidebar getters. */
+  pendingBlobCount(): number;
+  pendingBlobBytes(): number;
+  subscribedContentCount(): number;
+  manifestNodeCount(): number;
+  /** #65 phase 6 — `"unknown" | "pending" | "match" | "mismatch"`. */
+  lastVerifyResult(): string;
+  /** #65 phase 5 — fires (jsonString) per server-stats reply. */
+  onServerStats(cb: (json: string) => void): void;
+  /** #65 phase 5 — sends an empty MSG_SERVER_STATS request. The reply
+   *  arrives via `onServerStats`. No-op if disconnected. */
+  requestServerStats(): void;
   free(): void;
+}
+
+/** Shape of the JSON the server returns in a `MSG_SERVER_STATS` reply
+ *  (#65 phase 5). All numeric fields are unsigned, but TypeScript only
+ *  has `number`, so values above 2^53 are theoretically lossy — in
+ *  practice none of these ever come close. */
+interface ServerStats {
+  server_version: string;
+  uptime_secs: number;
+  connected_clients: number;
+  manifest_node_count: number;
+  manifest_total_bytes: number;
+  blob_count: number;
+  blob_total_bytes: number;
 }
 
 async function initWasm(): Promise<WasmModule> {
@@ -178,7 +240,43 @@ const STATUS_LABELS: Record<SyncStatus, string> = {
   syncing: "Syncing…",
   error: "Error",
   disconnected: "Disconnected",
+  degraded: "Degraded — projection diverged",
+  "read-only": "Read-only — handshake in progress",
 };
+
+/** Maximum activity-feed depth (#65 §5 specifies "last 20"). */
+const ACTIVITY_FEED_LIMIT = 20;
+
+/** Heartbeat the sidebar's vault summary on this interval; reads are
+ *  cheap (live-entry count + projection scan) so a slow tick is fine. */
+const SIDEBAR_VAULT_REFRESH_MS = 5000;
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function shortHash(h: string | null | undefined): string {
+  if (!h) return "—";
+  return h.length > 12 ? `${h.slice(0, 8)}…${h.slice(-4)}` : h;
+}
+
+/** "X days HH:MM" / "HH:MM:SS" / "MM:SS" depending on magnitude. */
+function formatUptime(secs: number): string {
+  if (secs < 0) return "—";
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (d > 0) return `${d}d ${pad2(h)}:${pad2(m)}`;
+  if (h > 0) return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+  return `${pad2(m)}:${pad2(s)}`;
+}
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
 
 /** Format a "N seconds/minutes/hours ago" timestamp for the sidebar. */
 function formatRelativeTime(epochMs: number | null, nowMs: number): string {
@@ -197,11 +295,44 @@ function formatRelativeTime(epochMs: number | null, nowMs: number): string {
 
 class SynclineSidebarView extends ItemView {
   plugin: SynclinePlugin;
+  // Status banner (phase 1 + 6).
   private statusDot!: HTMLElement;
   private statusLabel!: HTMLElement;
-  private fileCountEl!: HTMLElement;
   private lastSyncEl!: HTMLElement;
+  // Progress section (phase 2). Hidden when nothing is in flight.
+  private progressSection!: HTMLElement;
+  private downloadingRow!: HTMLElement;
+  private downloadingText!: HTMLElement;
+  private downloadingBar!: HTMLElement;
+  // Vault summary (phase 3).
+  private fileCountEl!: HTMLElement;
+  private folderCountEl!: HTMLElement;
+  private conflictCountEl!: HTMLElement;
+  private conflictRow!: HTMLElement;
+  private conflictListEl!: HTMLElement;
+  private vaultSizeEl!: HTMLElement;
+  // Server section (phase 5). Only populated once the first
+  // `MSG_SERVER_STATS` reply arrives — older servers that don't
+  // recognise the opcode never reply and the rows stay at "—".
+  private serverVersionEl!: HTMLElement;
+  private serverUptimeEl!: HTMLElement;
+  private serverPeersEl!: HTMLElement;
+  private serverDbBytesEl!: HTMLElement;
+  private serverManifestEl!: HTMLElement;
+  // Activity feed (phase 4).
+  private activitySection!: HTMLElement;
+  private activityList!: HTMLElement;
+  // Diagnostics (phase 6).
+  private diagSummary!: HTMLDetailsElement;
+  private diagActorEl!: HTMLElement;
+  private diagLamportEl!: HTMLElement;
+  private diagHashEl!: HTMLElement;
+  private diagPendingEl!: HTMLElement;
+  private diagSubscribedEl!: HTMLElement;
+  private diagVerifyEl!: HTMLElement;
+
   private tickInterval: number | null = null;
+  private vaultRefreshInterval: number | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: SynclinePlugin) {
     super(leaf);
@@ -225,6 +356,7 @@ class SynclineSidebarView extends ItemView {
     root.empty();
     root.addClass("syncline-sidebar");
 
+    // ---- Status banner ----
     const statusRow = root.createDiv({ cls: "syncline-sidebar-status" });
     this.statusDot = statusRow.createDiv({
       cls: `syncline-sidebar-dot ${this.plugin.syncStatus}`,
@@ -234,32 +366,105 @@ class SynclineSidebarView extends ItemView {
       text: STATUS_LABELS[this.plugin.syncStatus],
     });
 
-    const meta = root.createDiv({ cls: "syncline-sidebar-meta" });
-    const filesRow = meta.createDiv({ cls: "syncline-sidebar-row" });
-    filesRow.createSpan({ cls: "syncline-sidebar-row-label", text: "Files" });
-    this.fileCountEl = filesRow.createSpan({
+    const lastSyncRow = root.createDiv({
+      cls: "syncline-sidebar-status-sub",
+    });
+    this.lastSyncEl = lastSyncRow.createSpan({ text: "never" });
+
+    // ---- Progress section (downloads only on the read side; the
+    //      upload counter is paired with it as a sibling row). Hidden
+    //      when both queues are zero so the sidebar is quiet at idle.
+    this.progressSection = root.createDiv({
+      cls: "syncline-sidebar-section syncline-sidebar-progress",
+    });
+    this.progressSection
+      .createDiv({ cls: "syncline-sidebar-section-title" })
+      .setText("In flight");
+    this.downloadingRow = this.progressSection.createDiv({
+      cls: "syncline-sidebar-progress-row",
+    });
+    this.downloadingRow
+      .createSpan({ cls: "syncline-sidebar-progress-icon" })
+      .setText("↓");
+    this.downloadingText = this.downloadingRow.createDiv({
+      cls: "syncline-sidebar-progress-text",
+      text: "—",
+    });
+    const barWrap = this.progressSection.createDiv({
+      cls: "syncline-sidebar-progress-bar",
+    });
+    this.downloadingBar = barWrap.createDiv({
+      cls: "syncline-sidebar-progress-fill",
+    });
+
+    // ---- Vault summary (phase 3) ----
+    const vaultSection = root.createDiv({ cls: "syncline-sidebar-section" });
+    vaultSection
+      .createDiv({ cls: "syncline-sidebar-section-title" })
+      .setText("Vault");
+    this.fileCountEl = appendKVRow(vaultSection, "Files");
+    this.folderCountEl = appendKVRow(vaultSection, "Folders");
+    this.conflictRow = vaultSection.createDiv({ cls: "syncline-sidebar-row" });
+    this.conflictRow.createSpan({
+      cls: "syncline-sidebar-row-label",
+      text: "Conflicts",
+    });
+    this.conflictCountEl = this.conflictRow.createSpan({
       cls: "syncline-sidebar-row-value",
       text: "—",
     });
+    // Hidden until expanded; lists conflict-copy paths.
+    this.conflictListEl = vaultSection.createDiv({
+      cls: "syncline-sidebar-conflict-list",
+    });
+    this.vaultSizeEl = appendKVRow(vaultSection, "Vault size");
 
-    const lastSyncRow = meta.createDiv({ cls: "syncline-sidebar-row" });
-    lastSyncRow.createSpan({
-      cls: "syncline-sidebar-row-label",
-      text: "Last sync",
+    // ---- Server section (phase 5). Populated by MSG_SERVER_STATS
+    //      replies — see SynclinePlugin.startServerStatsPolling.
+    const serverSection = root.createDiv({ cls: "syncline-sidebar-section" });
+    serverSection
+      .createDiv({ cls: "syncline-sidebar-section-title" })
+      .setText("Server");
+    this.serverVersionEl = appendKVRow(serverSection, "Version");
+    this.serverUptimeEl = appendKVRow(serverSection, "Uptime");
+    this.serverPeersEl = appendKVRow(serverSection, "Connected clients");
+    this.serverManifestEl = appendKVRow(serverSection, "Server-side files");
+    this.serverDbBytesEl = appendKVRow(serverSection, "Server blob storage");
+
+    // ---- Activity feed (phase 4) ----
+    this.activitySection = root.createDiv({ cls: "syncline-sidebar-section" });
+    this.activitySection
+      .createDiv({ cls: "syncline-sidebar-section-title" })
+      .setText("Recent activity");
+    this.activityList = this.activitySection.createDiv({
+      cls: "syncline-sidebar-activity",
     });
-    this.lastSyncEl = lastSyncRow.createSpan({
-      cls: "syncline-sidebar-row-value",
-      text: "never",
+
+    // ---- Diagnostics, collapsed by default (phase 6) ----
+    this.diagSummary = root.createEl("details", {
+      cls: "syncline-sidebar-section syncline-sidebar-diag",
     });
+    this.diagSummary.createEl("summary", { text: "Diagnostics" });
+    this.diagActorEl = appendKVRow(this.diagSummary, "Actor");
+    this.diagLamportEl = appendKVRow(this.diagSummary, "Lamport");
+    this.diagHashEl = appendKVRow(this.diagSummary, "Projection hash");
+    this.diagPendingEl = appendKVRow(this.diagSummary, "Pending blobs");
+    this.diagSubscribedEl = appendKVRow(this.diagSummary, "Subscribed docs");
+    this.diagVerifyEl = appendKVRow(this.diagSummary, "Last verify");
 
     this.render();
 
-    // Repaint relative timestamp every few seconds while the view is open;
-    // status / file count are pushed via render() from the plugin instead.
+    // Repaint the relative timestamp + vault summary on a slow timer.
+    // Hot signals (status, blob queue, sync events) push from the
+    // plugin instead.
     this.tickInterval = window.setInterval(() => {
       this.renderLastSync();
-    }, 5000);
+    }, 3000);
     this.registerInterval(this.tickInterval);
+    this.vaultRefreshInterval = window.setInterval(() => {
+      this.render();
+    }, SIDEBAR_VAULT_REFRESH_MS);
+    this.registerInterval(this.vaultRefreshInterval);
   }
 
   async onClose(): Promise<void> {
@@ -267,25 +472,167 @@ class SynclineSidebarView extends ItemView {
       window.clearInterval(this.tickInterval);
       this.tickInterval = null;
     }
+    if (this.vaultRefreshInterval !== null) {
+      window.clearInterval(this.vaultRefreshInterval);
+      this.vaultRefreshInterval = null;
+    }
   }
 
-  /** Push current plugin state into the DOM. Called by the plugin on every
-   *  status change and after the manifest reconcile updates the file count. */
+  /** Push current plugin state into the DOM. Called by the plugin on
+   *  every status change, manifest update, blob-queue change, sync
+   *  event, and a slow vault-summary tick. Cheap to call repeatedly. */
   render(): void {
     if (!this.statusDot) return;
     const status = this.plugin.syncStatus;
     this.statusDot.className = `syncline-sidebar-dot ${status}`;
     this.statusLabel.setText(STATUS_LABELS[status]);
-    const count = this.plugin.lastProjection.size;
-    this.fileCountEl.setText(String(count));
     this.renderLastSync();
+
+    // ---- Progress section (phase 2) ----
+    // Show / hide via a class so the Obsidian lint rule
+    // (`no-static-styles-assignment`) is happy. The CSS rule for
+    // `.syncline-sidebar-progress.is-hidden` lives in styles.css.
+    const pendingCount = this.plugin.pendingBlobCount;
+    const pendingBytes = this.plugin.pendingBlobBytes;
+    if (pendingCount > 0) {
+      this.progressSection.removeClass("is-hidden");
+      this.downloadingText.setText(
+        `${pendingCount} blob${pendingCount === 1 ? "" : "s"} · ${formatBytes(
+          pendingBytes,
+        )} remaining`,
+      );
+    } else {
+      this.progressSection.addClass("is-hidden");
+    }
+
+    // ---- Vault summary (phase 3) ----
+    const proj = this.plugin.lastProjection;
+    const fileEntries: ProjectionRow[] = [];
+    const folderSet = new Set<string>();
+    let conflictCount = 0;
+    let totalBytes = 0;
+    for (const row of proj.values()) {
+      if (row.kind === "directory") continue;
+      fileEntries.push(row);
+      if (row.is_conflict_copy) conflictCount += 1;
+      totalBytes += row.size ?? 0;
+      const lastSlash = row.path.lastIndexOf("/");
+      if (lastSlash >= 0) folderSet.add(row.path.slice(0, lastSlash));
+    }
+    const textCount = fileEntries.filter((r) => r.kind === "text").length;
+    const binaryCount = fileEntries.length - textCount;
+    this.fileCountEl.setText(
+      `${fileEntries.length} (${textCount} text, ${binaryCount} binary)`,
+    );
+    this.folderCountEl.setText(String(folderSet.size));
+    this.conflictCountEl.setText(String(conflictCount));
+    if (conflictCount > 0) {
+      this.conflictRow.addClass("syncline-sidebar-row-warn");
+      this.conflictListEl.empty();
+      for (const row of fileEntries) {
+        if (row.is_conflict_copy) {
+          this.conflictListEl
+            .createDiv({ cls: "syncline-sidebar-conflict-row" })
+            .setText(row.path);
+        }
+      }
+    } else {
+      this.conflictRow.removeClass("syncline-sidebar-row-warn");
+      this.conflictListEl.empty();
+    }
+    this.vaultSizeEl.setText(formatBytes(totalBytes));
+
+    // ---- Server section (phase 5) ----
+    const stats = this.plugin.serverStats;
+    if (stats) {
+      this.serverVersionEl.setText(stats.server_version);
+      this.serverUptimeEl.setText(formatUptime(stats.uptime_secs));
+      this.serverPeersEl.setText(String(stats.connected_clients));
+      this.serverManifestEl.setText(
+        `${stats.manifest_node_count} (${formatBytes(stats.manifest_total_bytes)})`,
+      );
+      this.serverDbBytesEl.setText(
+        `${stats.blob_count} blobs, ${formatBytes(stats.blob_total_bytes)}`,
+      );
+    } else {
+      this.serverVersionEl.setText("—");
+      this.serverUptimeEl.setText("—");
+      this.serverPeersEl.setText("—");
+      this.serverManifestEl.setText("—");
+      this.serverDbBytesEl.setText("—");
+    }
+
+    // ---- Activity feed (phase 4) ----
+    this.activityList.empty();
+    const events = this.plugin.activityFeed;
+    if (events.length === 0) {
+      this.activityList
+        .createDiv({ cls: "syncline-sidebar-activity-empty" })
+        .setText("No events yet.");
+    } else {
+      for (const ev of events) {
+        const row = this.activityList.createDiv({
+          cls: `syncline-sidebar-activity-row syncline-sidebar-activity-${ev.kind}`,
+        });
+        row
+          .createSpan({ cls: "syncline-sidebar-activity-icon" })
+          .setText(activityIcon(ev.kind));
+        const label = ev.path
+          ? ev.path
+          : ev.kind === "error"
+            ? (ev.error ?? "error")
+            : (ev.hash ?? "");
+        const tail = ev.bytes !== undefined ? ` (${formatBytes(ev.bytes)})` : "";
+        row
+          .createSpan({ cls: "syncline-sidebar-activity-label" })
+          .setText(label + tail);
+        row
+          .createSpan({ cls: "syncline-sidebar-activity-when" })
+          .setText(formatRelativeTime(ev.at, Date.now()));
+      }
+    }
+
+    // ---- Diagnostics (phase 6) ----
+    const diag = this.plugin.diagnostics;
+    this.diagActorEl.setText(shortHash(diag.actor));
+    this.diagLamportEl.setText(String(diag.lamport ?? "—"));
+    this.diagHashEl.setText(shortHash(diag.projectionHash));
+    this.diagPendingEl.setText(`${pendingCount} (${formatBytes(pendingBytes)})`);
+    this.diagSubscribedEl.setText(String(diag.subscribedCount ?? "—"));
+    this.diagVerifyEl.setText(diag.lastVerify ?? "unknown");
   }
 
   private renderLastSync(): void {
     if (!this.lastSyncEl) return;
-    this.lastSyncEl.setText(
-      formatRelativeTime(this.plugin.lastSyncedAt, Date.now()),
-    );
+    const text =
+      this.plugin.lastSyncedAt !== null
+        ? `last sync ${formatRelativeTime(this.plugin.lastSyncedAt, Date.now())}`
+        : "never synced";
+    this.lastSyncEl.setText(text);
+  }
+}
+
+/** Build a labelled key/value row. Returns the value span so callers
+ *  can write text into it later. */
+function appendKVRow(parent: HTMLElement, label: string): HTMLElement {
+  const row = parent.createDiv({ cls: "syncline-sidebar-row" });
+  row.createSpan({ cls: "syncline-sidebar-row-label", text: label });
+  return row.createSpan({
+    cls: "syncline-sidebar-row-value",
+    text: "—",
+  });
+}
+
+function activityIcon(kind: SyncEvent["kind"]): string {
+  switch (kind) {
+    case "blob_down":
+      return "↓";
+    case "blob_up":
+      return "↑";
+    case "node_modified":
+      return "~";
+    case "error":
+      return "×";
   }
 }
 
@@ -324,6 +671,51 @@ export default class SynclinePlugin extends Plugin {
   subscribedContent: Set<string> = new Set();
   /** Blob hashes we've already fetched this session (to avoid re-requests). */
   requestedBlobs: Set<string> = new Set();
+
+  /**
+   * #65 phase 2 — pending-blob counters mirrored from the WASM client
+   * via `onBlobQueueChange`. Cheap to read; the sidebar consumes them
+   * on every render. Default 0 (no in-flight blobs).
+   */
+  pendingBlobCount: number = 0;
+  pendingBlobBytes: number = 0;
+
+  /**
+   * #65 phase 5 — most recent `MSG_SERVER_STATS` reply. `null` until
+   * the first server response (which can be never, if running against
+   * an older server that doesn't recognise the opcode — in that case
+   * the sidebar's Server section keeps showing "—"). Refreshed on a
+   * 30 s timer; see `serverStatsTimer`.
+   */
+  serverStats: ServerStats | null = null;
+  /** Timer id for the 30 s server-stats poll. Cleared on disconnect. */
+  serverStatsTimer: number | null = null;
+
+  /**
+   * #65 phase 4 — most recent {@link ACTIVITY_FEED_LIMIT} sync events.
+   * Newest first. Populated by `onSyncEvent` callbacks from the WASM
+   * client. In-memory only — survives plugin reloads is *not* a goal
+   * (the issue's "Open questions" lean toward in-memory).
+   */
+  activityFeed: SyncEvent[] = [];
+
+  /** Read by the sidebar's diagnostics disclosure. Always cheap. */
+  get diagnostics() {
+    const c = this.client;
+    return {
+      actor: c?.actorId() ?? null,
+      lamport: c ? Number(c.lamport()) : null,
+      projectionHash: (() => {
+        try {
+          return c?.projectionHashHex() ?? null;
+        } catch {
+          return null;
+        }
+      })(),
+      subscribedCount: c?.subscribedContentCount() ?? null,
+      lastVerify: c?.lastVerifyResult() ?? null,
+    };
+  }
 
   /**
    * Single-flight guard for reconcileProjection. The manifest CRDT can
@@ -610,25 +1002,69 @@ export default class SynclinePlugin extends Plugin {
   // ---------------------------------------------------------------
 
   updateStatus(status: SyncStatus, text?: string) {
-    this.syncStatus = status;
-    if (status === "synced") {
+    // Refine to the sidebar-only `degraded` / `read-only` states when
+    // the underlying client signals indicate them. Status-bar dot still
+    // collapses these to the closest of the four base states for users
+    // who haven't enabled the sidebar — nothing breaks if a caller
+    // passes one of the new states directly.
+    const refined = this.refineStatus(status);
+    this.syncStatus = refined;
+    if (refined === "synced") {
       this.lastSyncedAt = Date.now();
     }
-    this.statusIcon.className = `status-icon ${status}`;
+    this.statusIcon.className = `status-icon ${this.statusBarFallback(refined)}`;
     const statusTexts: Record<SyncStatus, string> = {
       synced: "Syncline: synced",
       syncing: "Syncline: syncing…",
       error: "Syncline: error",
       disconnected: "Syncline: disconnected",
+      degraded: "Syncline: degraded — see sidebar",
+      "read-only": "Syncline: read-only (handshake)",
     };
-    const newText = text ?? statusTexts[status];
+    const newText = text ?? statusTexts[refined];
     this.statusText.setText(newText);
     if (this.ribbonIconEl) {
-      this.ribbonIconEl.removeClass("synced", "syncing", "error", "disconnected");
-      this.ribbonIconEl.addClass(status);
+      this.ribbonIconEl.removeClass(
+        "synced",
+        "syncing",
+        "error",
+        "disconnected",
+        "degraded",
+        "read-only",
+      );
+      this.ribbonIconEl.addClass(refined);
       this.ribbonIconEl.setAttribute("aria-label", newText);
     }
     this.refreshSidebar();
+  }
+
+  /** Map a callsite-supplied status to its sidebar-aware refinement.
+   *  - `synced` → `degraded` if the most recent verify result was a
+   *    mismatch (silent divergence — see #65 §6).
+   *  - `syncing` → `read-only` while the handshake is still pending,
+   *    so users understand why local writes are queued.
+   *  Other states pass through unchanged. */
+  private refineStatus(status: SyncStatus): SyncStatus {
+    if (!this.client) return status;
+    if (status === "synced") {
+      try {
+        if (this.client.lastVerifyResult() === "mismatch") return "degraded";
+      } catch {
+        /* ignore — pre-init or post-disconnect read; fall through */
+      }
+    }
+    if (status === "syncing" && !this.client.isConnected()) {
+      return "read-only";
+    }
+    return status;
+  }
+
+  /** The status-bar dot only knows the four base states; `degraded`
+   *  and `read-only` collapse to amber / amber respectively. */
+  private statusBarFallback(s: SyncStatus): string {
+    if (s === "degraded") return "syncing";
+    if (s === "read-only") return "syncing";
+    return s;
   }
 
   /** Push current state into any open sidebar leaves. Cheap no-op when
@@ -725,6 +1161,36 @@ export default class SynclinePlugin extends Plugin {
       this.client.onStatus((s) => {
         console.debug("[Syncline] status:", s);
       });
+      // #65 phase 2: cheap mirror so the sidebar can read these on
+      // every render without a WASM call per refresh.
+      this.client.onBlobQueueChange((count, bytes) => {
+        this.pendingBlobCount = count;
+        this.pendingBlobBytes = bytes;
+        this.refreshSidebar();
+      });
+      // #65 phase 4: ring-buffer the most recent activity events.
+      this.client.onSyncEvent((json) => {
+        try {
+          const parsed = JSON.parse(json) as Omit<SyncEvent, "at">;
+          this.activityFeed.unshift({ ...parsed, at: Date.now() });
+          if (this.activityFeed.length > ACTIVITY_FEED_LIMIT) {
+            this.activityFeed.length = ACTIVITY_FEED_LIMIT;
+          }
+          this.refreshSidebar();
+        } catch (err) {
+          console.warn("[Syncline] malformed sync event payload", json, err);
+        }
+      });
+      // #65 phase 5: subscribe to server-stats replies; the request
+      // is fired below once the WS is up and then on a 30 s timer.
+      this.client.onServerStats((json) => {
+        try {
+          this.serverStats = JSON.parse(json) as ServerStats;
+          this.refreshSidebar();
+        } catch (err) {
+          console.warn("[Syncline] malformed server stats payload", json, err);
+        }
+      });
 
       this.client.connect();
 
@@ -767,6 +1233,7 @@ export default class SynclinePlugin extends Plugin {
       await this.reconcileProjection();
 
       this.startStatusCheck();
+      this.startServerStatsPolling();
     } catch (error) {
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
@@ -787,6 +1254,7 @@ export default class SynclinePlugin extends Plugin {
 
   disconnect() {
     this.stopStatusCheck();
+    this.stopServerStatsPolling();
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -802,7 +1270,37 @@ export default class SynclinePlugin extends Plugin {
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
     this.reconcilePending = false;
+    this.serverStats = null;
     this.updateStatus("disconnected");
+  }
+
+  /**
+   * Poll `MSG_SERVER_STATS` once immediately and then every 30 s
+   * (#65 §4). 30 s is a deliberate compromise: the user-visible
+   * fields (uptime, connected_clients) drift slowly and the request
+   * payload is empty, so the bandwidth cost is trivial. A first
+   * request fires now so the sidebar's Server section populates
+   * within a couple of seconds of connect.
+   */
+  startServerStatsPolling() {
+    this.stopServerStatsPolling();
+    const fire = () => {
+      if (!this.client?.isConnected()) return;
+      try {
+        this.client.requestServerStats();
+      } catch (err) {
+        console.debug("[Syncline] requestServerStats failed:", err);
+      }
+    };
+    fire();
+    this.serverStatsTimer = window.setInterval(fire, 30_000);
+  }
+
+  stopServerStatsPolling() {
+    if (this.serverStatsTimer !== null) {
+      window.clearInterval(this.serverStatsTimer);
+      this.serverStatsTimer = null;
+    }
   }
 
   startStatusCheck() {

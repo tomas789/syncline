@@ -125,3 +125,182 @@
   color: var(--text-normal);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- */
+/* #65 phases 2–4 + 6 — sidebar sections beyond the status banner.   */
+/* ---------------------------------------------------------------- */
+
+.syncline-sidebar-dot.degraded {
+  /* Distinct from `syncing` — same amber family, but no pulse so the
+     user can tell at a glance whether the system is *working on it*
+     (syncing) or *silently diverged* (degraded). */
+  background-color: #ffb300;
+  border: 1px solid #b27300;
+}
+
+.syncline-sidebar-dot.read-only {
+  /* Blue — connected but not yet writeable. */
+  background-color: #1976d2;
+}
+
+.syncline-ribbon.degraded {
+  color: #ffb300;
+}
+.syncline-ribbon.read-only {
+  color: #1976d2;
+}
+
+.syncline-sidebar-status-sub {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-top: -8px;
+  margin-bottom: 12px;
+}
+
+.syncline-sidebar-section {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.syncline-sidebar-section-title {
+  font-size: 0.85em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.syncline-sidebar-progress.is-hidden {
+  /* Toggled from main.ts via `addClass`/`removeClass` — Obsidian's
+     lint rule disallows direct `element.style` writes. */
+  display: none;
+}
+
+.syncline-sidebar-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.syncline-sidebar-progress-icon {
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.syncline-sidebar-progress-text {
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.syncline-sidebar-progress-bar {
+  margin-top: 4px;
+  height: 4px;
+  background: var(--background-modifier-border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.syncline-sidebar-progress-fill {
+  /* The fill is currently a moving stripe rather than a precise %,
+     because the WASM client knows the *remaining* count, not the
+     original total. The animation tells the user "still running"
+     while the text row gives the precise figures. */
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--interactive-accent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: syncline-bar-stripe 1.6s linear infinite;
+}
+
+@keyframes syncline-bar-stripe {
+  from { background-position: 200% 0; }
+  to   { background-position: 0 0; }
+}
+
+.syncline-sidebar-row-warn {
+  color: #b27300;
+}
+.syncline-sidebar-row-warn .syncline-sidebar-row-label,
+.syncline-sidebar-row-warn .syncline-sidebar-row-value {
+  color: inherit;
+  font-weight: 600;
+}
+
+.syncline-sidebar-conflict-list {
+  margin-left: 8px;
+  border-left: 2px solid #ffb300;
+  padding-left: 8px;
+}
+
+.syncline-sidebar-conflict-row {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.syncline-sidebar-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.syncline-sidebar-activity-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.syncline-sidebar-activity-row {
+  display: grid;
+  grid-template-columns: 1em 1fr auto;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 0.9em;
+}
+
+.syncline-sidebar-activity-icon {
+  font-weight: 700;
+  color: var(--text-muted);
+}
+.syncline-sidebar-activity-blob_down .syncline-sidebar-activity-icon {
+  color: #1976d2;
+}
+.syncline-sidebar-activity-blob_up .syncline-sidebar-activity-icon {
+  color: #2e7d32;
+}
+.syncline-sidebar-activity-error .syncline-sidebar-activity-icon {
+  color: #f44336;
+}
+
+.syncline-sidebar-activity-label {
+  word-break: break-all;
+}
+
+.syncline-sidebar-activity-when {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+}
+
+.syncline-sidebar-diag {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 8px;
+}
+
+.syncline-sidebar-diag summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}

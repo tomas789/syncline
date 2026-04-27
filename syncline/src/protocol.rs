@@ -25,6 +25,12 @@ pub const MSG_MANIFEST_SYNC: u8 = 0x20;
 /// v1: convergence heartbeat — SHA-256 over the projected namespace
 /// (§4.4.1). Mismatch triggers a full manifest SyncStep1.
 pub const MSG_MANIFEST_VERIFY: u8 = 0x21;
+/// v1: server-stats request/response (#65 §4). Client sends an empty
+/// payload (with [`MANIFEST_DOC_ID`] as the outer doc_id); server
+/// replies with the same opcode carrying a JSON document. Backwards
+/// compatible: a server that doesn't recognise the opcode silently
+/// ignores the frame, and the client renders "—" in the UI.
+pub const MSG_SERVER_STATS: u8 = 0x22;
 /// v1: protocol version handshake. Must be the first frame on a v1
 /// session. Payload is `[u8 major][u8 minor]`.
 pub const MSG_VERSION: u8 = 0xF0;
