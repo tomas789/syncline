@@ -15,7 +15,7 @@
 //! without colliding on a monolithic borrow — this is the same pattern
 //! as `wasm_client.rs`.
 
-use js_sys::{Function, Uint8Array};
+use js_sys::{Date, Function, Uint8Array};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -81,7 +81,7 @@ pub struct SynclineV1Client {
     ws: Rc<RefCell<Option<WebSocket>>>,
     is_connected: Rc<RefCell<bool>>,
     closures: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>>,
-    requested_blobs: Rc<RefCell<HashSet<String>>>,
+    requested_blobs: Rc<RefCell<HashMap<String, f64>>>,
     /// Content node ids whose STEP_1 was deferred because the WebSocket
     /// hadn't completed its handshake yet. Drained on `onopen`. Without
     /// this, `subscribeContent` calls during the connect() → onopen
@@ -140,7 +140,7 @@ impl SynclineV1Client {
             ws: Rc::new(RefCell::new(None)),
             is_connected: Rc::new(RefCell::new(false)),
             closures: Rc::new(RefCell::new(Vec::new())),
-            requested_blobs: Rc::new(RefCell::new(HashSet::new())),
+            requested_blobs: Rc::new(RefCell::new(HashMap::new())),
             pending_step1: Rc::new(RefCell::new(HashSet::new())),
             last_verify_result: Rc::new(RefCell::new("unknown")),
             on_manifest_changed: Rc::new(RefCell::new(None)),
@@ -335,7 +335,7 @@ impl SynclineV1Client {
         }
         let mut total: u64 = 0;
         for entry in m.live_entries() {
-            if entry.chunk_hashes.iter().any(|h| pending.contains(h)) {
+            if entry.chunk_hashes.iter().any(|h| pending.contains_key(h)) {
                 total = total.saturating_add(entry.size);
             }
         }
@@ -869,14 +869,30 @@ impl SynclineV1Client {
 
     /// Request a blob by its hex hash. Deduplicates within a session.
     /// Reply arrives via the `onBlob` callback.
+    ///
+    /// Records the wall-clock instant of the send in `requested_blobs`
+    /// so [`retry_stale_blob_requests`] can re-issue requests whose
+    /// reply never arrived. Without that retry path, a `MSG_BLOB_REQUEST`
+    /// dropped during a brief WS hiccup pinned the sidebar's "in
+    /// flight" counter forever (manually reproduced on a 1.2.0 vault
+    /// with two large binary chunks).
     #[wasm_bindgen(js_name = requestBlob)]
     pub fn request_blob(&self, blob_hash_hex: String) -> Result<(), JsValue> {
         if !*self.is_connected.borrow() {
             return Err(JsValue::from_str("request_blob: not connected"));
         }
-        if !self.requested_blobs.borrow_mut().insert(blob_hash_hex.clone()) {
+        // Already-pending: no-op. Retries are the dedicated job of
+        // `retry_stale_blob_requests`.
+        if self
+            .requested_blobs
+            .borrow()
+            .contains_key(&blob_hash_hex)
+        {
             return Ok(());
         }
+        self.requested_blobs
+            .borrow_mut()
+            .insert(blob_hash_hex.clone(), Date::now());
         let ws = self.ws.borrow();
         let ws = ws
             .as_ref()
@@ -886,6 +902,94 @@ impl SynclineV1Client {
         // Newly-pending blob — the queue grew, sidebar wants to know.
         self.handles().emit_blob_queue_change();
         Ok(())
+    }
+
+    /// Re-issue any `MSG_BLOB_REQUEST` whose last send is older than
+    /// `stale_after_ms`. Returns the number of requests resent. The
+    /// predicate that picks stale requests lives in
+    /// [`collect_stale_blob_requests`] so it's unit-testable without
+    /// a live WebSocket.
+    ///
+    /// This is the missing companion to [`request_blob`]'s session-
+    /// dedupe set. A request frame can be dropped under WS
+    /// backpressure or lost during a reconnect window. Without this
+    /// retry, the dedupe set keeps the hash forever and the sidebar's
+    /// "in flight" counter never zeroes out.
+    ///
+    /// Idempotent and safe to call frequently — entries that aren't
+    /// stale are left alone; if the WebSocket isn't connected the
+    /// call short-circuits with `0`. Plugin-side caller drives this
+    /// on a small interval (e.g. every 5 s with a 15 s threshold).
+    #[wasm_bindgen(js_name = retryStaleBlobRequests)]
+    pub fn retry_stale_blob_requests(&self, stale_after_ms: f64) -> u32 {
+        if !*self.is_connected.borrow() {
+            return 0;
+        }
+        let now = Date::now();
+
+        // Step 1: prune ghost requests — pending hashes that no live
+        // manifest entry references any more (e.g. the entry's
+        // chunk_hashes changed under a manifest update). Without this
+        // we'd re-ask the server forever for blobs it will never
+        // have.
+        if let Some(m) = self.manifest.borrow().as_ref() {
+            // `live_entries()` returns owned `NodeEntry`s, so we have
+            // to hold the entry list ourselves to keep its
+            // `chunk_hashes` strings alive while we build the ref-set.
+            let entries = m.live_entries();
+            let live: std::collections::HashSet<&str> = entries
+                .iter()
+                .flat_map(|e| e.chunk_hashes.iter().map(|s| s.as_str()))
+                .collect();
+            let ghosts = crate::blob_retry::collect_ghost_blob_requests(
+                &self.requested_blobs.borrow(),
+                &live,
+            );
+            if !ghosts.is_empty() {
+                let mut map = self.requested_blobs.borrow_mut();
+                for h in &ghosts {
+                    map.remove(h);
+                }
+                drop(map);
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "[SynclineV1] pruned {} ghost MSG_BLOB_REQUEST(s) — \
+                     hashes are no longer in any manifest entry",
+                    ghosts.len()
+                )));
+                self.handles().emit_blob_queue_change();
+            }
+        }
+
+        // Step 2: re-send anything past the stale threshold.
+        let stale = crate::blob_retry::collect_stale_blob_requests(
+            &self.requested_blobs.borrow(),
+            now,
+            stale_after_ms,
+        );
+        if stale.is_empty() {
+            return 0;
+        }
+        let ws = self.ws.borrow();
+        let Some(ws) = ws.as_ref() else {
+            return 0;
+        };
+        // Bump every stale timestamp first so a follow-up call
+        // before the reply can settle won't double-send.
+        {
+            let mut map = self.requested_blobs.borrow_mut();
+            for h in &stale {
+                map.insert(h.clone(), now);
+            }
+        }
+        for hash in &stale {
+            let frame = encode_message(MSG_BLOB_REQUEST, hash, hash.as_bytes());
+            send_frame(ws, &frame);
+        }
+        web_sys::console::warn_1(&JsValue::from_str(&format!(
+            "[SynclineV1] re-sent {} stale MSG_BLOB_REQUEST frame(s)",
+            stale.len()
+        )));
+        stale.len() as u32
     }
 
     // ---------------------------------------------------------------
@@ -918,7 +1022,7 @@ struct Handles {
     manifest: Rc<RefCell<Option<Manifest>>>,
     manifest_is_receiving: Rc<RefCell<bool>>,
     content: Rc<RefCell<HashMap<NodeId, ContentDoc>>>,
-    requested_blobs: Rc<RefCell<HashSet<String>>>,
+    requested_blobs: Rc<RefCell<HashMap<String, f64>>>,
     last_verify_result: Rc<RefCell<&'static str>>,
     on_manifest_changed: Rc<RefCell<Option<Function>>>,
     on_content_changed: Rc<RefCell<Option<Function>>>,
@@ -946,7 +1050,7 @@ impl Handles {
                 Some(m) if !pending.is_empty() => m
                     .live_entries()
                     .into_iter()
-                    .filter(|e| e.chunk_hashes.iter().any(|h| pending.contains(h)))
+                    .filter(|e| e.chunk_hashes.iter().any(|h| pending.contains_key(h)))
                     .map(|e| e.size)
                     .sum(),
                 _ => 0,
@@ -1116,7 +1220,7 @@ fn dispatch_frame(h: &Handles, ws: &WebSocket, data: &[u8]) {
                 )));
                 return;
             }
-            let was_pending = h.requested_blobs.borrow_mut().remove(&expected);
+            let was_pending = h.requested_blobs.borrow_mut().remove(&expected).is_some();
             let cb = h.on_blob.borrow().clone();
             if let Some(cb) = cb {
                 let js_hash = JsValue::from_str(&expected);
@@ -1230,3 +1334,4 @@ where
         .ok_or_else(|| JsValue::from_str("manifest not initialised"))?;
     f(m)
 }
+
