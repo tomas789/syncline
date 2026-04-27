@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/tomas789/syncline/compare/v1.2.0...v1.3.0) (2026-04-27)
+
+
+### Features
+
+* **plugin:** full Syncline sidebar ([#65](https://github.com/tomas789/syncline/issues/65) phases 2-6) ([#84](https://github.com/tomas789/syncline/issues/84)) ([05de9a9](https://github.com/tomas789/syncline/commit/05de9a9b647582a7f7e4afe33ba4cccc6b51e867))
+
+
+### Bug Fixes
+
+* **plugin:** retry blob requests + prune ghosts left over by manifest churn ([#86](https://github.com/tomas789/syncline/issues/86)) ([769d813](https://github.com/tomas789/syncline/commit/769d813ce494c379d4a51915a4048a3877c10bbe))
+
 ## [1.2.0](https://github.com/tomas789/syncline/compare/v1.1.5...v1.2.0) (2026-04-26)
 
 
