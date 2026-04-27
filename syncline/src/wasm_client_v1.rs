@@ -28,8 +28,8 @@ use yrs::{Doc, GetString, ReadTxn, StateVector, Subscription, Text, Transact, Up
 
 use crate::protocol::{
     decode_message, encode_message, MANIFEST_DOC_ID, MSG_BLOB_REQUEST, MSG_BLOB_UPDATE,
-    MSG_MANIFEST_SYNC, MSG_MANIFEST_VERIFY, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2, MSG_UPDATE,
-    MSG_VERSION,
+    MSG_MANIFEST_SYNC, MSG_MANIFEST_VERIFY, MSG_SERVER_STATS, MSG_SYNC_STEP_1, MSG_SYNC_STEP_2,
+    MSG_UPDATE, MSG_VERSION,
 };
 use crate::v1::hash::hash_hex;
 use crate::v1::ids::{ActorId, Lamport, NodeId};
@@ -110,6 +110,10 @@ pub struct SynclineV1Client {
     /// `{ kind, path?, hash?, bytes?, error? }`. The plugin keeps a
     /// small ring buffer of these for the activity feed.
     on_sync_event: Rc<RefCell<Option<Function>>>,
+    /// Fires when a `MSG_SERVER_STATS` reply arrives. Argument is the
+    /// JSON string the server sent. Plugin's sidebar `JSON.parse`s it
+    /// into `{ server_version, uptime_secs, connected_clients, … }`.
+    on_server_stats: Rc<RefCell<Option<Function>>>,
 }
 
 #[wasm_bindgen]
@@ -145,6 +149,7 @@ impl SynclineV1Client {
             on_status: Rc::new(RefCell::new(None)),
             on_blob_queue_change: Rc::new(RefCell::new(None)),
             on_sync_event: Rc::new(RefCell::new(None)),
+            on_server_stats: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -275,6 +280,32 @@ impl SynclineV1Client {
     #[wasm_bindgen(js_name = onSyncEvent)]
     pub fn set_on_sync_event(&self, cb: Function) {
         *self.on_sync_event.borrow_mut() = Some(cb);
+    }
+
+    /// Subscribe to server-stats replies (#65 §4). Argument is the
+    /// raw JSON string. Plugin polls via [`request_server_stats`]
+    /// (e.g. every 30 s) and updates the sidebar's "Server" section
+    /// from each reply.
+    #[wasm_bindgen(js_name = onServerStats)]
+    pub fn set_on_server_stats(&self, cb: Function) {
+        *self.on_server_stats.borrow_mut() = Some(cb);
+    }
+
+    /// Send an empty `MSG_SERVER_STATS` request; the reply arrives via
+    /// the `onServerStats` callback. No-op if not connected — the
+    /// caller can retry on the next timer tick.
+    #[wasm_bindgen(js_name = requestServerStats)]
+    pub fn request_server_stats(&self) -> Result<(), JsValue> {
+        if !*self.is_connected.borrow() {
+            return Err(JsValue::from_str("request_server_stats: not connected"));
+        }
+        let ws = self.ws.borrow();
+        let ws = ws
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("request_server_stats: no socket"))?;
+        let frame = encode_message(MSG_SERVER_STATS, MANIFEST_DOC_ID, &[]);
+        send_frame(ws, &frame);
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -873,6 +904,7 @@ impl SynclineV1Client {
             on_blob: self.on_blob.clone(),
             on_blob_queue_change: self.on_blob_queue_change.clone(),
             on_sync_event: self.on_sync_event.clone(),
+            on_server_stats: self.on_server_stats.clone(),
         }
     }
 }
@@ -893,6 +925,7 @@ struct Handles {
     on_blob: Rc<RefCell<Option<Function>>>,
     on_blob_queue_change: Rc<RefCell<Option<Function>>>,
     on_sync_event: Rc<RefCell<Option<Function>>>,
+    on_server_stats: Rc<RefCell<Option<Function>>>,
 }
 
 impl Handles {
@@ -1116,6 +1149,24 @@ fn dispatch_frame(h: &Handles, ws: &WebSocket, data: &[u8]) {
                 "hash": expected,
                 "bytes": payload.len(),
             }));
+        }
+        MSG_SERVER_STATS => {
+            // Pass the JSON straight through — the plugin owns
+            // rendering. Old servers that don't recognise this opcode
+            // simply never reply, and the plugin's "—" placeholders
+            // stay in the UI.
+            if let Some(cb) = h.on_server_stats.borrow().clone() {
+                let s = match std::str::from_utf8(payload) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        web_sys::console::warn_1(&JsValue::from_str(
+                            "[SynclineV1] MSG_SERVER_STATS payload was not utf-8",
+                        ));
+                        return;
+                    }
+                };
+                let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&s));
+            }
         }
         _ => {
             web_sys::console::warn_1(&JsValue::from_str(&format!(

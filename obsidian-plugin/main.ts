@@ -129,7 +129,26 @@ interface SynclineV1Client {
   manifestNodeCount(): number;
   /** #65 phase 6 — `"unknown" | "pending" | "match" | "mismatch"`. */
   lastVerifyResult(): string;
+  /** #65 phase 5 — fires (jsonString) per server-stats reply. */
+  onServerStats(cb: (json: string) => void): void;
+  /** #65 phase 5 — sends an empty MSG_SERVER_STATS request. The reply
+   *  arrives via `onServerStats`. No-op if disconnected. */
+  requestServerStats(): void;
   free(): void;
+}
+
+/** Shape of the JSON the server returns in a `MSG_SERVER_STATS` reply
+ *  (#65 phase 5). All numeric fields are unsigned, but TypeScript only
+ *  has `number`, so values above 2^53 are theoretically lossy — in
+ *  practice none of these ever come close. */
+interface ServerStats {
+  server_version: string;
+  uptime_secs: number;
+  connected_clients: number;
+  manifest_node_count: number;
+  manifest_total_bytes: number;
+  blob_count: number;
+  blob_total_bytes: number;
 }
 
 async function initWasm(): Promise<WasmModule> {
@@ -244,6 +263,21 @@ function shortHash(h: string | null | undefined): string {
   return h.length > 12 ? `${h.slice(0, 8)}…${h.slice(-4)}` : h;
 }
 
+/** "X days HH:MM" / "HH:MM:SS" / "MM:SS" depending on magnitude. */
+function formatUptime(secs: number): string {
+  if (secs < 0) return "—";
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (d > 0) return `${d}d ${pad2(h)}:${pad2(m)}`;
+  if (h > 0) return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+  return `${pad2(m)}:${pad2(s)}`;
+}
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
 /** Format a "N seconds/minutes/hours ago" timestamp for the sidebar. */
 function formatRelativeTime(epochMs: number | null, nowMs: number): string {
   if (epochMs === null) return "never";
@@ -277,6 +311,14 @@ class SynclineSidebarView extends ItemView {
   private conflictRow!: HTMLElement;
   private conflictListEl!: HTMLElement;
   private vaultSizeEl!: HTMLElement;
+  // Server section (phase 5). Only populated once the first
+  // `MSG_SERVER_STATS` reply arrives — older servers that don't
+  // recognise the opcode never reply and the rows stay at "—".
+  private serverVersionEl!: HTMLElement;
+  private serverUptimeEl!: HTMLElement;
+  private serverPeersEl!: HTMLElement;
+  private serverDbBytesEl!: HTMLElement;
+  private serverManifestEl!: HTMLElement;
   // Activity feed (phase 4).
   private activitySection!: HTMLElement;
   private activityList!: HTMLElement;
@@ -376,6 +418,18 @@ class SynclineSidebarView extends ItemView {
       cls: "syncline-sidebar-conflict-list",
     });
     this.vaultSizeEl = appendKVRow(vaultSection, "Vault size");
+
+    // ---- Server section (phase 5). Populated by MSG_SERVER_STATS
+    //      replies — see SynclinePlugin.startServerStatsPolling.
+    const serverSection = root.createDiv({ cls: "syncline-sidebar-section" });
+    serverSection
+      .createDiv({ cls: "syncline-sidebar-section-title" })
+      .setText("Server");
+    this.serverVersionEl = appendKVRow(serverSection, "Version");
+    this.serverUptimeEl = appendKVRow(serverSection, "Uptime");
+    this.serverPeersEl = appendKVRow(serverSection, "Connected clients");
+    this.serverManifestEl = appendKVRow(serverSection, "Server-side files");
+    this.serverDbBytesEl = appendKVRow(serverSection, "Server blob storage");
 
     // ---- Activity feed (phase 4) ----
     this.activitySection = root.createDiv({ cls: "syncline-sidebar-section" });
@@ -487,6 +541,26 @@ class SynclineSidebarView extends ItemView {
       this.conflictListEl.empty();
     }
     this.vaultSizeEl.setText(formatBytes(totalBytes));
+
+    // ---- Server section (phase 5) ----
+    const stats = this.plugin.serverStats;
+    if (stats) {
+      this.serverVersionEl.setText(stats.server_version);
+      this.serverUptimeEl.setText(formatUptime(stats.uptime_secs));
+      this.serverPeersEl.setText(String(stats.connected_clients));
+      this.serverManifestEl.setText(
+        `${stats.manifest_node_count} (${formatBytes(stats.manifest_total_bytes)})`,
+      );
+      this.serverDbBytesEl.setText(
+        `${stats.blob_count} blobs, ${formatBytes(stats.blob_total_bytes)}`,
+      );
+    } else {
+      this.serverVersionEl.setText("—");
+      this.serverUptimeEl.setText("—");
+      this.serverPeersEl.setText("—");
+      this.serverManifestEl.setText("—");
+      this.serverDbBytesEl.setText("—");
+    }
 
     // ---- Activity feed (phase 4) ----
     this.activityList.empty();
@@ -605,6 +679,17 @@ export default class SynclinePlugin extends Plugin {
    */
   pendingBlobCount: number = 0;
   pendingBlobBytes: number = 0;
+
+  /**
+   * #65 phase 5 — most recent `MSG_SERVER_STATS` reply. `null` until
+   * the first server response (which can be never, if running against
+   * an older server that doesn't recognise the opcode — in that case
+   * the sidebar's Server section keeps showing "—"). Refreshed on a
+   * 30 s timer; see `serverStatsTimer`.
+   */
+  serverStats: ServerStats | null = null;
+  /** Timer id for the 30 s server-stats poll. Cleared on disconnect. */
+  serverStatsTimer: number | null = null;
 
   /**
    * #65 phase 4 — most recent {@link ACTIVITY_FEED_LIMIT} sync events.
@@ -1096,6 +1181,16 @@ export default class SynclinePlugin extends Plugin {
           console.warn("[Syncline] malformed sync event payload", json, err);
         }
       });
+      // #65 phase 5: subscribe to server-stats replies; the request
+      // is fired below once the WS is up and then on a 30 s timer.
+      this.client.onServerStats((json) => {
+        try {
+          this.serverStats = JSON.parse(json) as ServerStats;
+          this.refreshSidebar();
+        } catch (err) {
+          console.warn("[Syncline] malformed server stats payload", json, err);
+        }
+      });
 
       this.client.connect();
 
@@ -1138,6 +1233,7 @@ export default class SynclinePlugin extends Plugin {
       await this.reconcileProjection();
 
       this.startStatusCheck();
+      this.startServerStatsPolling();
     } catch (error) {
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
@@ -1158,6 +1254,7 @@ export default class SynclinePlugin extends Plugin {
 
   disconnect() {
     this.stopStatusCheck();
+    this.stopServerStatsPolling();
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -1173,7 +1270,37 @@ export default class SynclinePlugin extends Plugin {
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
     this.reconcilePending = false;
+    this.serverStats = null;
     this.updateStatus("disconnected");
+  }
+
+  /**
+   * Poll `MSG_SERVER_STATS` once immediately and then every 30 s
+   * (#65 §4). 30 s is a deliberate compromise: the user-visible
+   * fields (uptime, connected_clients) drift slowly and the request
+   * payload is empty, so the bandwidth cost is trivial. A first
+   * request fires now so the sidebar's Server section populates
+   * within a couple of seconds of connect.
+   */
+  startServerStatsPolling() {
+    this.stopServerStatsPolling();
+    const fire = () => {
+      if (!this.client?.isConnected()) return;
+      try {
+        this.client.requestServerStats();
+      } catch (err) {
+        console.debug("[Syncline] requestServerStats failed:", err);
+      }
+    };
+    fire();
+    this.serverStatsTimer = window.setInterval(fire, 30_000);
+  }
+
+  stopServerStatsPolling() {
+    if (this.serverStatsTimer !== null) {
+      window.clearInterval(this.serverStatsTimer);
+      this.serverStatsTimer = null;
+    }
   }
 
   startStatusCheck() {
