@@ -122,6 +122,10 @@ interface SynclineV1Client {
   contentSnapshot(nodeIdHex: string): Uint8Array | undefined;
   sendBlob(bytes: Uint8Array): string;
   requestBlob(blobHashHex: string): void;
+  /** Re-issue any `MSG_BLOB_REQUEST` whose last send is older than
+   *  `staleAfterMs`. Returns the count of resent requests. Idempotent
+   *  and safe to call frequently. */
+  retryStaleBlobRequests(staleAfterMs: number): number;
   /** #65 phase 2 sidebar getters. */
   pendingBlobCount(): number;
   pendingBlobBytes(): number;
@@ -691,6 +695,9 @@ export default class SynclinePlugin extends Plugin {
   /** Timer id for the 30 s server-stats poll. Cleared on disconnect. */
   serverStatsTimer: number | null = null;
 
+  /** Timer id for the blob-request retry sweep. Cleared on disconnect. */
+  blobRetryTimer: number | null = null;
+
   /**
    * #65 phase 4 — most recent {@link ACTIVITY_FEED_LIMIT} sync events.
    * Newest first. Populated by `onSyncEvent` callbacks from the WASM
@@ -1234,6 +1241,7 @@ export default class SynclinePlugin extends Plugin {
 
       this.startStatusCheck();
       this.startServerStatsPolling();
+      this.startBlobRetrySweep();
     } catch (error) {
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
@@ -1255,6 +1263,7 @@ export default class SynclinePlugin extends Plugin {
   disconnect() {
     this.stopStatusCheck();
     this.stopServerStatsPolling();
+    this.stopBlobRetrySweep();
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -1294,6 +1303,43 @@ export default class SynclinePlugin extends Plugin {
     };
     fire();
     this.serverStatsTimer = window.setInterval(fire, 30_000);
+  }
+
+  /**
+   * Periodically re-issue any in-flight `MSG_BLOB_REQUEST` whose reply
+   * never arrived. Without this, a request frame dropped during a
+   * brief WS hiccup pinned the sidebar's "in flight" counter forever
+   * because the WASM client's request set is dedupe-only — it would
+   * never re-ask. Reproduced manually on a 1.2.0 vault stuck at
+   * "2 blobs · 7.2 MiB remaining".
+   *
+   * Sweep cadence (5 s) and stale threshold (15 s) chosen so a
+   * legitimately-slow large blob (~ 5 MiB at modest bandwidth) gets
+   * room to land before we retry, and so that retry traffic from a
+   * truly-lost request is bounded at one extra request every 15 s.
+   */
+  private static readonly BLOB_RETRY_SWEEP_MS = 5_000;
+  private static readonly BLOB_RETRY_STALE_AFTER_MS = 15_000;
+
+  startBlobRetrySweep() {
+    this.stopBlobRetrySweep();
+    this.blobRetryTimer = window.setInterval(() => {
+      if (!this.client?.isConnected()) return;
+      try {
+        this.client.retryStaleBlobRequests(
+          SynclinePlugin.BLOB_RETRY_STALE_AFTER_MS,
+        );
+      } catch (err) {
+        console.debug("[Syncline] retryStaleBlobRequests failed:", err);
+      }
+    }, SynclinePlugin.BLOB_RETRY_SWEEP_MS);
+  }
+
+  stopBlobRetrySweep() {
+    if (this.blobRetryTimer !== null) {
+      window.clearInterval(this.blobRetryTimer);
+      this.blobRetryTimer = null;
+    }
   }
 
   stopServerStatsPolling() {
