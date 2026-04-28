@@ -786,37 +786,61 @@ impl SynclineV1Client {
         let Some(node_id) = NodeId::parse_str(&node_id_hex) else {
             return;
         };
-        let content = self.content.borrow();
-        let Some(cd) = content.get(&node_id) else {
-            return;
-        };
-        let text = cd.doc.get_or_insert_text("text");
-        let mut txn = cd.doc.transact_mut();
-        let current = text.get_string(&txn);
-        if current == new_content {
-            return;
-        }
-        if current.is_empty() {
-            text.insert(&mut txn, 0, &new_content);
-            return;
-        }
-        if new_content.is_empty() {
-            text.remove_range(&mut txn, 0, current.len() as u32);
-            return;
-        }
-        let diff = dissimilar::diff(&current, &new_content);
-        let mut cursor = 0u32;
-        for chunk in diff {
-            match chunk {
-                dissimilar::Chunk::Equal(v) => cursor += v.len() as u32,
-                dissimilar::Chunk::Delete(v) => {
-                    text.remove_range(&mut txn, cursor, v.len() as u32);
-                }
-                dissimilar::Chunk::Insert(v) => {
-                    text.insert(&mut txn, cursor, v);
-                    cursor += v.len() as u32;
+        // `changed` flips true if the function actually mutates the
+        // text. Used below to decide whether to emit a sync-event for
+        // the activity feed — a no-op call shouldn't pollute it.
+        let mut changed = false;
+        let new_byte_len = new_content.len();
+        {
+            let content = self.content.borrow();
+            let Some(cd) = content.get(&node_id) else {
+                return;
+            };
+            let text = cd.doc.get_or_insert_text("text");
+            let mut txn = cd.doc.transact_mut();
+            let current = text.get_string(&txn);
+            if current == new_content {
+                return;
+            }
+            changed = true;
+            if current.is_empty() {
+                text.insert(&mut txn, 0, &new_content);
+            } else if new_content.is_empty() {
+                text.remove_range(&mut txn, 0, current.len() as u32);
+            } else {
+                let diff = dissimilar::diff(&current, &new_content);
+                let mut cursor = 0u32;
+                for chunk in diff {
+                    match chunk {
+                        dissimilar::Chunk::Equal(v) => cursor += v.len() as u32,
+                        dissimilar::Chunk::Delete(v) => {
+                            text.remove_range(&mut txn, cursor, v.len() as u32);
+                        }
+                        dissimilar::Chunk::Insert(v) => {
+                            text.insert(&mut txn, cursor, v);
+                            cursor += v.len() as u32;
+                        }
+                    }
                 }
             }
+        }
+
+        // Surface local text edits in the activity feed. Without this
+        // emission, the user's own `.md` edits never showed up, while
+        // every random binary blob_down lit up the feed — exactly the
+        // complaint that motivated this fix.
+        if changed {
+            let path: Option<String> = self
+                .manifest
+                .borrow()
+                .as_ref()
+                .and_then(|m| project(m).by_id.get(&node_id).map(|e| e.path.clone()));
+            self.handles().emit_sync_event(serde_json::json!({
+                "kind": "node_modified",
+                "path": path,
+                "hash": Option::<String>::None,
+                "bytes": new_byte_len,
+            }));
         }
     }
 
@@ -1187,6 +1211,27 @@ fn dispatch_frame(h: &Handles, ws: &WebSocket, data: &[u8]) {
                     &JsValue::from_str(&node_id.to_string_hyphenated()),
                 );
             }
+            // Surface this to the activity feed (#65 phase 4).
+            // Without this emission, text-file edits never appeared
+            // in "Recent activity" — only the binary blob_down/up
+            // paths did, which was confusing because every random
+            // dotfile broadcast lit up the feed but the user's own
+            // .md edits stayed silent.
+            //
+            // Path lookup is best-effort — for an STEP_2 / UPDATE we
+            // received before the matching manifest entry landed,
+            // we'd have no path yet; fall back to the node id.
+            let path: Option<String> = h
+                .manifest
+                .borrow()
+                .as_ref()
+                .and_then(|m| project(m).by_id.get(&node_id).map(|e| e.path.clone()));
+            h.emit_sync_event(serde_json::json!({
+                "kind": "node_modified",
+                "path": path,
+                "hash": Option::<String>::None,
+                "bytes": payload.len(),
+            }));
         }
         MSG_SYNC_STEP_1 => {
             let Some(node_id) = parse_content_doc_id(doc_id) else {
