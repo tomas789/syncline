@@ -128,17 +128,31 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         // --------------------------------------------------------------
         // Phase A — serverUrl change picks up; client is reinstantiated.
         // --------------------------------------------------------------
+        // Reset the self-write cookie so the hook's cookie guard (which
+        // exists to filter out the echo of our own saveSettings()) does
+        // NOT early-return. The before() block calls saveSettings within
+        // its setup; on a fast machine the test reaches the hook well
+        // within the 250 ms cookie window. Production behavior is
+        // tested separately in Phase D.
         await adapterRewriteDataJson({ kind: 'serverUrl', value: altServerUrl });
         const phaseA: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            plugin.lastSelfSaveAt = 0;
+            // Diagnostic: confirm the on-disk write is visible to
+            // loadData() before we trigger the hook. If raw is null
+            // here, the failure is at the IO layer, not the hook logic.
+            const raw = await plugin.loadData();
             const oldClient = plugin.client;
             await plugin.onExternalSettingsChange();
             return {
+                rawSeenByLoadData: raw,
                 settingsUrl: plugin.settings.serverUrl,
                 clientReinstantiated: plugin.client !== oldClient,
                 clientNotNull: !!plugin.client,
             };
         });
+        console.log(`[#90] phase A diagnostic: loadData saw serverUrl=${phaseA.rawSeenByLoadData?.serverUrl}`);
+        expect(phaseA.rawSeenByLoadData?.serverUrl).toBe(altServerUrl);
         expect(phaseA.settingsUrl).toBe(altServerUrl);
         expect(phaseA.clientReinstantiated).toBe(true);
         expect(phaseA.clientNotNull).toBe(true);
@@ -152,6 +166,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         await adapterRewriteDataJson({ kind: 'serverUrl', value: serverUrl });
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            plugin.lastSelfSaveAt = 0;
             await plugin.onExternalSettingsChange();
         });
         await waitFor('plugin reconnected to primary', async () => browser.executeObsidian(async ({ app }) => {
@@ -165,6 +180,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         await adapterRewriteDataJson({ kind: 'autoSync', value: false });
         const phaseB: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            plugin.lastSelfSaveAt = 0;
             await plugin.onExternalSettingsChange();
             return {
                 clientNull: plugin.client === null,
@@ -179,6 +195,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         await adapterRewriteDataJson({ kind: 'autoSync', value: true });
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            plugin.lastSelfSaveAt = 0;
             await plugin.onExternalSettingsChange();
         });
         await waitFor('plugin reconnected (post-B)', async () => browser.executeObsidian(async ({ app }) => {
@@ -195,6 +212,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         await adapterRewriteDataJson({ kind: 'actorId', value: fakeActorId });
         const phaseC: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            plugin.lastSelfSaveAt = 0;
             await plugin.onExternalSettingsChange();
             const adapter = (app as any).vault.adapter;
             const cd = (app as any).vault.configDir;
