@@ -1768,33 +1768,66 @@ export default class SynclinePlugin extends Plugin {
    */
   private async ensureBinaryInSync(row: ProjectionRow): Promise<void> {
     if (!this.client || !row.blob_hash) return;
-    const file = this.app.vault.getAbstractFileByPath(row.path);
-    if (file instanceof TFile) {
+
+    // First try the indexed vault. Fast path that hits Obsidian's
+    // in-memory file table directly.
+    const indexed = this.app.vault.getAbstractFileByPath(row.path);
+    if (indexed instanceof TFile) {
       try {
-        const data = await this.app.vault.readBinary(file);
+        const data = await this.app.vault.readBinary(indexed);
         const localHash = await sha256Hex(data);
         if (localHash === row.blob_hash) return;
         this.tryRequestBlob(row.blob_hash);
       } catch (e) {
-        // Disk-side I/O on a stale TFile — nothing to do.
         if (isMissingFileError(e)) return;
         console.error(`[Syncline] ensureBinaryInSync ${row.path}:`, e);
       }
-    } else {
-      // File missing on disk — request unconditionally. tryRequestBlob
-      // dedupes per-hash, but for the missing-file branch that's wrong:
-      // a previous request for this hash only wrote to whichever rows
-      // happened to be in lastProjection when the blob landed. Rows
-      // arriving in later manifest batches need their own delivery.
-      // Server still has the bytes; re-request is cheap.
-      if (!this.client.isConnected()) return;
-      try {
-        this.client.requestBlob(row.blob_hash);
-        this.requestedBlobs.add(row.blob_hash);
-      } catch (e) {
-        if (isNotConnectedError(e)) return;
-        console.error(`[Syncline] requestBlob ${row.blob_hash}:`, e);
+      return;
+    }
+
+    // Indexed vault doesn't see this path — but Obsidian deliberately
+    // hides dotfiles (anything starting with `.`) from `getFiles()`
+    // and `getAbstractFileByPath`. They're still on disk, and the
+    // adapter layer can see them. Without this fallback, every
+    // reconcile pass for a dotfile (e.g. `.gitignore`, `.env`,
+    // `.obsidianignore`) hit the "file missing" branch below,
+    // re-requested the same blob, the bytes landed via
+    // `onBlobReceived` (which uses the adapter so the file ended up
+    // on disk anyway), and the next reconcile re-requested again —
+    // visible to the user as the same handful of dot-paths spamming
+    // the activity feed forever.
+    try {
+      const adapter = this.app.vault.adapter;
+      if (await adapter.exists(row.path)) {
+        const data = await adapter.readBinary(row.path);
+        const localHash = await sha256Hex(data);
+        if (localHash === row.blob_hash) return;
+        this.tryRequestBlob(row.blob_hash);
+        return;
       }
+    } catch (e) {
+      if (!isMissingFileError(e)) {
+        console.error(
+          `[Syncline] ensureBinaryInSync adapter ${row.path}:`,
+          e,
+        );
+      }
+      // Fall through to the request-unconditionally path below.
+    }
+
+    // Truly missing on disk (neither the indexed vault nor the
+    // adapter found anything). Request unconditionally — `tryRequestBlob`
+    // dedupes per-hash, but for the missing-file branch that's wrong:
+    // a previous request for this hash only wrote to whichever rows
+    // happened to be in lastProjection when the blob landed. Rows
+    // arriving in later manifest batches need their own delivery.
+    if (!this.client.isConnected()) return;
+    try {
+      this.client.requestBlob(row.blob_hash);
+      this.requestedBlobs.add(row.blob_hash);
+    } catch (e) {
+      if (isNotConnectedError(e)) return;
+      console.error(`[Syncline] requestBlob ${row.blob_hash}:`, e);
     }
   }
 
