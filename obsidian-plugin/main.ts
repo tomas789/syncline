@@ -1242,6 +1242,7 @@ export default class SynclinePlugin extends Plugin {
       this.startStatusCheck();
       this.startServerStatsPolling();
       this.startBlobRetrySweep();
+      this.startHiddenFileScanner();
     } catch (error) {
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
@@ -1264,6 +1265,7 @@ export default class SynclinePlugin extends Plugin {
     this.stopStatusCheck();
     this.stopServerStatsPolling();
     this.stopBlobRetrySweep();
+    this.stopHiddenFileScanner();
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -1444,6 +1446,184 @@ export default class SynclinePlugin extends Plugin {
       } catch (e) {
         console.error(`[Syncline] scan: failed to ingest ${file.path}:`, e);
       }
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Hidden-file scan — Obsidian's `vault.getFiles()` and its event
+  // bus *only* report files indexed in the vault tree, which excludes
+  // everything under `.obsidian/`. That's where plugins, themes,
+  // snippets and per-vault settings live, and users (reasonably)
+  // expect those to sync across devices alongside their notes. The
+  // CLI sync sees those files because it walks the filesystem
+  // directly; the WASM client never could.
+  //
+  // This walks `.obsidian/` via `vault.adapter`, which IS allowed to
+  // see hidden paths. Walks every connect + on a slow timer (Obsidian
+  // doesn't surface fs events for these, so polling is the only
+  // option). Files matching the same default ignore patterns the
+  // CLI uses (workspace*.json, cache/, graph.json) are skipped.
+  // ---------------------------------------------------------------
+
+  /** How often to re-scan the config folder for changes. Mostly
+   *  captures edits made by Obsidian itself (plugin install /
+   *  settings save) — too quick wastes CPU hashing 1000 small JS
+   *  files; too slow and the user notices the lag. 30 s mirrors the
+   *  CLI's `SCAN_INTERVAL` default. */
+  private static readonly HIDDEN_SCAN_INTERVAL_MS = 30_000;
+
+  private hiddenScanTimer: number | null = null;
+
+  /** Roots the hidden-file scanner walks. `vault.configDir`
+   *  (typically `.obsidian` but configurable per Obsidian docs) is
+   *  the only one today — future expansion goes here. Must be a
+   *  property, not a static, because `configDir` isn't constant. */
+  private hiddenScanRoots(): string[] {
+    return [this.app.vault.configDir];
+  }
+
+  /** Per-device files inside the config folder that mustn't sync
+   *  (would clobber another peer's window layout, FTS cache, graph
+   *  node positions). Built dynamically so we honor a non-default
+   *  `configDir`. Mirrors `syncline/src/ignore.rs::DEFAULT_PATTERNS`
+   *  from PR #40 — keep the two lists in lockstep or peers diverge
+   *  on what does and doesn't sync.
+   *
+   *  Self-exclusion of `${cd}/plugins/${manifest.id}/` is critical:
+   *  the plugin stores its CRDT manifest, lamport counter, and
+   *  content blobs under that directory. Letting the scanner upload
+   *  them would (a) feedback-loop: write → scanner → upload →
+   *  broadcast → write, and (b) corrupt peers' manifest views by
+   *  treating one device's CRDT state as vault content. Same
+   *  precedent as LiveSync's hard-coded `/obsidian-livesync/` in
+   *  `syncInternalFilesIgnorePatterns`. */
+  private hiddenIgnorePatterns(): string[] {
+    const cd = this.app.vault.configDir;
+    return [
+      ".git/",
+      "node_modules/",
+      `${cd}/plugins/${this.manifest.id}/`,
+      `${cd}/workspace`,
+      `${cd}/workspace.json`,
+      `${cd}/workspace-mobile.json`,
+      `${cd}/cache/`,
+      `${cd}/graph.json`,
+    ];
+  }
+
+  private isHiddenIgnored(rel: string): boolean {
+    for (const pat of this.hiddenIgnorePatterns()) {
+      if (pat.endsWith("/")) {
+        const dir = pat.slice(0, -1);
+        if (rel === dir || rel.startsWith(pat)) return true;
+      } else if (rel === pat) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Walk `.obsidian/` (and friends) via the adapter and ingest /
+   *  reconcile every non-ignored file against the manifest. Cheap
+   *  to call repeatedly: files already in the manifest with matching
+   *  hashes are detected and skipped. */
+  private async scanHiddenFiles(): Promise<void> {
+    if (!this.client) return;
+    const adapter = this.app.vault.adapter;
+    const seen: string[] = [];
+    for (const root of this.hiddenScanRoots()) {
+      // Stack-driven walk so the closure stays sync for one root.
+      const stack: string[] = [root];
+      while (stack.length > 0) {
+        const dir = stack.pop()!;
+        try {
+          if (!(await adapter.exists(dir))) continue;
+          const listing = await adapter.list(dir);
+          for (const sub of listing.folders) {
+            // adapter.list returns paths relative to the vault root,
+            // which is what the manifest stores too. Compare with a
+            // trailing `/` for the directory ignore check.
+            if (this.isHiddenIgnored(sub + "/")) continue;
+            stack.push(sub);
+          }
+          for (const f of listing.files) {
+            if (this.isHiddenIgnored(f)) continue;
+            seen.push(f);
+          }
+        } catch (e) {
+          console.debug(`[Syncline] hidden scan list ${dir}:`, e);
+        }
+      }
+    }
+
+    for (const path of seen) {
+      try {
+        await this.ingestOrSyncHiddenFile(path);
+      } catch (e) {
+        console.error(`[Syncline] hidden scan ${path}:`, e);
+      }
+    }
+  }
+
+  /** Ingest one hidden file. Always treated as binary — `.obsidian/`
+   *  contents are JSON / JS / WASM, none of which want CRDT text
+   *  semantics, and the CLI side already classifies them as binary
+   *  (TEXT_EXTS = ["md","txt"]).
+   *
+   *  - Not in manifest → `createBinary` + `sendBlob`.
+   *  - Already in manifest with matching hash → no-op.
+   *  - Already in manifest with different hash → push the new bytes
+   *    via `recordModifyBinary`. */
+  private async ingestOrSyncHiddenFile(path: string): Promise<void> {
+    if (!this.client) return;
+    const adapter = this.app.vault.adapter;
+    let data: ArrayBuffer;
+    try {
+      data = await adapter.readBinary(path);
+    } catch (e) {
+      if (isMissingFileError(e)) return;
+      throw e;
+    }
+    const hash = await sha256Hex(data);
+    const bytes = new Uint8Array(data);
+    const row = this.lastProjection.get(path);
+    if (row) {
+      if (row.kind !== "binary") {
+        // Path collision with a text-kind manifest entry. Refuse to
+        // touch — projection's conflict-suffix rule will surface the
+        // mismatch on the next reconcile. Logging once is enough.
+        console.warn(
+          `[Syncline] hidden ${path} would collide with non-binary manifest entry`,
+        );
+        return;
+      }
+      if (row.blob_hash === hash) return;
+      if (this.client.isConnected()) {
+        this.client.sendBlob(bytes);
+      }
+      this.client.recordModifyBinary(path, hash, data.byteLength);
+      return;
+    }
+    if (this.client.isConnected()) {
+      this.client.sendBlob(bytes);
+    }
+    this.client.createBinary(path, hash, data.byteLength);
+  }
+
+  private startHiddenFileScanner() {
+    this.stopHiddenFileScanner();
+    // Run an initial scan immediately so plugins land within seconds
+    // of the WS handshake completing, not 30 s later.
+    void this.scanHiddenFiles();
+    this.hiddenScanTimer = window.setInterval(() => {
+      void this.scanHiddenFiles();
+    }, SynclinePlugin.HIDDEN_SCAN_INTERVAL_MS);
+  }
+
+  private stopHiddenFileScanner() {
+    if (this.hiddenScanTimer !== null) {
+      window.clearInterval(this.hiddenScanTimer);
+      this.hiddenScanTimer = null;
     }
   }
 
@@ -1863,6 +2043,24 @@ export default class SynclinePlugin extends Plugin {
       (r) => r.kind === "binary" && r.blob_hash === hash,
     );
     for (const row of matches) {
+      // Hash-equality guard. `ensureBinaryInSync` already gates the
+      // request side, but the local file can change between request
+      // and receive — another sync tool / user landing the same
+      // bytes, or a redundant re-delivery. Writing identical content
+      // still fires the fs-event; the scanner re-hashes and may
+      // re-broadcast. Skip when on-disk already matches.
+      try {
+        if (await this.app.vault.adapter.exists(row.path)) {
+          const existing = await this.app.vault.adapter.readBinary(row.path);
+          if ((await sha256Hex(existing)) === hash) continue;
+        }
+      } catch (e) {
+        if (!isMissingFileError(e)) {
+          console.debug(`[Syncline] hash guard read ${row.path}:`, e);
+        }
+        // Read failure shouldn't block delivery — fall through.
+      }
+
       const buffer = bytes.buffer.slice(
         bytes.byteOffset,
         bytes.byteOffset + bytes.byteLength,
