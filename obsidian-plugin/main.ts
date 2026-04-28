@@ -1487,11 +1487,23 @@ export default class SynclinePlugin extends Plugin {
    *  node positions). Built dynamically so we honor a non-default
    *  `configDir`. Mirrors `syncline/src/ignore.rs::DEFAULT_PATTERNS`
    *  from PR #40 — keep the two lists in lockstep or peers diverge
-   *  on what does and doesn't sync. */
+   *  on what does and doesn't sync.
+   *
+   *  Self-exclusion of `${cd}/plugins/${manifest.id}/` is critical:
+   *  the plugin stores its CRDT manifest, lamport counter, and
+   *  content blobs under that directory. Letting the scanner upload
+   *  them would (a) feedback-loop: write → scanner → upload →
+   *  broadcast → write, and (b) corrupt peers' manifest views by
+   *  treating one device's CRDT state as vault content. Same
+   *  precedent as LiveSync's hard-coded `/obsidian-livesync/` in
+   *  `syncInternalFilesIgnorePatterns`. */
   private hiddenIgnorePatterns(): string[] {
     const cd = this.app.vault.configDir;
     return [
       ".git/",
+      "node_modules/",
+      `${cd}/plugins/${this.manifest.id}/`,
+      `${cd}/workspace`,
       `${cd}/workspace.json`,
       `${cd}/workspace-mobile.json`,
       `${cd}/cache/`,
@@ -2031,6 +2043,24 @@ export default class SynclinePlugin extends Plugin {
       (r) => r.kind === "binary" && r.blob_hash === hash,
     );
     for (const row of matches) {
+      // Hash-equality guard. `ensureBinaryInSync` already gates the
+      // request side, but the local file can change between request
+      // and receive — another sync tool / user landing the same
+      // bytes, or a redundant re-delivery. Writing identical content
+      // still fires the fs-event; the scanner re-hashes and may
+      // re-broadcast. Skip when on-disk already matches.
+      try {
+        if (await this.app.vault.adapter.exists(row.path)) {
+          const existing = await this.app.vault.adapter.readBinary(row.path);
+          if ((await sha256Hex(existing)) === hash) continue;
+        }
+      } catch (e) {
+        if (!isMissingFileError(e)) {
+          console.debug(`[Syncline] hash guard read ${row.path}:`, e);
+        }
+        // Read failure shouldn't block delivery — fall through.
+      }
+
       const buffer = bytes.buffer.slice(
         bytes.byteOffset,
         bytes.byteOffset + bytes.byteLength,
