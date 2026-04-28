@@ -149,11 +149,22 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
             return true;
         }, 2 * 60_000, 200);
 
+        // Count only the corpus markdown rows. PR #89 added hidden-file
+        // sync, so the projection legitimately contains binary entries
+        // for files under `${configDir}/` (themes, snippets, settings).
+        // The bug under test (#58) creates `.md` conflict copies — the
+        // text-kind subset is what we need to assert against.
         const initialProjSize: number = await browser.executeObsidian(async ({ app }) => {
             const p: any = (app as any).plugins.plugins['syncline'];
-            return p?.lastProjection?.size ?? 0;
+            const proj = p?.lastProjection;
+            if (!proj) return 0;
+            let n = 0;
+            for (const row of proj.values()) {
+                if (row?.kind === 'text' && typeof row?.path === 'string' && row.path.endsWith('.md')) n++;
+            }
+            return n;
         });
-        console.log(`[#58] phase A: initial projection size = ${initialProjSize}, expected ${N_FILES}`);
+        console.log(`[#58] phase A: initial projection .md size = ${initialProjSize}, expected ${N_FILES}`);
         expect(initialProjSize).toBe(N_FILES);
 
         // Phase B: disconnect, wipe manifest cache, keep vault files +
@@ -230,22 +241,29 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         }, 3 * 60_000, 200);
 
         // Phase E: assert no conflict copies and projection size matches.
+        // Same .md-only filter as Phase A for the same reason.
         const finalProjSize: number = await browser.executeObsidian(async ({ app }) => {
             const p: any = (app as any).plugins.plugins['syncline'];
-            return p?.lastProjection?.size ?? 0;
+            const proj = p?.lastProjection;
+            if (!proj) return 0;
+            let n = 0;
+            for (const row of proj.values()) {
+                if (row?.kind === 'text' && typeof row?.path === 'string' && row.path.endsWith('.md')) n++;
+            }
+            return n;
         });
         const obs = listVault(vaultPath);
         const conflicts: string[] = [...obs.keys()].filter((k) => k.includes('.conflict-'));
         const allMd: string[] = [...obs.keys()].filter((k) => k.endsWith('.md'));
 
-        console.log(`[#58] phase E: projection=${finalProjSize}, vault_md=${allMd.length}, conflicts_on_disk=${conflicts.length}`);
+        console.log(`[#58] phase E: projection_md=${finalProjSize}, vault_md=${allMd.length}, conflicts_on_disk=${conflicts.length}`);
         if (conflicts.length > 0) {
             console.error(`[#58] conflict files (sample):`);
             for (const c of conflicts.slice(0, 10)) console.error(`   ${c}`);
         }
 
         expect(conflicts.length).toBe(0);
-        // Projection should not exceed N_FILES (any growth = conflict node was minted).
+        // Projection .md count should not exceed N_FILES (any growth = conflict node was minted).
         expect(finalProjSize).toBeLessThanOrEqual(N_FILES);
     });
 });
