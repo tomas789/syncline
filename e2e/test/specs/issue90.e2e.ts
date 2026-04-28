@@ -10,10 +10,13 @@
 //     on-disk state matches reality.
 //   - Ignore the echo of our own `saveSettings()` writes (250 ms cookie).
 //
-// Test strategy: write `data.json` from the test process (Node fs),
-// then invoke `plugin.onExternalSettingsChange()` directly. This
-// bypasses Obsidian's own fs-watcher (which is unreliable in xvfb /
-// headless chrome) and tests the plugin's logic deterministically.
+// Test strategy: write `data.json` via Obsidian's vault adapter (NOT
+// `Plugin.saveData`, so it counts as "external" from the plugin's
+// perspective), then invoke `plugin.onExternalSettingsChange()`
+// directly. We bypass Obsidian's own fs-watcher (unreliable under
+// xvfb / headless chrome) and bypass Node-side `fs.writeFileSync`
+// (the renderer's vault adapter may not see external fs writes
+// coherently in CI). Tests the plugin's logic deterministically.
 
 import { spawn, ChildProcess } from 'child_process';
 import { join } from 'path';
@@ -52,10 +55,24 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         return proc;
     }
 
-    async function rewriteDataJson(dataPath: string, mutator: (cur: any) => void) {
-        const cur = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-        mutator(cur);
-        fs.writeFileSync(dataPath, JSON.stringify(cur));
+    /**
+     * Mutate data.json via Obsidian's vault adapter — equivalent to what
+     * another in-Obsidian plugin or another adapter-based sync tool
+     * would do. Counts as "external" from this plugin's perspective
+     * (does NOT go through `this.saveData`), but stays adapter-coherent
+     * so the next `loadData()` call sees the new bytes immediately.
+     *
+     * Returns nothing; it's run inside Obsidian via executeObsidian.
+     */
+    async function adapterRewriteDataJson(mutation: { kind: 'serverUrl' | 'autoSync' | 'actorId'; value: any }) {
+        await browser.executeObsidian(async ({ app }, m) => {
+            const adapter = (app as any).vault.adapter;
+            const cd = (app as any).vault.configDir;
+            const path = `${cd}/plugins/syncline/data.json`;
+            const cur = JSON.parse(await adapter.read(path));
+            cur[m.kind] = m.value;
+            await adapter.write(path, JSON.stringify(cur));
+        }, mutation);
     }
 
     before(async function () {
@@ -97,20 +114,21 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
     it('reacts to external data.json changes correctly', async function () {
         this.timeout(2 * 60_000);
 
-        const vaultPath: string = await browser.executeObsidian(async ({ app }) => (app as any).vault.adapter.basePath as string);
-        const dataPath = join(vaultPath, '.obsidian', 'plugins', 'syncline', 'data.json');
-
-        if (!fs.existsSync(dataPath)) {
-            throw new Error(`data.json missing at ${dataPath}`);
-        }
-        const originalData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-        const originalActorId: string = originalData.actorId;
+        const originalActorId: string = await browser.executeObsidian(async ({ app }) => {
+            const adapter = (app as any).vault.adapter;
+            const cd = (app as any).vault.configDir;
+            const path = `${cd}/plugins/syncline/data.json`;
+            const exists = await adapter.exists(path);
+            if (!exists) throw new Error(`data.json missing at ${path}`);
+            const cur = JSON.parse(await adapter.read(path));
+            return cur.actorId;
+        });
         if (!originalActorId) throw new Error('plugin has no actorId yet — connect before this test');
 
         // --------------------------------------------------------------
         // Phase A — serverUrl change picks up; client is reinstantiated.
         // --------------------------------------------------------------
-        await rewriteDataJson(dataPath, (c) => { c.serverUrl = altServerUrl; });
+        await adapterRewriteDataJson({ kind: 'serverUrl', value: altServerUrl });
         const phaseA: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             const oldClient = plugin.client;
@@ -131,7 +149,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         console.log(`[#90] phase A: serverUrl change reflected, client reinstantiated, reconnected to ${altServerUrl}`);
 
         // Restore back to primary server for subsequent phases.
-        await rewriteDataJson(dataPath, (c) => { c.serverUrl = serverUrl; });
+        await adapterRewriteDataJson({ kind: 'serverUrl', value: serverUrl });
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.onExternalSettingsChange();
@@ -144,7 +162,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         // --------------------------------------------------------------
         // Phase B — autoSync: false disconnects the client.
         // --------------------------------------------------------------
-        await rewriteDataJson(dataPath, (c) => { c.autoSync = false; });
+        await adapterRewriteDataJson({ kind: 'autoSync', value: false });
         const phaseB: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.onExternalSettingsChange();
@@ -158,7 +176,7 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         console.log(`[#90] phase B: autoSync=false disconnected client`);
 
         // Restore autoSync, reconnect.
-        await rewriteDataJson(dataPath, (c) => { c.autoSync = true; });
+        await adapterRewriteDataJson({ kind: 'autoSync', value: true });
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.onExternalSettingsChange();
@@ -174,15 +192,21 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         //   external actorId would corrupt Yrs history across devices.
         // --------------------------------------------------------------
         const fakeActorId = '00000000-0000-4000-8000-deadbeefcafe';
-        await rewriteDataJson(dataPath, (c) => { c.actorId = fakeActorId; });
+        await adapterRewriteDataJson({ kind: 'actorId', value: fakeActorId });
         const phaseC: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             await plugin.onExternalSettingsChange();
-            return { inMemoryActor: plugin.settings.actorId };
+            const adapter = (app as any).vault.adapter;
+            const cd = (app as any).vault.configDir;
+            const path = `${cd}/plugins/syncline/data.json`;
+            const onDisk = JSON.parse(await adapter.read(path));
+            return {
+                inMemoryActor: plugin.settings.actorId,
+                onDiskActor: onDisk.actorId,
+            };
         });
-        const onDiskActor = JSON.parse(fs.readFileSync(dataPath, 'utf8')).actorId;
         expect(phaseC.inMemoryActor).toBe(originalActorId);
-        expect(onDiskActor).toBe(originalActorId);
+        expect(phaseC.onDiskActor).toBe(originalActorId);
         console.log(`[#90] phase C: actorId mismatch rejected; on-disk file restored`);
 
         // --------------------------------------------------------------
