@@ -66,11 +66,15 @@ const DEFAULT_CONFIG_SYNC: ConfigSyncCategories = {
   other: false,
 };
 
-interface SynclineSettings {
+/**
+ * Settings that are safe to share across devices via any sync
+ * mechanism (Obsidian Sync, LiveSync, syncline itself if the user
+ * ever opts data.json into the syncline-managed sync surface).
+ * Persisted to `${configDir}/plugins/syncline/data.json`.
+ */
+interface SharedSettings {
   serverUrl: string;
   autoSync: boolean;
-  /** Stable per-installation ActorId (UUIDv4, hyphenated). Minted on first run. */
-  actorId: string | null;
   /** Per-category opt-ins for syncing the Obsidian config folder.
    *  Replaces the single boolean from #92 — see ConfigSyncCategories
    *  for per-field defaults and rationale. Migrated on first load
@@ -79,12 +83,49 @@ interface SynclineSettings {
   configSync: ConfigSyncCategories;
 }
 
-const DEFAULT_SETTINGS: SynclineSettings = {
+/**
+ * Settings that are device-local and must NEVER propagate across
+ * devices. Persisted to `app.saveLocalStorage("syncline:local")`,
+ * which Obsidian shards per-vault and never includes in any sync
+ * surface. Future device-local fields (auth tokens, debug toggles,
+ * machine-specific paths) belong here.
+ *
+ * `actorId` is the most consequential of these: it's this device's
+ * CRDT identity. Two devices sharing one would corrupt Yrs history
+ * permanently.
+ */
+interface LocalSettings {
+  /** Stable per-device ActorId (UUIDv4). Minted on first run. */
+  actorId: string | null;
+}
+
+/**
+ * Flat in-memory shape used by the rest of the plugin. The split
+ * between shared and local only matters at persistence time: read in
+ * `loadSettings`, partition in `saveSettings`. Callers stay oblivious.
+ */
+interface SynclineSettings extends SharedSettings, LocalSettings {}
+
+const DEFAULT_SHARED_SETTINGS: SharedSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
-  actorId: null,
   configSync: DEFAULT_CONFIG_SYNC,
 };
+
+const DEFAULT_LOCAL_SETTINGS: LocalSettings = {
+  actorId: null,
+};
+
+const DEFAULT_SETTINGS: SynclineSettings = {
+  ...DEFAULT_SHARED_SETTINGS,
+  ...DEFAULT_LOCAL_SETTINGS,
+};
+
+/** localStorage key for the device-local settings blob. Obsidian's
+ *  `loadLocalStorage`/`saveLocalStorage` shard keys per-vault, so
+ *  this key namespaces only within a single vault — no further
+ *  vault-id suffix needed. */
+const LOCAL_SETTINGS_LS_KEY = "syncline:local-settings";
 
 /** Categories used by `classifyHiddenPath`. */
 type HiddenPathCategory =
@@ -902,6 +943,21 @@ export default class SynclinePlugin extends Plugin {
     );
     await this.migrateLegacyStateRoot();
     await this.migrateOnDiskStateToIndexedDB();
+
+    // #95: if loadSettings detected a pre-#95 install (actorId still
+    // in data.json, nothing in localStorage), eagerly partition now.
+    // The next saveSettings() would do this anyway when the user
+    // first toggles a setting or connects, but doing it up-front
+    // ensures the migration completes for users who never trigger
+    // either path.
+    if (this.deviceLocalMigrationNeeded) {
+      await this.saveSettings();
+      this.deviceLocalMigrationNeeded = false;
+      console.debug(
+        "[Syncline] migration: actorId moved from data.json to localStorage",
+      );
+    }
+
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
     this.statusBarItem = this.addStatusBarItem();
@@ -967,9 +1023,20 @@ export default class SynclinePlugin extends Plugin {
    *  the legacy field wasn't present. */
   private legacyBooleanValue: boolean | null = null;
 
+  /** Set in `loadSettings` if `data.json` still has an `actorId`
+   *  field (pre-#95 layout) AND localStorage doesn't yet have the
+   *  device-local settings blob. The next `saveSettings()` call
+   *  partitions naturally — writes data.json without actorId and
+   *  populates localStorage — but we also force one explicit save
+   *  in `onload()` so the migration completes even for users who
+   *  never edit settings or connect. */
+  private deviceLocalMigrationNeeded = false;
+
   async loadSettings() {
     const raw = (await this.loadData()) as
-      | (Partial<SynclineSettings> & { syncObsidianConfig?: boolean })
+      | (Partial<SynclineSettings> & {
+          syncObsidianConfig?: boolean;
+        })
       | null;
     const legacyValue =
       raw && typeof raw.syncObsidianConfig === "boolean"
@@ -1000,6 +1067,34 @@ export default class SynclinePlugin extends Plugin {
     // Drop the legacy field from the in-memory settings — the next
     // saveSettings() will write only the new shape.
     delete merged.syncObsidianConfig;
+
+    // #95: device-local subset lives in localStorage. Read order:
+    //   1. localStorage (post-migration, source of truth)
+    //   2. data.json's legacy `actorId` field (pre-#95, one-shot)
+    //   3. default (null — actorId minted on first connect)
+    const localRaw: unknown = this.app.loadLocalStorage(
+      LOCAL_SETTINGS_LS_KEY,
+    );
+    const localFromStorage =
+      localRaw && typeof localRaw === "object"
+        ? (localRaw as Partial<LocalSettings>)
+        : null;
+    if (
+      localFromStorage &&
+      typeof localFromStorage.actorId === "string"
+    ) {
+      // localStorage wins, even if data.json also has one (defensive
+      // posture against a buggy/external write that put actorId back
+      // into data.json).
+      merged.actorId = localFromStorage.actorId;
+    } else if (raw && typeof raw.actorId === "string") {
+      // Pre-#95 install: actorId in data.json. `merged.actorId`
+      // already reflects this via the Object.assign above; just
+      // mark the migration so onload eagerly saves the partitioned
+      // form.
+      this.deviceLocalMigrationNeeded = true;
+    }
+
     this.settings = merged;
   }
 
@@ -1013,7 +1108,20 @@ export default class SynclinePlugin extends Plugin {
 
   async saveSettings() {
     this.lastSelfSaveAt = Date.now();
-    await this.saveData(this.settings);
+    // #95: partition into shared (data.json) and local (localStorage).
+    // Shared gets `Plugin.saveData()`, eligible for cross-device sync
+    // if the user opts in. Local goes to `app.saveLocalStorage`,
+    // which Obsidian shards per-vault and never propagates.
+    const shared: SharedSettings = {
+      serverUrl: this.settings.serverUrl,
+      autoSync: this.settings.autoSync,
+      configSync: this.settings.configSync,
+    };
+    const local: LocalSettings = {
+      actorId: this.settings.actorId,
+    };
+    await this.saveData(shared);
+    this.app.saveLocalStorage(LOCAL_SETTINGS_LS_KEY, local);
   }
 
   /**
@@ -1047,12 +1155,19 @@ export default class SynclinePlugin extends Plugin {
       raw,
     ) as SynclineSettings;
 
+    // #95: actorId is device-local — lives in localStorage, never
+    // in data.json. Pin incoming.actorId to the in-memory value so
+    // a leftover `actorId` field in raw can't influence runtime
+    // state. If raw HAS the field (pre-#95 install or external write
+    // that added it back), we trigger a rewrite that strips it.
+    incoming.actorId = previous.actorId;
     let needsRewrite = false;
-    if (incoming.actorId !== previous.actorId) {
+    if (Object.prototype.hasOwnProperty.call(raw, "actorId")) {
+      const staleRaw = (raw as { actorId?: unknown }).actorId;
+      const stale = typeof staleRaw === "string" ? staleRaw : "(non-string)";
       console.warn(
-        `[Syncline] external data.json change tried to set actorId=${incoming.actorId} (current=${previous.actorId}) — keeping current; rewriting data.json`,
+        `[Syncline] external data.json carried actorId=${stale} — actorId now lives in localStorage. Rewriting data.json to drop the field.`,
       );
-      incoming.actorId = previous.actorId;
       needsRewrite = true;
     }
     this.settings = incoming;
@@ -2983,10 +3098,21 @@ class SynclineSettingTab extends PluginSettingTab {
       );
     }
 
-    new Setting(containerEl).setName("Identity").setHeading();
+    new Setting(containerEl).setName("This device").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Identifiers and state below are device-local. They live in this " +
+        "vault's localStorage, never in data.json, and are never propagated " +
+        "by any sync mechanism — including syncline itself if you opt " +
+        "data.json into the synced surface.",
+    });
     new Setting(containerEl)
       .setName("Actor ID")
-      .setDesc("Stable per-installation identifier used for sync authorship.")
+      .setDesc(
+        "Stable per-device CRDT identity. Two devices sharing one " +
+          "would corrupt history permanently, so this is never synced.",
+      )
       .addText((text) => {
         text
           .setPlaceholder("(minted on first connect)")
