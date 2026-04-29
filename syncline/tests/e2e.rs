@@ -742,6 +742,114 @@ async fn test_initial_bootstrap_clean_server_does_not_create_phantom_conflicts()
     );
 }
 
+/// Hypothesis A4 / "suspenders" for #107 — does scan_once mint manifest
+/// entries for stale conflict-sibling artifacts on disk?
+///
+/// This test isolates the periodic-scan path. The cookie fix
+/// (planned for `syncline/src/client/watcher.rs`, mirroring #91)
+/// suppresses watcher events for paths the CLI just wrote — but
+/// the periodic timer at `client_v1.rs:583` runs `scan_once`
+/// every `SCAN_INTERVAL` (30 s) regardless of recent writes. If a
+/// conflict-sibling-format file is sitting on disk when that timer
+/// fires (e.g. left over from a previous bug run, copied in by an
+/// external tool, or restored from backup), `scan_once` will walk
+/// it, find no projection entry at that path, and `create_text` /
+/// `create_binary` mint a fresh manifest entry with the local
+/// actor. The cookie does nothing for this — no recent self-write
+/// to suppress.
+///
+/// This test is the **decision point** the reviewer asked for:
+///   * If FAIL on current (unfixed) code → cookie alone is not
+///     enough; the fix must also teach `scan_once` to recognise
+///     the conflict-sibling regex and skip those paths.
+///   * If PASS on current code → the cookie alone closes everything;
+///     no suspenders needed.
+///
+/// Setup:
+///   1. Pre-populate client 0's folder with one legitimate file
+///      and five files matching `client_v1::conflict_sibling_path`'s
+///      output format (`<stem> (conflict YYYY-MM-DD <hash8>).<ext>`).
+///   2. Bring up two clients. Client 0's first `scan_once` walks
+///      everything that's already on disk; client 1 sits empty,
+///      receiving anything 0 pushes.
+///   3. Assert: the legitimate file propagates; the artifacts do
+///      not.
+#[tokio::test]
+async fn test_scan_once_skips_stale_conflict_sibling_artifacts() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Empty receiver, started first. Mirrors a peer that joins
+    // before the artifacts get pushed.
+    let receiver_dir = TempDir::new().unwrap();
+    let _receiver = spawn_client(receiver_dir.path(), port).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Pre-populate sender BEFORE starting `syncline sync`. The
+    // first scan_once after the WS handshake walks every file
+    // already on disk and decides whether to mint a manifest entry
+    // for each one.
+    let sender_dir = TempDir::new().unwrap();
+    fs::write(
+        sender_dir.path().join("real-note.md"),
+        "legitimate user content\n",
+    )
+    .unwrap();
+    for i in 0..5 {
+        let stale = sender_dir
+            .path()
+            .join(format!("phantom-{i} (conflict 2026-01-15 deadbeef).md"));
+        fs::write(&stale, format!("stale artifact {i}\n")).unwrap();
+    }
+
+    let _sender = spawn_client(sender_dir.path(), port).await;
+
+    // Wait long enough for: WS handshake → first MANIFEST_SYNC →
+    // first scan_once → push manifest update → server broadcast →
+    // receiver reconcile materialise. Keep the wait under
+    // SCAN_INTERVAL (30 s) so a second periodic scan_once doesn't
+    // muddy the picture.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // Sanity: legitimate file propagated. If this fails the test
+    // setup is broken, not the bug.
+    assert!(
+        receiver_dir.path().join("real-note.md").is_file(),
+        "real-note.md did not propagate to receiver — test setup broken"
+    );
+
+    // Hypothesis: stale conflict-sibling artifacts MUST NOT
+    // propagate. scan_once should recognise the format and refuse
+    // to mint manifest entries for those paths. Without the
+    // suspenders fix, scan_once treats them as normal new files
+    // and mints — which then propagates to every other peer.
+    let mut leaked = Vec::new();
+    for i in 0..5 {
+        let phantom = receiver_dir
+            .path()
+            .join(format!("phantom-{i} (conflict 2026-01-15 deadbeef).md"));
+        if phantom.is_file() {
+            leaked.push(phantom);
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "Suspenders missing: {} stale conflict-sibling artifact(s) on \
+         the sender's disk were minted into the manifest by `scan_once` \
+         and propagated to the receiver: {:?}. \
+         The cookie fix (#91-style) on the watcher does not cover this \
+         path because the artifacts were not written by the CLI itself; \
+         scan_once needs an explicit conflict-sibling-format check \
+         before calling `create_text` / `create_binary`. (#107)",
+        leaked.len(),
+        leaked,
+    );
+}
+
 /// Hypothesis B for #107 — the 100 % CPU + freeze the user observed
 /// on Obsidian startup is a downstream effect of the conflict
 /// explosion (hypothesis A2). With ~900 phantom conflict siblings in
