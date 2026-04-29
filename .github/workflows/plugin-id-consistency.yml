@@ -51,10 +51,11 @@ jobs:
         run: |
           count=$(grep -c "syncline-obsidian" obsidian-plugin/main.ts || true)
           # Expected occurrences in the legacy-migration block:
-          #  1. comment in stateRoot getter
-          #  2. literal in legacyStateRoot getter
-          #  3. comment in migrateLegacyStateRoot doc-block
-          expected=3
+          #  1. literal in legacyStateRoot getter
+          #  2. comment in migrateLegacyStateRoot doc-block
+          # (#94 removed the stateRoot getter and its comment, dropping
+          #  the count from 3 to 2.)
+          expected=2
           if [ "$count" -ne "$expected" ]; then
             echo "::error::main.ts contains $count occurrences of \"syncline-obsidian\"; expected $expected."
             echo "::error::Either remove the new reference or update the expected count in this workflow."
