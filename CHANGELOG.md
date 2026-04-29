@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.0](https://github.com/tomas789/syncline/compare/v1.3.0...v1.4.0) (2026-04-29)
+
+
+### Features
+
+* **plugin:** device-local settings override — closes [#95](https://github.com/tomas789/syncline/issues/95) ([#106](https://github.com/tomas789/syncline/issues/106)) ([500e27d](https://github.com/tomas789/syncline/commit/500e27d9605fba4487e11518747d64b142bfd3ab))
+* **plugin:** hook onExternalSettingsChange — closes [#90](https://github.com/tomas789/syncline/issues/90) ([#101](https://github.com/tomas789/syncline/issues/101)) ([3bf2c75](https://github.com/tomas789/syncline/commit/3bf2c755e4f0822e6d77c32dbf924c6f8eabeef2))
+* **plugin:** opt-in default for .obsidian/ syncing — closes [#92](https://github.com/tomas789/syncline/issues/92) ([#103](https://github.com/tomas789/syncline/issues/103)) ([d6b67da](https://github.com/tomas789/syncline/commit/d6b67da6b5edfea76d977281d8b6f677198f7749))
+* **plugin:** per-category data.json sync allow-list — closes [#93](https://github.com/tomas789/syncline/issues/93) ([#104](https://github.com/tomas789/syncline/issues/104)) ([363c1af](https://github.com/tomas789/syncline/commit/363c1af0dd1abec459cf7c41888c1178a2a75e64))
+* **plugin:** relocate CRDT state cache to IndexedDB — closes [#94](https://github.com/tomas789/syncline/issues/94) ([#105](https://github.com/tomas789/syncline/issues/105)) ([f3bde32](https://github.com/tomas789/syncline/commit/f3bde3218676684bf7a9de568d596af2db8bcd20))
+* **plugin:** self-write fs-event suppression cookie — closes [#91](https://github.com/tomas789/syncline/issues/91) ([#102](https://github.com/tomas789/syncline/issues/102)) ([0e5d38e](https://github.com/tomas789/syncline/commit/0e5d38e9e80d6f50ca6c33dbbbc0d5b90fd26de3))
+* **plugin:** sync the Obsidian config folder — completes [#40](https://github.com/tomas789/syncline/issues/40) ([#89](https://github.com/tomas789/syncline/issues/89)) ([e290949](https://github.com/tomas789/syncline/commit/e290949e131b33037733458e666a43218620dffb))
+
+
+### Bug Fixes
+
+* **plugin:** stop the dotfile activity-feed loop, surface text edits ([#88](https://github.com/tomas789/syncline/issues/88)) ([03c4558](https://github.com/tomas789/syncline/commit/03c4558060f9274e1d0322c7fca4a3f799e325d7))
+
 ## [1.3.0](https://github.com/tomas789/syncline/compare/v1.2.0...v1.3.0) (2026-04-27)
 
 
