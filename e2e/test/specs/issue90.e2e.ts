@@ -114,14 +114,12 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
     it('reacts to external data.json changes correctly', async function () {
         this.timeout(2 * 60_000);
 
+        // Post-#95: actorId lives in localStorage, not data.json.
+        // Read it from in-memory settings (which loadSettings already
+        // populated from localStorage).
         const originalActorId: string = await browser.executeObsidian(async ({ app }) => {
-            const adapter = (app as any).vault.adapter;
-            const cd = (app as any).vault.configDir;
-            const path = `${cd}/plugins/syncline/data.json`;
-            const exists = await adapter.exists(path);
-            if (!exists) throw new Error(`data.json missing at ${path}`);
-            const cur = JSON.parse(await adapter.read(path));
-            return cur.actorId;
+            const plugin: any = (app as any).plugins.plugins['syncline'];
+            return plugin.settings.actorId;
         });
         if (!originalActorId) throw new Error('plugin has no actorId yet — connect before this test');
 
@@ -204,9 +202,12 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
         }), 30_000, 100);
 
         // --------------------------------------------------------------
-        // Phase C — actorId mismatch is REJECTED; data.json is restored.
-        //   This is the highest-stakes assertion: silently accepting an
-        //   external actorId would corrupt Yrs history across devices.
+        // Phase C — actorId injected via data.json is REJECTED.
+        //   Post-#95 actorId lives in localStorage; if a buggy sync
+        //   tool puts the field back into data.json, the hook must
+        //   ignore it and rewrite data.json without it.
+        //   Silently accepting an external actorId would corrupt Yrs
+        //   history across devices.
         // --------------------------------------------------------------
         const fakeActorId = '00000000-0000-4000-8000-deadbeefcafe';
         await adapterRewriteDataJson({ kind: 'actorId', value: fakeActorId });
@@ -220,12 +221,14 @@ describe('Syncline #90 — onExternalSettingsChange', () => {
             const onDisk = JSON.parse(await adapter.read(path));
             return {
                 inMemoryActor: plugin.settings.actorId,
-                onDiskActor: onDisk.actorId,
+                actorIdFieldOnDisk: Object.prototype.hasOwnProperty.call(onDisk, 'actorId'),
             };
         });
         expect(phaseC.inMemoryActor).toBe(originalActorId);
-        expect(phaseC.onDiskActor).toBe(originalActorId);
-        console.log(`[#90] phase C: actorId mismatch rejected; on-disk file restored`);
+        // Post-#95: actorId is never persisted to data.json. The
+        // rewrite triggered by the rejection strips the leftover key.
+        expect(phaseC.actorIdFieldOnDisk).toBe(false);
+        console.log(`[#90] phase C: actorId injection rejected; data.json sanitized`);
 
         // --------------------------------------------------------------
         // Phase D — self-write echo within the cookie window is ignored.
