@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/tomas789/syncline/compare/v1.4.0...v1.4.1) (2026-04-29)
+
+
+### Bug Fixes
+
+* **client:** drop self-write loop that creates phantom conflict files (closes [#107](https://github.com/tomas789/syncline/issues/107)) ([#108](https://github.com/tomas789/syncline/issues/108)) ([57631a8](https://github.com/tomas789/syncline/commit/57631a8ec03ad76a68efa6fd7c137b213ee23025))
+
 ## [1.4.0](https://github.com/tomas789/syncline/compare/v1.3.0...v1.4.0) (2026-04-29)
 
 
