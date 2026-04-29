@@ -805,8 +805,79 @@ export default class SynclinePlugin extends Plugin {
     ) as SynclineSettings;
   }
 
+  /** Wall-clock of the last `saveSettings()` call. Used by
+   *  `onExternalSettingsChange` to ignore the echo of our own write
+   *  in case Obsidian's own filtering doesn't catch every case
+   *  (e.g. on a slow filesystem the change event lands later than
+   *  expected). 250 ms is the same window LiveSync uses. */
+  private lastSelfSaveAt = 0;
+  private static readonly EXTERNAL_SETTINGS_SELF_WRITE_WINDOW_MS = 250;
+
   async saveSettings() {
+    this.lastSelfSaveAt = Date.now();
     await this.saveData(this.settings);
+  }
+
+  /**
+   * Obsidian fires this when our `data.json` is rewritten by something
+   * other than this plugin instance — typically a separate sync tool
+   * propagating settings across devices, or the user editing the file
+   * by hand to recover from a bad state.
+   *
+   * Apply the safe subset (server URL, autoSync), but refuse to
+   * overwrite `actorId`. `actorId` is this device's CRDT identity:
+   * if two devices ever mint Yrs updates with the same actor, history
+   * is corrupted permanently. So if an external write tries to change
+   * it, keep ours and rewrite `data.json` to match — that way the on-
+   * disk state ends up consistent with what we'll actually use, and
+   * the next external sync round won't keep proposing a bad value.
+   */
+  async onExternalSettingsChange() {
+    if (
+      Date.now() - this.lastSelfSaveAt <
+      SynclinePlugin.EXTERNAL_SETTINGS_SELF_WRITE_WINDOW_MS
+    ) {
+      return;
+    }
+    const raw = (await this.loadData()) as Partial<SynclineSettings> | null;
+    if (!raw) return;
+
+    const previous = { ...this.settings };
+    const incoming: SynclineSettings = Object.assign(
+      {},
+      DEFAULT_SETTINGS,
+      raw,
+    ) as SynclineSettings;
+
+    let needsRewrite = false;
+    if (incoming.actorId !== previous.actorId) {
+      console.warn(
+        `[Syncline] external data.json change tried to set actorId=${incoming.actorId} (current=${previous.actorId}) — keeping current; rewriting data.json`,
+      );
+      incoming.actorId = previous.actorId;
+      needsRewrite = true;
+    }
+    this.settings = incoming;
+    if (needsRewrite) {
+      await this.saveSettings();
+    }
+
+    if (previous.serverUrl !== incoming.serverUrl) {
+      // URL changed: tear down and rebind. Honor autoSync for the
+      // reconnect — same policy as a settings-tab edit.
+      if (this.client) {
+        this.disconnect();
+      }
+      if (incoming.autoSync) {
+        await this.connect();
+      }
+    } else if (previous.autoSync !== incoming.autoSync) {
+      if (incoming.autoSync && !this.client) {
+        await this.connect();
+      } else if (!incoming.autoSync && this.client) {
+        this.disconnect();
+      }
+    }
   }
 
   // ---------------------------------------------------------------
