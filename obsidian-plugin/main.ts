@@ -23,12 +23,22 @@ interface SynclineSettings {
   autoSync: boolean;
   /** Stable per-installation ActorId (UUIDv4, hyphenated). Minted on first run. */
   actorId: string | null;
+  /** Sync the Obsidian config folder (themes, snippets, plugin
+   *  settings). Defaults to OFF for new installs — propagating
+   *  `.obsidian/` across devices breaks per-device workflows
+   *  (hotkey schemes, themes, vault-specific plugin tuning). Mirrors
+   *  Remotely-Save and LiveSync's default-off posture. Existing
+   *  installs that already had hidden-file state when this setting
+   *  was introduced are auto-migrated to true (see `migrationNeeded`
+   *  in `loadSettings` / `connect`). */
+  syncObsidianConfig: boolean;
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
   actorId: null,
+  syncObsidianConfig: false,
 };
 
 /**
@@ -872,11 +882,23 @@ export default class SynclinePlugin extends Plugin {
     this.disconnect();
   }
 
+  /** Set during `loadSettings` if `data.json` lacks the
+   *  `syncObsidianConfig` key. Triggers the one-time migration in
+   *  `connect()` that flips the flag to `true` for installs that were
+   *  already running PR #89's always-on hidden-file sync. Cleared
+   *  after the migration runs (or after `saveSettings` writes the
+   *  decided value) so we don't re-migrate. */
+  private syncObsidianConfigMigrationNeeded = false;
+
   async loadSettings() {
+    const raw = (await this.loadData()) as Partial<SynclineSettings> | null;
+    this.syncObsidianConfigMigrationNeeded =
+      !raw ||
+      !Object.prototype.hasOwnProperty.call(raw, "syncObsidianConfig");
     this.settings = Object.assign(
       {},
       DEFAULT_SETTINGS,
-      await this.loadData(),
+      raw,
     ) as SynclineSettings;
   }
 
@@ -952,6 +974,19 @@ export default class SynclinePlugin extends Plugin {
       } else if (!incoming.autoSync && this.client) {
         this.disconnect();
       }
+    } else if (
+      previous.syncObsidianConfig !== incoming.syncObsidianConfig &&
+      this.client
+    ) {
+      // Toggling `.obsidian/` sync via an external rewrite. Start /
+      // stop the scanner so the running plugin matches the new flag,
+      // then re-reconcile to pick up (or drop) hidden manifest rows.
+      if (incoming.syncObsidianConfig) {
+        this.startHiddenFileScanner();
+      } else {
+        this.stopHiddenFileScanner();
+      }
+      void this.reconcileProjection();
     }
   }
 
@@ -1295,6 +1330,25 @@ export default class SynclinePlugin extends Plugin {
         this.client.initManifest();
       }
 
+      // One-time migration for installs that ran PR #89 before #92
+      // landed: if `data.json` lacks `syncObsidianConfig` AND the
+      // persisted manifest already has any `${configDir}/...` rows,
+      // the user was relying on the old always-on behavior — flip the
+      // flag to `true` so their existing sync flow keeps working
+      // without surprise. Fresh installs (manifest empty) and new
+      // users who explicitly chose `false` are left alone.
+      if (this.syncObsidianConfigMigrationNeeded) {
+        const projection = this.readProjection();
+        if (projection.some((r) => this.isUnderHiddenRoot(r.path))) {
+          this.settings.syncObsidianConfig = true;
+          console.debug(
+            "[Syncline] migration: existing hidden-file state detected → syncObsidianConfig=true",
+          );
+        }
+        this.syncObsidianConfigMigrationNeeded = false;
+        await this.saveSettings();
+      }
+
       // The WASM observer fires synchronously while it still holds a
       // mutable borrow on the manifest RefCell. If we run reconcile
       // here, its synchronous `projectionJson()` re-enters the same
@@ -1388,7 +1442,9 @@ export default class SynclinePlugin extends Plugin {
       this.startStatusCheck();
       this.startServerStatsPolling();
       this.startBlobRetrySweep();
-      this.startHiddenFileScanner();
+      if (this.settings.syncObsidianConfig) {
+        this.startHiddenFileScanner();
+      }
     } catch (error) {
       console.error("[Syncline] Connection error:", error);
       this.updateStatus("error");
@@ -1669,6 +1725,17 @@ export default class SynclinePlugin extends Plugin {
     return false;
   }
 
+  /** True iff `path` lives under any of the hidden scan roots
+   *  (typically `.obsidian/`). Used by `reconcileProjectionInner` to
+   *  drop hidden manifest rows when `syncObsidianConfig` is off, and
+   *  by tests to spot hidden-state during migration. */
+  private isUnderHiddenRoot(path: string): boolean {
+    for (const root of this.hiddenScanRoots()) {
+      if (path === root || path.startsWith(root + "/")) return true;
+    }
+    return false;
+  }
+
   /** Walk `.obsidian/` (and friends) via the adapter and ingest /
    *  reconcile every non-ignored file against the manifest. Cheap
    *  to call repeatedly: files already in the manifest with matching
@@ -1761,7 +1828,7 @@ export default class SynclinePlugin extends Plugin {
     this.client.createBinary(path, hash, data.byteLength);
   }
 
-  private startHiddenFileScanner() {
+  startHiddenFileScanner() {
     this.stopHiddenFileScanner();
     // Run an initial scan immediately so plugins land within seconds
     // of the WS handshake completing, not 30 s later.
@@ -1776,7 +1843,7 @@ export default class SynclinePlugin extends Plugin {
     }, SynclinePlugin.HIDDEN_SCAN_INTERVAL_MS);
   }
 
-  private stopHiddenFileScanner() {
+  stopHiddenFileScanner() {
     if (this.hiddenScanTimer !== null) {
       window.clearInterval(this.hiddenScanTimer);
       this.hiddenScanTimer = null;
@@ -1836,7 +1903,19 @@ export default class SynclinePlugin extends Plugin {
 
   private async reconcileProjectionInner(): Promise<void> {
     if (!this.client) return;
-    const projection = this.readProjection();
+    // When `.obsidian/` syncing is off, drop hidden manifest rows from
+    // the projection used by reconcile. Effects:
+    //   - byPath / byId / lastProjection don't carry hidden rows.
+    //   - The folder pre-creation and per-row write loops below skip
+    //     hidden paths.
+    //   - onBlobReceived's `lastProjection` filter won't match hidden
+    //     rows, so inbound blobs for hidden paths are not written to
+    //     disk. Server-side entries persist (just not materialized
+    //     locally) so the user can re-enable later without loss.
+    const rawProjection = this.readProjection();
+    const projection = this.settings.syncObsidianConfig
+      ? rawProjection
+      : rawProjection.filter((r) => !this.isUnderHiddenRoot(r.path));
     const byPath = new Map<string, ProjectionRow>();
     const byId = new Map<string, ProjectionRow>();
     for (const row of projection) {
@@ -1846,6 +1925,17 @@ export default class SynclinePlugin extends Plugin {
 
     // --- Removals: paths that were in the prior projection but aren't now ---
     for (const [path, prev] of this.lastProjection) {
+      // When syncObsidianConfig is off, hidden rows are filtered out
+      // of `byId` above; they look "removed" to this loop even though
+      // they're still valid manifest entries. Skip them — deleting the
+      // user's local `.obsidian/...` files just because we toggled
+      // sync off would be a hostile UX.
+      if (
+        !this.settings.syncObsidianConfig &&
+        this.isUnderHiddenRoot(path)
+      ) {
+        continue;
+      }
       if (!byId.has(prev.id)) {
         await this.removeLocalFile(path);
         this.subscribedContent.delete(prev.id);
@@ -2422,6 +2512,36 @@ class SynclineSettingTab extends PluginSettingTab {
           this.plugin.disconnect();
           void this.plugin.connect();
         }),
+      );
+
+    new Setting(containerEl).setName("Sync scope").setHeading();
+
+    new Setting(containerEl)
+      .setName("Sync Obsidian config folder")
+      .setDesc(
+        `Off by default. When enabled, propagates themes, snippets, and ` +
+          `community-plugin settings under ${this.plugin.app.vault.configDir}/ across all devices ` +
+          `sharing this vault. Per-device customizations (hotkey schemes, ` +
+          `theme overrides, vault-specific plugin tuning) will be overwritten.`,
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.syncObsidianConfig)
+          .onChange(async (value) => {
+            this.plugin.settings.syncObsidianConfig = value;
+            await this.plugin.saveSettings();
+            // Match running plugin state to the new flag and re-reconcile
+            // so hidden manifest rows are picked up (or dropped) without
+            // requiring a reconnect.
+            if (this.plugin.client) {
+              if (value) {
+                this.plugin.startHiddenFileScanner();
+              } else {
+                this.plugin.stopHiddenFileScanner();
+              }
+              void this.plugin.reconcileProjection();
+            }
+          }),
       );
 
     new Setting(containerEl).setName("Identity").setHeading();
