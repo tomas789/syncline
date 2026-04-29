@@ -151,20 +151,33 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         }, 2 * 60_000, 200);
         console.log(`[#57] phase A: initial convergence done`);
 
-        // Phase B: disconnect, then wipe vault md files + plugin v1/content/.
-        // Keep manifest.bin so the next connect()'s reconcile sees the
-        // full projection synchronously and races the WS handshake.
-        await browser.executeObsidian(async ({ app }) => {
+        // Phase B: disconnect, then wipe vault md files + plugin's
+        // per-node content snapshots from storage. Keep the manifest
+        // snapshot so the next connect()'s reconcile sees the full
+        // projection synchronously and races the WS handshake.
+        //
+        // (Pre-#94 this code wiped `${configDir}/plugins/syncline/v1/content/*.bin`
+        // directly via Node fs. After #94 the content snapshots live
+        // in IndexedDB inside the renderer; reach them through the
+        // plugin's storage abstraction.)
+        const wipeStorageResult: any = await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
+            // Capture the manifest before disconnect so we can verify
+            // it's still in storage after the wipe.
+            const projection = plugin.client
+                ? JSON.parse(plugin.client.projectionJson())
+                : [];
+            const nodeIds: string[] = projection.map((r: any) => r.id);
             plugin.disconnect();
-        });
-
-        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline', 'v1');
-        if (fs.existsSync(join(stateDir, 'content'))) {
-            for (const f of fs.readdirSync(join(stateDir, 'content'))) {
-                fs.unlinkSync(join(stateDir, 'content', f));
+            for (const id of nodeIds) {
+                await plugin.storage.deleteContent(id);
             }
-        }
+            const manifestStillThere = await plugin.storage.getManifest();
+            return {
+                wiped: nodeIds.length,
+                manifestPresent: !!(manifestStillThere && manifestStillThere.length > 0),
+            };
+        });
         // Wipe vault .md / .txt files (keep dirs and dotfiles).
         function wipeFiles(dir: string) {
             for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -176,15 +189,15 @@ describe('Syncline #57 — STEP_1 dropped before WS handshake', () => {
         }
         wipeFiles(vaultPath);
 
-        // Sanity: manifest.bin still there, content/.bin gone, vault empty of .md.
-        if (!fs.existsSync(join(stateDir, 'manifest.bin'))) {
-            throw new Error('manifest.bin missing — wipe was too aggressive');
+        // Sanity: manifest snapshot still in storage, content snapshots gone, vault empty of .md.
+        if (!wipeStorageResult.manifestPresent) {
+            throw new Error('manifest snapshot missing from storage — wipe was too aggressive');
         }
         const remainingMds = [...listVault(vaultPath).keys()].filter((k) => k.endsWith('.md')).length;
         if (remainingMds !== 0) {
             throw new Error(`vault still has ${remainingMds} .md files — wipe failed`);
         }
-        console.log(`[#57] phase B: cache + vault wiped, manifest.bin retained`);
+        console.log(`[#57] phase B: ${wipeStorageResult.wiped} content snapshots + vault wiped, manifest retained`);
 
         // Drain Obsidian's vault watcher (Chokidar on Linux) before
         // we plug back in. Chokidar batches and aggregates filesystem

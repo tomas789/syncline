@@ -167,15 +167,23 @@ describe('Syncline #58 — synthetic onFileCreate on vault load creates conflict
         console.log(`[#58] phase A: initial projection .md size = ${initialProjSize}, expected ${N_FILES}`);
         expect(initialProjSize).toBe(N_FILES);
 
-        // Phase B: disconnect, wipe manifest cache, keep vault files +
-        // content cache (Obsidian still has the TFile tree).
+        // Phase B: disconnect, wipe manifest cache from storage, keep
+        // vault files + content cache (Obsidian still has the TFile
+        // tree). Pre-#94 the manifest cache lived on disk; after #94
+        // it's in IndexedDB, so we reach it through the plugin's
+        // storage abstraction.
         await browser.executeObsidian(async ({ app }) => {
             const plugin: any = (app as any).plugins.plugins['syncline'];
             plugin.disconnect();
+            // Wipe the manifest snapshot + lamport from storage so
+            // the next connect()'s `loadManifestFromStorage` returns
+            // null and reconcile starts from empty `lastProjection`.
+            // Use setManifest with an empty bytes blob — getManifest
+            // treats zero-length as null, mirroring the pre-#94
+            // contract where `manifest.bin` not on disk meant null.
+            await plugin.storage.setManifest(new Uint8Array(0));
+            plugin.storage.setLamport(0);
         });
-        const stateDir = join(vaultPath, '.obsidian', 'plugins', 'syncline', 'v1');
-        if (fs.existsSync(join(stateDir, 'manifest.bin'))) fs.unlinkSync(join(stateDir, 'manifest.bin'));
-        if (fs.existsSync(join(stateDir, 'lamport.txt'))) fs.unlinkSync(join(stateDir, 'lamport.txt'));
         console.log(`[#58] phase B: manifest cache wiped (vault files retained)`);
 
         // Phase C: reconnect, wait for server's manifest STEP_2 to land

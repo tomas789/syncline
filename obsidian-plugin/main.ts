@@ -13,6 +13,11 @@ import {
 // @ts-ignore - rollup base64-inlines the .wasm binary at build time.
 import wasmBinary from "./wasm/syncline_bg.wasm";
 import * as wasmModule from "./wasm/syncline.js";
+import {
+  IndexedDBSynclineStorage,
+  SynclineStorage,
+  getOrMintVaultId,
+} from "./storage";
 
 // ---------------------------------------------------------------------------
 // Settings & persistence layout
@@ -878,6 +883,12 @@ export default class SynclinePlugin extends Plugin {
   reconnectTimeout: number | null = null;
   reconnectAttempts = 0;
 
+  /** IndexedDB-backed CRDT state cache. Replaces the on-disk
+   *  persistence under `${configDir}/plugins/syncline/v1/` so the
+   *  hidden-file scanner cannot observe (and therefore can't echo /
+   *  re-broadcast) the plugin's own state. Created in `onload`. */
+  storage!: SynclineStorage;
+
   // ---------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------
@@ -885,7 +896,12 @@ export default class SynclinePlugin extends Plugin {
   async onload() {
     console.debug("[Syncline] Loading plugin (v1)…");
     await this.loadSettings();
+    this.storage = new IndexedDBSynclineStorage(
+      this.app,
+      getOrMintVaultId(this.app),
+    );
     await this.migrateLegacyStateRoot();
+    await this.migrateOnDiskStateToIndexedDB();
     this.addSettingTab(new SynclineSettingTab(this.app, this));
 
     this.statusBarItem = this.addStatusBarItem();
@@ -1081,36 +1097,19 @@ export default class SynclinePlugin extends Plugin {
   // On-disk persistence for CRDT state
   // ---------------------------------------------------------------
 
-  /** Root folder for v1 CRDT snapshots — separate from any v0 leftovers. */
-  private get stateRoot(): string {
-    // Use the plugin's own manifest id rather than a literal so this never
-    // drifts again. Pre-1.1.6 installs wrote state under "syncline-obsidian";
-    // migrateLegacyStateRoot() handles the relocation on first load.
-    return `${this.app.vault.configDir}/plugins/${this.manifest.id}/v1`;
-  }
-  /** Pre-1.1.6 state-root path. Only consulted by migrateLegacyStateRoot(). */
+  /** Pre-1.1.6 state-root path. Only consulted by
+   *  migrateLegacyStateRoot() during the on-disk era; #94 has since
+   *  moved everything off disk, so this is dead-letter except for
+   *  cleanup of leftover legacy directories. */
   private get legacyStateRoot(): string {
     return `${this.app.vault.configDir}/plugins/syncline-obsidian/v1`;
   }
-  private get manifestPath(): string {
-    return `${this.stateRoot}/manifest.bin`;
-  }
-  private get lamportPath(): string {
-    return `${this.stateRoot}/lamport.txt`;
-  }
-  private contentPath(nodeId: string): string {
-    return `${this.stateRoot}/content/${nodeId}.bin`;
-  }
-
-  private async ensureStateRoot(): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    if (!(await adapter.exists(this.stateRoot))) {
-      await adapter.mkdir(this.stateRoot);
-    }
-    const contentDir = `${this.stateRoot}/content`;
-    if (!(await adapter.exists(contentDir))) {
-      await adapter.mkdir(contentDir);
-    }
+  /** Pre-#94 state-root: where the plugin used to keep its CRDT
+   *  snapshots before they moved to IndexedDB. Only consulted by
+   *  `migrateOnDiskStateToIndexedDB()` to find leftover files to
+   *  copy over and delete. */
+  private get preIndexedDBStateRoot(): string {
+    return `${this.app.vault.configDir}/plugins/${this.manifest.id}/v1`;
   }
 
   /**
@@ -1130,7 +1129,7 @@ export default class SynclinePlugin extends Plugin {
   private async migrateLegacyStateRoot(): Promise<void> {
     const adapter = this.app.vault.adapter;
     const legacy = this.legacyStateRoot;
-    const target = this.stateRoot;
+    const target = this.preIndexedDBStateRoot;
 
     // If the manifest id ever happens to equal the legacy literal (e.g. a
     // future revert), legacy === target and there's nothing to migrate.
@@ -1189,19 +1188,110 @@ export default class SynclinePlugin extends Plugin {
     }
   }
 
-  private async loadManifestFromDisk(): Promise<{ state: Uint8Array; lamport: number } | null> {
+  /**
+   * One-time migration from the on-disk state cache (pre-#94) to
+   * IndexedDB. Reads any leftover files under
+   * `${configDir}/plugins/<id>/v1/`, copies them into the storage
+   * abstraction, and removes the on-disk artifacts. Idempotent: a
+   * second run finds nothing to migrate and is a no-op.
+   *
+   * Runs in `onload` after `migrateLegacyStateRoot()` consolidates
+   * pre-1.1.6 paths, so we only need to handle the single
+   * `preIndexedDBStateRoot` location.
+   */
+  private async migrateOnDiskStateToIndexedDB(): Promise<void> {
     const adapter = this.app.vault.adapter;
-    if (!(await adapter.exists(this.manifestPath))) return null;
+    const root = this.preIndexedDBStateRoot;
+    let exists = false;
     try {
-      const state = new Uint8Array(await adapter.readBinary(this.manifestPath));
-      let lamport = 0;
-      if (await adapter.exists(this.lamportPath)) {
-        const txt = await adapter.read(this.lamportPath);
-        lamport = Number.parseInt(txt.trim(), 10) || 0;
-      }
-      return { state, lamport };
+      exists = await adapter.exists(root);
     } catch (e) {
-      console.error("[Syncline] Failed to load manifest from disk:", e);
+      console.error("[Syncline] migrateOnDisk: stat failed:", e);
+      return;
+    }
+    if (!exists) return;
+
+    let migratedAny = false;
+
+    // Manifest + lamport.
+    const manifestPath = `${root}/manifest.bin`;
+    const lamportPath = `${root}/lamport.txt`;
+    try {
+      if (await adapter.exists(manifestPath)) {
+        const bytes = new Uint8Array(await adapter.readBinary(manifestPath));
+        if (bytes.length > 0) {
+          await this.storage.setManifest(bytes);
+          migratedAny = true;
+        }
+        await adapter.remove(manifestPath);
+      }
+      if (await adapter.exists(lamportPath)) {
+        const txt = await adapter.read(lamportPath);
+        const n = Number.parseInt(txt.trim(), 10);
+        if (Number.isFinite(n)) {
+          this.storage.setLamport(n);
+          migratedAny = true;
+        }
+        await adapter.remove(lamportPath);
+      }
+    } catch (e) {
+      console.error("[Syncline] migrateOnDisk: manifest/lamport failed:", e);
+    }
+
+    // Content blobs.
+    const contentDir = `${root}/content`;
+    try {
+      if (await adapter.exists(contentDir)) {
+        const listing = await adapter.list(contentDir);
+        for (const file of listing.files) {
+          const name = file.split("/").pop() ?? "";
+          if (!name.endsWith(".bin")) continue;
+          const nodeId = name.slice(0, -4);
+          try {
+            const bytes = new Uint8Array(await adapter.readBinary(file));
+            await this.storage.putContent(nodeId, bytes);
+            await adapter.remove(file);
+            migratedAny = true;
+          } catch (e) {
+            console.error(`[Syncline] migrateOnDisk: content ${file}:`, e);
+          }
+        }
+        try {
+          await adapter.rmdir(contentDir, false);
+        } catch {
+          // Non-empty (residual files we couldn't migrate) or already
+          // gone — either way, leave as-is.
+        }
+      }
+    } catch (e) {
+      console.error("[Syncline] migrateOnDisk: content dir failed:", e);
+    }
+
+    // Empty state root → remove. If still has stragglers, leave it
+    // (the user / a future migration pass can deal with it).
+    try {
+      const post = await adapter.list(root);
+      if (post.files.length === 0 && post.folders.length === 0) {
+        await adapter.rmdir(root, false);
+      }
+    } catch {
+      // tolerated
+    }
+
+    if (migratedAny) {
+      console.debug(
+        "[Syncline] Migrated on-disk CRDT state cache → IndexedDB.",
+      );
+    }
+  }
+
+  private async loadManifestFromStorage(): Promise<{ state: Uint8Array; lamport: number } | null> {
+    try {
+      const state = await this.storage.getManifest();
+      if (!state || state.length === 0) return null;
+      return { state, lamport: this.storage.getLamport() };
+    } catch (e) {
+      console.error("[Syncline] Failed to load manifest from storage:", e);
       return null;
     }
   }
@@ -1209,17 +1299,21 @@ export default class SynclinePlugin extends Plugin {
   private async persistManifest(): Promise<void> {
     if (!this.client) return;
     try {
-      await this.ensureStateRoot();
       const snap = this.client.manifestSnapshot();
       // Zero-length means uninitialised — don't clobber.
       if (!snap || snap.length === 0) return;
-      const buffer = snap.buffer.slice(
-        snap.byteOffset,
-        snap.byteOffset + snap.byteLength,
-      ) as ArrayBuffer;
-      await this.app.vault.adapter.writeBinary(this.manifestPath, buffer);
-      const lamport = String(this.client.lamport());
-      await this.app.vault.adapter.write(this.lamportPath, lamport);
+      // Copy into a plain Uint8Array detached from the WASM heap.
+      // IndexedDB structured-clones the value before storing it, but
+      // the WASM-backed view becomes invalid the moment the WASM
+      // module reallocates its memory; copying first guarantees the
+      // bytes survive the next allocation.
+      const detached = new Uint8Array(snap.length);
+      detached.set(snap);
+      await this.storage.setManifest(detached);
+      // The wasm-bindgen binding for u64 surfaces as bigint at
+      // runtime even though the .d.ts declares `number`. Coerce
+      // explicitly so the storage layer always sees a JS number.
+      this.storage.setLamport(Number(this.client.lamport()));
     } catch (e) {
       console.error("[Syncline] Failed to persist manifest:", e);
     }
@@ -1228,15 +1322,9 @@ export default class SynclinePlugin extends Plugin {
   private persistManifestDebounced = debounce(() => void this.persistManifest(), 500, false);
 
   private async loadContentState(nodeId: string): Promise<Uint8Array | null> {
-    const adapter = this.app.vault.adapter;
-    const p = this.contentPath(nodeId);
-    if (!(await adapter.exists(p))) return null;
     try {
-      return new Uint8Array(await adapter.readBinary(p));
+      return await this.storage.getContent(nodeId);
     } catch (e) {
-      // exists() returned true but read raced with a concurrent
-      // removeContentState — treat as "no state" and move on.
-      if (isMissingFileError(e)) return null;
       console.error(`[Syncline] Failed to load content state ${nodeId}:`, e);
       return null;
     }
@@ -1245,30 +1333,21 @@ export default class SynclinePlugin extends Plugin {
   private async persistContentState(nodeId: string): Promise<void> {
     if (!this.client) return;
     try {
-      await this.ensureStateRoot();
       const snap = this.client.contentSnapshot(nodeId);
       if (!snap) return;
-      const buffer = snap.buffer.slice(
-        snap.byteOffset,
-        snap.byteOffset + snap.byteLength,
-      ) as ArrayBuffer;
-      await this.app.vault.adapter.writeBinary(this.contentPath(nodeId), buffer);
+      const detached = new Uint8Array(snap.length);
+      detached.set(snap);
+      await this.storage.putContent(nodeId, detached);
     } catch (e) {
       console.error(`[Syncline] Failed to persist content ${nodeId}:`, e);
     }
   }
 
   private async removeContentState(nodeId: string): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    const p = this.contentPath(nodeId);
-    if (await adapter.exists(p)) {
-      try {
-        await adapter.remove(p);
-      } catch (e) {
-        // Concurrent remove already cleaned this up — that's fine.
-        if (isMissingFileError(e)) return;
-        console.error(`[Syncline] Failed to remove content state ${nodeId}:`, e);
-      }
+    try {
+      await this.storage.deleteContent(nodeId);
+    } catch (e) {
+      console.error(`[Syncline] Failed to remove content state ${nodeId}:`, e);
     }
   }
 
@@ -1409,8 +1488,7 @@ export default class SynclinePlugin extends Plugin {
         await this.saveSettings();
       }
 
-      await this.ensureStateRoot();
-      const persisted = await this.loadManifestFromDisk();
+      const persisted = await this.loadManifestFromStorage();
       if (persisted) {
         this.client.loadManifestState(persisted.state, persisted.lamport);
       } else {
@@ -1841,14 +1919,16 @@ export default class SynclinePlugin extends Plugin {
    *  from PR #40 — keep the two lists in lockstep or peers diverge
    *  on what does and doesn't sync.
    *
-   *  Self-exclusion of `${cd}/plugins/${manifest.id}/` is critical:
-   *  the plugin stores its CRDT manifest, lamport counter, and
-   *  content blobs under that directory. Letting the scanner upload
-   *  them would (a) feedback-loop: write → scanner → upload →
-   *  broadcast → write, and (b) corrupt peers' manifest views by
-   *  treating one device's CRDT state as vault content. Same
-   *  precedent as LiveSync's hard-coded `/obsidian-livesync/` in
-   *  `syncInternalFilesIgnorePatterns`. */
+   *  Self-exclusion of `${cd}/plugins/${manifest.id}/` covers two
+   *  things: (1) our own `data.json` settings, which contain device-
+   *  local state (actorId, server URL); (2) defense-in-depth for the
+   *  CRDT state cache, which since #94 lives in IndexedDB and is no
+   *  longer observable to the scanner — but if a future change ever
+   *  reintroduces an on-disk artifact under this dir, this rule
+   *  prevents an immediate self-sync loop. The
+   *  `ingestOrSyncHiddenFile` call site logs an error when this rule
+   *  is bypassed (the only way a path under our dir reaches it is via
+   *  a bug). */
   private hiddenIgnorePatterns(): string[] {
     const cd = this.app.vault.configDir;
     return [
@@ -1861,6 +1941,16 @@ export default class SynclinePlugin extends Plugin {
       `${cd}/cache/`,
       `${cd}/graph.json`,
     ];
+  }
+
+  /** True iff `path` lives inside this plugin's own folder. Used by
+   *  `ingestOrSyncHiddenFile` as a defense-in-depth check — the
+   *  ignore-pattern logic should keep us out, but if a regression
+   *  ever lets a path under our own folder slip through to the
+   *  ingest step, we want a loud error rather than a silent loop. */
+  private isOwnPluginPath(path: string): boolean {
+    const ownRoot = `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    return path === ownRoot || path.startsWith(ownRoot + "/");
   }
 
   private isHiddenIgnored(rel: string): boolean {
@@ -2032,6 +2122,20 @@ export default class SynclinePlugin extends Plugin {
    *    via `recordModifyBinary`. */
   private async ingestOrSyncHiddenFile(path: string): Promise<void> {
     if (!this.client) return;
+    if (this.isOwnPluginPath(path)) {
+      // Should be unreachable: the ignore patterns in
+      // `hiddenIgnorePatterns` keep our own folder out of the
+      // scanner's `seen` list. Reaching this branch means the
+      // ignore logic regressed. Don't actually ingest — that would
+      // re-introduce the loop the IndexedDB relocation eliminated —
+      // and shout loudly so the regression gets noticed.
+      console.error(
+        `[Syncline] BUG: ingestOrSyncHiddenFile reached own plugin folder (${path}). ` +
+          "The hidden-file scanner's ignore rule should have filtered this out. " +
+          "Refusing to upload — please file an issue with reproduction steps.",
+      );
+      return;
+    }
     const adapter = this.app.vault.adapter;
     let data: ArrayBuffer;
     try {
