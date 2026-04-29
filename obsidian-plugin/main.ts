@@ -179,6 +179,8 @@ async function initWasm(): Promise<WasmModule> {
  */
 const IGNORE_CHANGES_TIMEOUT_MS = 1000;
 
+type SelfWriteKind = "modify" | "create" | "delete" | "rename";
+
 /** Extensions that project as text nodes (Y.Text CRDT). Everything else is binary. */
 const TEXT_EXTENSIONS = new Set(["md", "txt"]);
 
@@ -658,16 +660,89 @@ export default class SynclinePlugin extends Plugin {
   client: SynclineV1Client | null = null;
   /**
    * Per-event-kind suppression of vault echoes that follow our own writes.
-   * Keyed by event type ("modify"|"create"|"delete"|"rename") then path.
-   * Suppressing a `modify` echo on `foo.md` must not suppress a later
-   * `rename` of the same path, so the kinds are tracked separately.
+   * Keyed by event type then path → expiry timestamp (Date.now() + TTL).
+   *
+   * Why per-kind: suppressing a `modify` echo on `foo.md` must not
+   * suppress a later user-initiated `rename` of the same path, so the
+   * kinds are tracked separately.
+   *
+   * Why expiry timestamps (not setTimeout): timestamp-based expiry is
+   * deterministic and lazy-sweeps on read. setTimeout cleanup races
+   * against plugin unload (timers can fire after `disconnect()` clears
+   * unrelated state) and against successive writes to the same path
+   * (the second timer overwrites the first's window).
+   *
+   * Use `markSelfWrite` and `isSelfWriteEcho` rather than touching the
+   * maps directly.
    */
-  ignoreEvents: { modify: Set<string>; create: Set<string>; delete: Set<string>; rename: Set<string> } = {
-    modify: new Set(),
-    create: new Set(),
-    delete: new Set(),
-    rename: new Set(),
+  selfWriteCookies: {
+    modify: Map<string, number>;
+    create: Map<string, number>;
+    delete: Map<string, number>;
+    rename: Map<string, number>;
+  } = {
+    modify: new Map(),
+    create: new Map(),
+    delete: new Map(),
+    rename: new Map(),
   };
+
+  /** Stamp `path` as a self-write under `kind` so the next fs event for
+   *  that pair is dropped as an echo of our own work. The window is
+   *  `IGNORE_CHANGES_TIMEOUT_MS` (1 s) — long enough to outrun the
+   *  onFileModify debounce + Obsidian's vault watcher latency, short
+   *  enough that a user action on the same path within the window is
+   *  rare. Call IMMEDIATELY before the corresponding vault.* /
+   *  vault.adapter.* write, while still on the same microtask. */
+  private markSelfWrite(kind: SelfWriteKind, path: string): void {
+    this.selfWriteCookies[kind].set(
+      path,
+      Date.now() + IGNORE_CHANGES_TIMEOUT_MS,
+    );
+  }
+
+  /** True iff `path` was stamped under `kind` and the cookie hasn't
+   *  expired yet. Lazy-sweeps the entry on expiry so a path that fires
+   *  no event after its window doesn't accumulate. */
+  private isSelfWriteEcho(kind: SelfWriteKind, path: string): boolean {
+    const exp = this.selfWriteCookies[kind].get(path);
+    if (exp === undefined) return false;
+    if (Date.now() >= exp) {
+      this.selfWriteCookies[kind].delete(path);
+      return false;
+    }
+    return true;
+  }
+
+  /** True iff `path` was stamped under any kind and is unexpired.
+   *  Used by the hidden-file scanner where we don't track which
+   *  CRUD verb landed it on disk. */
+  private isAnySelfWriteEcho(path: string): boolean {
+    return (
+      this.isSelfWriteEcho("modify", path) ||
+      this.isSelfWriteEcho("create", path) ||
+      this.isSelfWriteEcho("delete", path) ||
+      this.isSelfWriteEcho("rename", path)
+    );
+  }
+
+  /** Drop every cookie whose expiry is in the past. Bounds memory usage
+   *  for paths whose corresponding fs event never fired (no-op writes,
+   *  events suppressed elsewhere). Lazy sweep on read handles the
+   *  common case; this is the periodic safety net. */
+  private sweepExpiredSelfWriteCookies(): void {
+    const now = Date.now();
+    for (const m of [
+      this.selfWriteCookies.modify,
+      this.selfWriteCookies.create,
+      this.selfWriteCookies.delete,
+      this.selfWriteCookies.rename,
+    ]) {
+      for (const [path, exp] of m) {
+        if (now >= exp) m.delete(path);
+      }
+    }
+  }
 
   /** Last projection we reconciled against — keyed by path. */
   lastProjection: Map<string, ProjectionRow> = new Map();
@@ -1347,7 +1422,7 @@ export default class SynclinePlugin extends Plugin {
       this.client.free();
       this.client = null;
     }
-    for (const k of Object.values(this.ignoreEvents)) k.clear();
+    for (const m of Object.values(this.selfWriteCookies)) m.clear();
     this.lastProjection.clear();
     this.subscribedContent.clear();
     this.requestedBlobs.clear();
@@ -1619,6 +1694,11 @@ export default class SynclinePlugin extends Plugin {
           }
           for (const f of listing.files) {
             if (this.isHiddenIgnored(f)) continue;
+            // Skip files we just wrote ourselves. Without this, an
+            // inbound blob landing on a hidden path (via onBlobReceived)
+            // is immediately picked back up by the next scan tick and
+            // re-broadcast — exact loop the cookie exists to break.
+            if (this.isAnySelfWriteEcho(f)) continue;
             seen.push(f);
           }
         } catch (e) {
@@ -1687,6 +1767,11 @@ export default class SynclinePlugin extends Plugin {
     // of the WS handshake completing, not 30 s later.
     void this.scanHiddenFiles();
     this.hiddenScanTimer = window.setInterval(() => {
+      // Lazy sweeps in `isSelfWriteEcho` clean up entries on read,
+      // but cookies for paths whose echo never fires (e.g. the write
+      // was a no-op or the fs event was lost) accumulate. Periodic
+      // full sweep on the same cadence as the scanner bounds memory.
+      this.sweepExpiredSelfWriteCookies();
       void this.scanHiddenFiles();
     }, SynclinePlugin.HIDDEN_SCAN_INTERVAL_MS);
   }
@@ -1791,8 +1876,8 @@ export default class SynclinePlugin extends Plugin {
     // lookups otherwise). Then iterate per-row serially.
     //
     // Tried Promise.all over the per-row loop; it was *slower* on real
-    // vaults — desktop adapter contention + 1k concurrent setTimeouts
-    // for ignoreEvents cleanup added more wall time than it saved.
+    // vaults — desktop adapter contention + concurrent self-write
+    // cookie writes added more wall time than it saved.
     // The serial loop also yields between rows so STEP_2/blob frames
     // can land and be processed mid-walk, which is itself a win.
     const parentDirs = new Set<string>();
@@ -1820,14 +1905,12 @@ export default class SynclinePlugin extends Plugin {
       if (row.kind === "text") {
         if (!(existing instanceof TFile)) {
           try {
-            this.ignoreEvents.create.add(row.path);
+            this.markSelfWrite("create", row.path);
             await this.app.vault.create(row.path, "");
           } catch (e) {
             if (!isAlreadyExistsError(e)) {
               console.error(`[Syncline] create placeholder ${row.path}:`, e);
             }
-          } finally {
-            setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
           }
         }
         if (!this.subscribedContent.has(row.id)) {
@@ -1844,7 +1927,7 @@ export default class SynclinePlugin extends Plugin {
   private async removeLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
-    this.ignoreEvents.delete.add(path);
+    this.markSelfWrite("delete", path);
     try {
       await this.app.fileManager.trashFile(file);
     } catch (e) {
@@ -1852,8 +1935,6 @@ export default class SynclinePlugin extends Plugin {
       // CRDT-side removal already happened, so this is a no-op locally.
       if (isMissingFileError(e)) return;
       console.error(`[Syncline] trash ${path}:`, e);
-    } finally {
-      setTimeout(() => this.ignoreEvents.delete.delete(path), IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
 
@@ -1862,8 +1943,8 @@ export default class SynclinePlugin extends Plugin {
     if (!(file instanceof TFile)) return;
     try {
       await this.ensureParentFolders(to);
-      this.ignoreEvents.rename.add(from);
-      this.ignoreEvents.rename.add(to);
+      this.markSelfWrite("rename", from);
+      this.markSelfWrite("rename", to);
       await this.app.fileManager.renameFile(file, to);
     } catch (e) {
       // Source no longer on disk (Obsidian's index hadn't caught up) —
@@ -1873,11 +1954,6 @@ export default class SynclinePlugin extends Plugin {
       // we'll converge on the next reconcile pass.
       if (isAlreadyExistsError(e)) return;
       console.error(`[Syncline] rename ${from} → ${to}:`, e);
-    } finally {
-      setTimeout(() => {
-        this.ignoreEvents.rename.delete(from);
-        this.ignoreEvents.rename.delete(to);
-      }, IGNORE_CHANGES_TIMEOUT_MS);
     }
   }
 
@@ -1966,23 +2042,21 @@ export default class SynclinePlugin extends Plugin {
           // deleted out from under us. Treat it as "needs to be (re-)
           // written" — fall through to write the CRDT content via the
           // adapter so the file is restored on disk.
-          this.ignoreEvents.modify.add(row.path);
+          this.markSelfWrite("modify", row.path);
           await this.ensureParentFolders(row.path);
           await this.app.vault.adapter.write(row.path, text);
           return;
         }
         if (current === text) return;
-        this.ignoreEvents.modify.add(row.path);
+        this.markSelfWrite("modify", row.path);
         await this.app.vault.modify(file, text);
       } catch (e) {
         console.error(`[Syncline] modify ${row.path}:`, e);
-      } finally {
-        setTimeout(() => this.ignoreEvents.modify.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     } else {
       try {
         await this.ensureParentFolders(row.path);
-        this.ignoreEvents.create.add(row.path);
+        this.markSelfWrite("create", row.path);
         try {
           await this.app.vault.create(row.path, text);
         } catch (e) {
@@ -1995,8 +2069,6 @@ export default class SynclinePlugin extends Plugin {
         }
       } catch (e) {
         console.error(`[Syncline] create ${row.path}:`, e);
-      } finally {
-        setTimeout(() => this.ignoreEvents.create.delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -2137,8 +2209,8 @@ export default class SynclinePlugin extends Plugin {
         bytes.byteOffset + bytes.byteLength,
       ) as ArrayBuffer;
       const file = this.app.vault.getAbstractFileByPath(row.path);
-      const kind: 'modify' | 'create' = file instanceof TFile ? 'modify' : 'create';
-      this.ignoreEvents[kind].add(row.path);
+      const kind: SelfWriteKind = file instanceof TFile ? "modify" : "create";
+      this.markSelfWrite(kind, row.path);
       try {
         if (file instanceof TFile) {
           await this.app.vault.modifyBinary(file, buffer);
@@ -2155,8 +2227,6 @@ export default class SynclinePlugin extends Plugin {
         }
       } catch (e) {
         console.error(`[Syncline] write blob → ${row.path}:`, e);
-      } finally {
-        setTimeout(() => this.ignoreEvents[kind].delete(row.path), IGNORE_CHANGES_TIMEOUT_MS);
       }
     }
   }
@@ -2167,7 +2237,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileModify = debounce(async (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreEvents.modify.has(file.path)) return;
+    if (this.isSelfWriteEcho("modify", file.path)) return;
     if (!this.client) return;
 
     const row = this.lastProjection.get(file.path);
@@ -2180,7 +2250,7 @@ export default class SynclinePlugin extends Plugin {
     if (row.kind === "text") {
       try {
         const content = await this.app.vault.read(file);
-        if (this.ignoreEvents.modify.has(file.path)) return;
+        if (this.isSelfWriteEcho("modify", file.path)) return;
         const crdtContent = this.client.getContentText(row.id) ?? "";
         if (crdtContent === content) return;
         this.client.updateContentText(row.id, content);
@@ -2195,7 +2265,7 @@ export default class SynclinePlugin extends Plugin {
     } else if (row.kind === "binary") {
       try {
         const data = await this.app.vault.readBinary(file);
-        if (this.ignoreEvents.modify.has(file.path)) return;
+        if (this.isSelfWriteEcho("modify", file.path)) return;
         const hash = await sha256Hex(data);
         if (row.blob_hash === hash) return;
         this.client.sendBlob(new Uint8Array(data));
@@ -2209,7 +2279,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileCreate = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreEvents.create.has(file.path)) return;
+    if (this.isSelfWriteEcho("create", file.path)) return;
     void this.ingestNewFile(file);
   };
 
@@ -2273,7 +2343,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileDelete = (file: TAbstractFile) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreEvents.delete.has(file.path)) return;
+    if (this.isSelfWriteEcho("delete", file.path)) return;
     if (!this.client) return;
     const row = this.lastProjection.get(file.path);
     if (!row) return;
@@ -2288,7 +2358,7 @@ export default class SynclinePlugin extends Plugin {
 
   onFileRename = (file: TAbstractFile, oldPath: string) => {
     if (!(file instanceof TFile)) return;
-    if (this.ignoreEvents.rename.has(oldPath) || this.ignoreEvents.rename.has(file.path)) return;
+    if (this.isSelfWriteEcho("rename", oldPath) || this.isSelfWriteEcho("rename", file.path)) return;
     if (!this.client) return;
     const row = this.lastProjection.get(oldPath);
     if (row) {
