@@ -18,28 +18,79 @@ import * as wasmModule from "./wasm/syncline.js";
 // Settings & persistence layout
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-category toggles for `.obsidian/` syncing. Replaces #92's
+ * single boolean with the granularity the spec in #93 calls for:
+ * the safe categories (themes, snippets, hotkeys, core config) are on
+ * by default; community-plugin metadata and per-plugin data are off
+ * and require explicit opt-in. Mirrors Obsidian Sync's selective-sync
+ * UI, with stricter defaults for the high-conflict surfaces.
+ */
+interface ConfigSyncCategories {
+  /** `${configDir}/themes/**`. Default ON. */
+  themes: boolean;
+  /** `${configDir}/snippets/**`. Default ON. */
+  snippets: boolean;
+  /** `${configDir}/hotkeys.json`. Default ON. */
+  hotkeys: boolean;
+  /** `${configDir}/{app,appearance,core-plugins,core-plugins-migration}.json`. Default ON. */
+  coreConfig: boolean;
+  /** `${configDir}/community-plugins.json` (the install/enable list).
+   *  Default OFF — propagating which plugins are installed across
+   *  devices is reasonable but not universal; user opts in. */
+  communityPluginList: boolean;
+  /** Per-plugin allow-list for `${configDir}/plugins/<id>/**`.
+   *  Default `{}` — every community plugin's data.json starts as
+   *  "do not sync". User toggles individual plugins on. Syncline's
+   *  own plugin folder is hard-excluded regardless of this map. */
+  communityPluginData: Record<string, boolean>;
+  /** Anything under `${configDir}/` that doesn't match the above
+   *  categories (e.g. `types.json`, `bookmarks/`, plugin-specific
+   *  one-offs). Default OFF — safer to require opt-in than to
+   *  silently propagate device-specific state we haven't classified. */
+  other: boolean;
+}
+
+const DEFAULT_CONFIG_SYNC: ConfigSyncCategories = {
+  themes: true,
+  snippets: true,
+  hotkeys: true,
+  coreConfig: true,
+  communityPluginList: false,
+  communityPluginData: {},
+  other: false,
+};
+
 interface SynclineSettings {
   serverUrl: string;
   autoSync: boolean;
   /** Stable per-installation ActorId (UUIDv4, hyphenated). Minted on first run. */
   actorId: string | null;
-  /** Sync the Obsidian config folder (themes, snippets, plugin
-   *  settings). Defaults to OFF for new installs — propagating
-   *  `.obsidian/` across devices breaks per-device workflows
-   *  (hotkey schemes, themes, vault-specific plugin tuning). Mirrors
-   *  Remotely-Save and LiveSync's default-off posture. Existing
-   *  installs that already had hidden-file state when this setting
-   *  was introduced are auto-migrated to true (see `migrationNeeded`
-   *  in `loadSettings` / `connect`). */
-  syncObsidianConfig: boolean;
+  /** Per-category opt-ins for syncing the Obsidian config folder.
+   *  Replaces the single boolean from #92 — see ConfigSyncCategories
+   *  for per-field defaults and rationale. Migrated on first load
+   *  if the data.json still has the legacy `syncObsidianConfig` key
+   *  (see `migrateConfigSyncFromLegacy` / `connect()`). */
+  configSync: ConfigSyncCategories;
 }
 
 const DEFAULT_SETTINGS: SynclineSettings = {
   serverUrl: "ws://localhost:3030/sync",
   autoSync: true,
   actorId: null,
-  syncObsidianConfig: false,
+  configSync: DEFAULT_CONFIG_SYNC,
 };
+
+/** Categories used by `classifyHiddenPath`. */
+type HiddenPathCategory =
+  | "themes"
+  | "snippets"
+  | "hotkeys"
+  | "coreConfig"
+  | "communityPluginList"
+  | "communityPluginData"
+  | "other"
+  | "self";
 
 /**
  * Sidebar status states. The four "classic" states drive both the
@@ -882,24 +933,58 @@ export default class SynclinePlugin extends Plugin {
     this.disconnect();
   }
 
-  /** Set during `loadSettings` if `data.json` lacks the
-   *  `syncObsidianConfig` key. Triggers the one-time migration in
-   *  `connect()` that flips the flag to `true` for installs that were
-   *  already running PR #89's always-on hidden-file sync. Cleared
-   *  after the migration runs (or after `saveSettings` writes the
-   *  decided value) so we don't re-migrate. */
-  private syncObsidianConfigMigrationNeeded = false;
+  /** Set in `loadSettings` if the persisted data.json lacks both the
+   *  legacy `syncObsidianConfig` boolean and the new `configSync`
+   *  field — i.e., this is a pre-#92 install that never ran the
+   *  earlier migration. We finish the migration in `connect()` after
+   *  the manifest is loaded so we can inspect projection paths. */
+  private legacyManifestMigrationNeeded = false;
+
+  /** Set in `loadSettings` if data.json has the legacy boolean
+   *  `syncObsidianConfig` (from #92) but not the new `configSync`
+   *  shape. We translate the boolean into per-category fields on
+   *  first connect and rewrite data.json. */
+  private legacyBooleanMigrationNeeded = false;
+
+  /** Captured in `loadSettings` so the boolean→category translation
+   *  can read it without a second `loadData()` call. `null` means
+   *  the legacy field wasn't present. */
+  private legacyBooleanValue: boolean | null = null;
 
   async loadSettings() {
-    const raw = (await this.loadData()) as Partial<SynclineSettings> | null;
-    this.syncObsidianConfigMigrationNeeded =
-      !raw ||
-      !Object.prototype.hasOwnProperty.call(raw, "syncObsidianConfig");
-    this.settings = Object.assign(
-      {},
-      DEFAULT_SETTINGS,
-      raw,
-    ) as SynclineSettings;
+    const raw = (await this.loadData()) as
+      | (Partial<SynclineSettings> & { syncObsidianConfig?: boolean })
+      | null;
+    const legacyValue =
+      raw && typeof raw.syncObsidianConfig === "boolean"
+        ? raw.syncObsidianConfig
+        : null;
+    const hasNew =
+      !!raw &&
+      typeof raw.configSync === "object" &&
+      raw.configSync !== null;
+    this.legacyBooleanMigrationNeeded = legacyValue !== null && !hasNew;
+    this.legacyBooleanValue = legacyValue;
+    this.legacyManifestMigrationNeeded = legacyValue === null && !hasNew;
+
+    // Standard shallow merge over defaults. configSync needs a
+    // dedicated deep-ish merge so per-key defaults aren't lost when
+    // the user has only set some categories. The
+    // communityPluginData record likewise has to be its own copy so
+    // a fresh load doesn't share the literal default {} reference.
+    const merged = Object.assign({}, DEFAULT_SETTINGS, raw ?? {}) as
+      SynclineSettings & { syncObsidianConfig?: boolean };
+    merged.configSync = {
+      ...DEFAULT_CONFIG_SYNC,
+      ...(raw?.configSync ?? {}),
+      communityPluginData: {
+        ...(raw?.configSync?.communityPluginData ?? {}),
+      },
+    };
+    // Drop the legacy field from the in-memory settings — the next
+    // saveSettings() will write only the new shape.
+    delete merged.syncObsidianConfig;
+    this.settings = merged;
   }
 
   /** Wall-clock of the last `saveSettings()` call. Used by
@@ -975,13 +1060,15 @@ export default class SynclinePlugin extends Plugin {
         this.disconnect();
       }
     } else if (
-      previous.syncObsidianConfig !== incoming.syncObsidianConfig &&
-      this.client
+      this.client &&
+      JSON.stringify(previous.configSync) !==
+        JSON.stringify(incoming.configSync)
     ) {
-      // Toggling `.obsidian/` sync via an external rewrite. Start /
-      // stop the scanner so the running plugin matches the new flag,
-      // then re-reconcile to pick up (or drop) hidden manifest rows.
-      if (incoming.syncObsidianConfig) {
+      // Toggling category settings via an external rewrite. Start /
+      // stop the scanner to match (any-category-enabled means we
+      // need it running) and re-reconcile so hidden manifest rows
+      // are picked up or dropped without restarting the plugin.
+      if (this.anyConfigCategoryEnabled()) {
         this.startHiddenFileScanner();
       } else {
         this.stopHiddenFileScanner();
@@ -1330,22 +1417,85 @@ export default class SynclinePlugin extends Plugin {
         this.client.initManifest();
       }
 
-      // One-time migration for installs that ran PR #89 before #92
-      // landed: if `data.json` lacks `syncObsidianConfig` AND the
-      // persisted manifest already has any `${configDir}/...` rows,
-      // the user was relying on the old always-on behavior — flip the
-      // flag to `true` so their existing sync flow keeps working
-      // without surprise. Fresh installs (manifest empty) and new
-      // users who explicitly chose `false` are left alone.
-      if (this.syncObsidianConfigMigrationNeeded) {
+      // ----------------------------------------------------------
+      // Settings migrations
+      //
+      // Two paths feed into the new per-category `configSync` shape:
+      //
+      //   - `legacyBooleanMigrationNeeded`: data.json has the #92
+      //     boolean but not the #93 categories. Translate the
+      //     boolean into category fields, preserving the user's
+      //     explicit prior choice.
+      //
+      //   - `legacyManifestMigrationNeeded`: data.json has neither
+      //     field — pre-#92 install that never connected during the
+      //     #92 era. Inspect the persisted manifest: if hidden rows
+      //     exist, the user was relying on PR #89's always-on
+      //     behavior. Mirror it by enabling the safe categories AND
+      //     enumerating any community-plugin folders the manifest
+      //     already has (those plugins were syncing before; keep
+      //     them syncing rather than silently dropping data).
+      //
+      // Both are one-shot — `saveSettings()` rewrites data.json with
+      // the new shape and clears the flag. Idempotent on rerun.
+      // ----------------------------------------------------------
+      if (this.legacyBooleanMigrationNeeded) {
+        if (this.legacyBooleanValue === true) {
+          // #92 was on → mirror that as "safe categories on, risky
+          // categories off". Same defaults as DEFAULT_CONFIG_SYNC,
+          // so this is a no-op except for clearing the legacy flag
+          // and writing the new shape.
+          this.settings.configSync = { ...DEFAULT_CONFIG_SYNC };
+        } else {
+          // #92 was off → preserve "no .obsidian/ syncing at all".
+          // Override every category to false.
+          this.settings.configSync = {
+            themes: false,
+            snippets: false,
+            hotkeys: false,
+            coreConfig: false,
+            communityPluginList: false,
+            communityPluginData: {},
+            other: false,
+          };
+        }
+        console.debug(
+          `[Syncline] migration: legacy syncObsidianConfig=${this.legacyBooleanValue} → configSync derived`,
+        );
+        this.legacyBooleanMigrationNeeded = false;
+        this.legacyBooleanValue = null;
+        await this.saveSettings();
+      } else if (this.legacyManifestMigrationNeeded) {
         const projection = this.readProjection();
-        if (projection.some((r) => this.isUnderHiddenRoot(r.path))) {
-          this.settings.syncObsidianConfig = true;
+        const hiddenRows = projection.filter((r) =>
+          this.isUnderHiddenRoot(r.path),
+        );
+        if (hiddenRows.length > 0) {
+          // Pre-#92 always-on user. Enable safe categories (the
+          // #93 default for them is already on) and explicitly
+          // allow-list any community plugins whose data.json was
+          // already in the manifest — those were syncing under
+          // PR #89 and shouldn't silently stop.
+          const seenPluginIds = new Set<string>();
+          for (const row of hiddenRows) {
+            if (this.classifyHiddenPath(row.path) === "communityPluginData") {
+              const pluginId = this.communityPluginIdOf(row.path);
+              if (pluginId) seenPluginIds.add(pluginId);
+            }
+          }
+          for (const id of seenPluginIds) {
+            this.settings.configSync.communityPluginData[id] = true;
+          }
+          // communityPluginList tends to come along for the ride too
+          // if the user was syncing community plugin data.
+          if (seenPluginIds.size > 0) {
+            this.settings.configSync.communityPluginList = true;
+          }
           console.debug(
-            "[Syncline] migration: existing hidden-file state detected → syncObsidianConfig=true",
+            `[Syncline] migration: pre-#92 install with hidden state → enabled safe categories + ${seenPluginIds.size} community plugin(s)`,
           );
         }
-        this.syncObsidianConfigMigrationNeeded = false;
+        this.legacyManifestMigrationNeeded = false;
         await this.saveSettings();
       }
 
@@ -1442,7 +1592,7 @@ export default class SynclinePlugin extends Plugin {
       this.startStatusCheck();
       this.startServerStatsPolling();
       this.startBlobRetrySweep();
-      if (this.settings.syncObsidianConfig) {
+      if (this.anyConfigCategoryEnabled()) {
         this.startHiddenFileScanner();
       }
     } catch (error) {
@@ -1726,12 +1876,96 @@ export default class SynclinePlugin extends Plugin {
   }
 
   /** True iff `path` lives under any of the hidden scan roots
-   *  (typically `.obsidian/`). Used by `reconcileProjectionInner` to
-   *  drop hidden manifest rows when `syncObsidianConfig` is off, and
-   *  by tests to spot hidden-state during migration. */
+   *  (typically `.obsidian/`). Used by classification + migration. */
   private isUnderHiddenRoot(path: string): boolean {
     for (const root of this.hiddenScanRoots()) {
       if (path === root || path.startsWith(root + "/")) return true;
+    }
+    return false;
+  }
+
+  /** Bucket a config-folder path into one of the per-#93 categories.
+   *  Returns null for paths that aren't under a hidden scan root.
+   *  `self` is reserved for our own plugin folder, which is always
+   *  excluded regardless of category settings. */
+  private classifyHiddenPath(path: string): HiddenPathCategory | null {
+    if (!this.isUnderHiddenRoot(path)) return null;
+    const cd = this.app.vault.configDir;
+    const rel = path.startsWith(cd + "/") ? path.slice(cd.length + 1) : "";
+
+    if (
+      rel === `plugins/${this.manifest.id}` ||
+      rel.startsWith(`plugins/${this.manifest.id}/`)
+    ) {
+      return "self";
+    }
+
+    if (rel === "themes" || rel.startsWith("themes/")) return "themes";
+    if (rel === "snippets" || rel.startsWith("snippets/")) return "snippets";
+    if (rel === "hotkeys.json") return "hotkeys";
+    if (
+      rel === "app.json" ||
+      rel === "appearance.json" ||
+      rel === "core-plugins.json" ||
+      rel === "core-plugins-migration.json"
+    ) {
+      return "coreConfig";
+    }
+    if (rel === "community-plugins.json") return "communityPluginList";
+    if (rel === "plugins" || rel.startsWith("plugins/")) {
+      return "communityPluginData";
+    }
+    return "other";
+  }
+
+  /** Extract the plugin id from a `${configDir}/plugins/<id>/...` path,
+   *  or null if `path` isn't a community-plugin-data path. */
+  private communityPluginIdOf(path: string): string | null {
+    const cd = this.app.vault.configDir;
+    const prefix = `${cd}/plugins/`;
+    if (!path.startsWith(prefix)) return null;
+    const rest = path.slice(prefix.length);
+    const slash = rest.indexOf("/");
+    return slash === -1 ? rest : rest.slice(0, slash);
+  }
+
+  /** Per-#93 sync decision: should this hidden path be materialized
+   *  locally / uploaded to the server? Centralizes the
+   *  category-toggle logic so callers (reconcile filter, scanner
+   *  filter) stay simple. */
+  private shouldSyncHiddenPath(path: string): boolean {
+    const category = this.classifyHiddenPath(path);
+    if (category === null) return true; // not a hidden path; not our concern
+    if (category === "self") return false; // hard exclusion
+    const cs = this.settings.configSync;
+    switch (category) {
+      case "themes":
+        return cs.themes;
+      case "snippets":
+        return cs.snippets;
+      case "hotkeys":
+        return cs.hotkeys;
+      case "coreConfig":
+        return cs.coreConfig;
+      case "communityPluginList":
+        return cs.communityPluginList;
+      case "communityPluginData": {
+        const id = this.communityPluginIdOf(path);
+        return id !== null && cs.communityPluginData[id] === true;
+      }
+      case "other":
+        return cs.other;
+    }
+  }
+
+  /** True iff at least one category is on. Used to decide whether to
+   *  start the hidden-file scanner at all. */
+  anyConfigCategoryEnabled(): boolean {
+    const cs = this.settings.configSync;
+    if (cs.themes || cs.snippets || cs.hotkeys || cs.coreConfig) return true;
+    if (cs.communityPluginList || cs.other) return true;
+    for (const v of Object.values(cs.communityPluginData)) {
+      if (v) return true;
     }
     return false;
   }
@@ -1761,6 +1995,10 @@ export default class SynclinePlugin extends Plugin {
           }
           for (const f of listing.files) {
             if (this.isHiddenIgnored(f)) continue;
+            // Per-category opt-in: skip files whose category is
+            // disabled (or unclassified, since `other` defaults off
+            // and is the catch-all for unrecognized config files).
+            if (!this.shouldSyncHiddenPath(f)) continue;
             // Skip files we just wrote ourselves. Without this, an
             // inbound blob landing on a hidden path (via onBlobReceived)
             // is immediately picked back up by the next scan tick and
@@ -1913,9 +2151,9 @@ export default class SynclinePlugin extends Plugin {
     //     disk. Server-side entries persist (just not materialized
     //     locally) so the user can re-enable later without loss.
     const rawProjection = this.readProjection();
-    const projection = this.settings.syncObsidianConfig
-      ? rawProjection
-      : rawProjection.filter((r) => !this.isUnderHiddenRoot(r.path));
+    const projection = rawProjection.filter((r) =>
+      this.shouldSyncHiddenPath(r.path),
+    );
     const byPath = new Map<string, ProjectionRow>();
     const byId = new Map<string, ProjectionRow>();
     for (const row of projection) {
@@ -1925,15 +2163,15 @@ export default class SynclinePlugin extends Plugin {
 
     // --- Removals: paths that were in the prior projection but aren't now ---
     for (const [path, prev] of this.lastProjection) {
-      // When syncObsidianConfig is off, hidden rows are filtered out
-      // of `byId` above; they look "removed" to this loop even though
-      // they're still valid manifest entries. Skip them — deleting the
-      // user's local `.obsidian/...` files just because we toggled
-      // sync off would be a hostile UX.
-      if (
-        !this.settings.syncObsidianConfig &&
-        this.isUnderHiddenRoot(path)
-      ) {
+      // Hidden rows in disabled categories are filtered out of `byId`
+      // above; they look "removed" to this loop even though they're
+      // still valid manifest entries. Skip them — deleting the user's
+      // local `.obsidian/...` files just because they toggled a
+      // category off would be a hostile UX. (We only delete on
+      // explicit manifest tombstone or user-driven category-on →
+      // category-off → category-on cycle, which is a no-op here too
+      // since the path was previously filtered.)
+      if (!this.shouldSyncHiddenPath(path)) {
         continue;
       }
       if (!byId.has(prev.id)) {
@@ -2515,34 +2753,131 @@ class SynclineSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl).setName("Sync scope").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        `Per-category opt-ins for syncing the Obsidian config folder ` +
+        `(${this.plugin.app.vault.configDir}/). Safe categories are on ` +
+        `by default; community-plugin metadata and per-plugin data are ` +
+        `off — propagating those across devices is the highest-conflict ` +
+        `surface in practice.`,
+    });
+
+    const onToggle = async () => {
+      await this.plugin.saveSettings();
+      if (!this.plugin.client) return;
+      // Match running plugin state to the new flag set and re-
+      // reconcile so hidden manifest rows are picked up (or
+      // dropped) without requiring a reconnect.
+      if (this.plugin.anyConfigCategoryEnabled()) {
+        this.plugin.startHiddenFileScanner();
+      } else {
+        this.plugin.stopHiddenFileScanner();
+      }
+      void this.plugin.reconcileProjection();
+    };
+
+    const addCategoryToggle = (
+      name: string,
+      desc: string,
+      get: () => boolean,
+      set: (v: boolean) => void,
+    ) => {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addToggle((toggle) =>
+          toggle.setValue(get()).onChange(async (value) => {
+            set(value);
+            await onToggle();
+          }),
+        );
+    };
+
+    addCategoryToggle(
+      "Themes",
+      "CSS themes installed in the vault.",
+      () => this.plugin.settings.configSync.themes,
+      (v) => {
+        this.plugin.settings.configSync.themes = v;
+      },
+    );
+    addCategoryToggle(
+      "Snippets",
+      "Custom CSS snippets.",
+      () => this.plugin.settings.configSync.snippets,
+      (v) => {
+        this.plugin.settings.configSync.snippets = v;
+      },
+    );
+    addCategoryToggle(
+      "Hotkeys",
+      "Custom hotkey assignments.",
+      () => this.plugin.settings.configSync.hotkeys,
+      (v) => {
+        this.plugin.settings.configSync.hotkeys = v;
+      },
+    );
+    addCategoryToggle(
+      "Core plugin settings",
+      "Obsidian's built-in plugin list, app appearance, and core config files.",
+      () => this.plugin.settings.configSync.coreConfig,
+      (v) => {
+        this.plugin.settings.configSync.coreConfig = v;
+      },
+    );
+    addCategoryToggle(
+      "Community plugin list",
+      "Which community plugins are installed and enabled. Off by default — opt in if you want to keep installed-plugin sets aligned across devices.",
+      () => this.plugin.settings.configSync.communityPluginList,
+      (v) => {
+        this.plugin.settings.configSync.communityPluginList = v;
+      },
+    );
+    addCategoryToggle(
+      "Other config files",
+      "Anything under the config folder that doesn't match the categories above (bookmarks, types, plugin one-offs). Off by default — propagating uncategorized state risks overwriting device-specific paths or tokens.",
+      () => this.plugin.settings.configSync.other,
+      (v) => {
+        this.plugin.settings.configSync.other = v;
+      },
+    );
 
     new Setting(containerEl)
-      .setName("Sync Obsidian config folder")
-      .setDesc(
-        `Off by default. When enabled, propagates themes, snippets, and ` +
-          `community-plugin settings under ${this.plugin.app.vault.configDir}/ across all devices ` +
-          `sharing this vault. Per-device customizations (hotkey schemes, ` +
-          `theme overrides, vault-specific plugin tuning) will be overwritten.`,
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.syncObsidianConfig)
-          .onChange(async (value) => {
-            this.plugin.settings.syncObsidianConfig = value;
-            await this.plugin.saveSettings();
-            // Match running plugin state to the new flag and re-reconcile
-            // so hidden manifest rows are picked up (or dropped) without
-            // requiring a reconnect.
-            if (this.plugin.client) {
-              if (value) {
-                this.plugin.startHiddenFileScanner();
-              } else {
-                this.plugin.stopHiddenFileScanner();
-              }
-              void this.plugin.reconcileProjection();
-            }
-          }),
+      .setName("Community plugin data")
+      .setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Per-plugin opt-in for syncing each community plugin's data.json. " +
+        "Off by default for every plugin — many plugins store device-" +
+        "specific paths, API tokens, or workspace coordinates that should " +
+        "not propagate across devices.",
+    });
+
+    const installedPluginIds = Object.keys(
+      ((this.app as unknown as { plugins?: { manifests?: Record<string, unknown> } })
+        .plugins?.manifests) ?? {},
+    )
+      .filter((id) => id !== this.plugin.manifest.id)
+      .sort();
+    if (installedPluginIds.length === 0) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text: "No community plugins detected.",
+      });
+    }
+    for (const pluginId of installedPluginIds) {
+      addCategoryToggle(
+        pluginId,
+        `Sync ${this.plugin.app.vault.configDir}/plugins/${pluginId}/`,
+        () =>
+          this.plugin.settings.configSync.communityPluginData[pluginId] === true,
+        (v) => {
+          this.plugin.settings.configSync.communityPluginData[pluginId] = v;
+        },
       );
+    }
 
     new Setting(containerEl).setName("Identity").setHeading();
     new Setting(containerEl)
