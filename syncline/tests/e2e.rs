@@ -564,7 +564,15 @@ async fn test_cli_does_not_self_loop_on_received_writes() {
 /// Post-fix: B's watcher should drop the fs-event for the
 /// reconcile-driven conflict-sibling write (it's a self-write). No
 /// scan, no mint, no propagation.
+///
+/// **Currently FAILS on `main`** — that's the point: this is the
+/// gating test for the fix. Marked `#[ignore]` so CI on the
+/// test-only PR (#108) stays green; the fix PR removes the
+/// `#[ignore]` and the test must pass for the fix to merge. Run
+/// locally with `cargo test --test e2e --
+/// --ignored test_binary_modification_during_bootstrap`.
 #[tokio::test]
+#[ignore = "TDD: fails on current code; the fix PR for #107 must remove this attribute and assert the test passes"]
 async fn test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry() {
     let env = TestEnv::new(2).await;
 
@@ -774,7 +782,15 @@ async fn test_initial_bootstrap_clean_server_does_not_create_phantom_conflicts()
 ///      receiving anything 0 pushes.
 ///   3. Assert: the legitimate file propagates; the artifacts do
 ///      not.
+///
+/// **Currently FAILS on `main`** — verified on Linux (podman): all
+/// 5 stale artifacts get minted by `scan_once` and propagate to the
+/// receiver. Marked `#[ignore]` so CI stays green on the test-only
+/// PR (#108); the fix PR removes the `#[ignore]` and the test must
+/// pass for the fix to merge. Run locally with `cargo test --test
+/// e2e -- --ignored test_scan_once_skips_stale_conflict_sibling_artifacts`.
 #[tokio::test]
+#[ignore = "TDD: fails on current code; the fix PR for #107 must remove this attribute and assert the test passes"]
 async fn test_scan_once_skips_stale_conflict_sibling_artifacts() {
     build_workspace().await;
     let port = get_available_port();
