@@ -668,9 +668,20 @@ async fn test_initial_bootstrap_clean_server_does_not_create_phantom_conflicts()
     // burst — same shape as a plugin connecting with a populated
     // vault.
     let sender_dir = TempDir::new().unwrap();
-    // Production scale was ~1200 text + ~163 binary. We use a
-    // smaller corpus to keep CI runtime reasonable but go larger
-    // than the simple-case test above (which passes with N=50 text).
+    // Production scale was ~1200 text + ~163 binary. Verified
+    // empirically in a Linux/podman container that this CLI-only
+    // scenario PASSES at both N=200 and N=1200 — the receiving
+    // peer's text-adoption rule covers the bootstrap-write race.
+    // Kept at N=200 to keep CI runtime reasonable; if this test
+    // ever starts failing it's a real regression.
+    //
+    // The user's production case still produced conflicts because
+    // the actual trigger requires either:
+    //   * a binary file rewrite during bootstrap (covered by
+    //     `test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry`
+    //     above), or
+    //   * the Obsidian plugin's specific protocol burst pattern,
+    //     not reproducible in CLI-only.
     const N_TEXT: usize = 200;
     for i in 0..N_TEXT {
         let subdir = format!("dir-{:02}", i % 8);
