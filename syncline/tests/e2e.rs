@@ -399,6 +399,606 @@ async fn test_single_client_flow() {
     tokio::time::sleep(Duration::from_millis(1000)).await;
 }
 
+/// Recursively count files whose name matches either of syncline's
+/// two conflict naming schemes, anywhere under `root`. Skips the
+/// `.syncline/` state cache.
+///
+/// Two schemes coexist:
+///   1. **Projection-level** (`v1::projection::conflict_path`):
+///      `<stem>.conflict-<actor8>-<lamp>-<id8>.<ext>`. Emitted when
+///      two manifest entries share a path; the loser is renamed.
+///   2. **Reconcile-level** (`client_v1::conflict_sibling_path`):
+///      `<stem> (conflict <YYYY-MM-DD> <actor8>).<ext>`. Emitted by
+///      `reconcile_projection_to_disk` when local on-disk bytes
+///      differ from the manifest's chunk hashes.
+fn count_conflict_files(root: &Path) -> usize {
+    let mut n = 0;
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let rel = match p.strip_prefix(root) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if rel.starts_with(".syncline") {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.contains(".conflict-") || name.contains(" (conflict ") {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Regression test for #107 — CLI client lacks self-write fs-event
+/// suppression.
+///
+/// Scenario reproducing the production bug:
+///
+///   1. Server + two clients spin up.
+///   2. Client 0 drops N files (its folder was empty before).
+///   3. Server broadcasts the manifest + content updates to client 1.
+///   4. Client 1 materialises every file on disk.
+///   5. Client 1's fs-watcher fires for those writes — they look like
+///      "new local files" because there's no self-write suppression
+///      on the CLI side (PR #102 added that to the Obsidian plugin
+///      only).
+///   6. Client 1's `scan_once` runs against the freshly-written
+///      files. For each path the projection has client 0's entry,
+///      but the text-adoption guard requires
+///      `content.has_persisted(id) || body.is_empty()` — racy with
+///      respect to the concurrent text-content subscription. When
+///      adoption misses, `scan_once` falls through to `create_text`
+///      and mints a fresh node at the same path with client 1's
+///      actor.
+///   7. Server receives the colliding create from client 1, projects
+///      it, and emits a `.conflict-<actor1>-<lamp>-<id>.md` sibling.
+///   8. Both clients reconcile to disk, ending up with the original
+///      file PLUS a conflict copy.
+///
+/// Pre-fix: the test fails — at least one `.conflict-*` file appears
+/// in client 0's directory, even though client 0 only wrote files
+/// itself and never edited anything.
+///
+/// Post-fix: the CLI watcher suppresses self-writes the same way the
+/// plugin does (#91). No spurious creates, no conflicts.
+///
+/// Note: the simple "client A writes N text files, client B receives,
+/// no edits" case turns out NOT to reproduce reliably — the text
+/// path's empty-placeholder adoption rule
+/// (`content.has_persisted(id) || body.is_empty()`) lets scan_once
+/// adopt the placeholder, so no spurious create. The
+/// `test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry`
+/// test below exercises the actual production path: binary file
+/// rewrites trigger reconcile's conflict-sibling branch, which writes
+/// a new path on disk that the projection doesn't know about, which
+/// then trips scan_once into minting a fresh node.
+#[tokio::test]
+async fn test_cli_does_not_self_loop_on_received_writes() {
+    let env = TestEnv::new(2).await;
+
+    // Drop N files into client 0. Larger than 1 so reconciliation on
+    // client 1 takes long enough that the fs-watcher batches at
+    // least one round-trip; small enough to keep the test fast.
+    const N: usize = 50;
+    for i in 0..N {
+        let path = env.client_path(0).join(format!("note-{i:03}.md"));
+        fs::write(&path, format!("# note {i}\n\nlorem ipsum {i}\n")).unwrap();
+    }
+
+    // Wait for convergence: both clients should agree on the set of
+    // files. With the bug they still converge — the server emits
+    // conflict pairs and both clients agree on the (original +
+    // conflict-sibling) set. So we ALSO assert no `.conflict-*`
+    // files exist anywhere. That's the actual bug surface.
+    let converged = wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await;
+    assert!(
+        converged,
+        "Clients did not converge after 20 seconds — even with the bug, both sides should agree on _some_ shape"
+    );
+
+    // Settle period: give the watcher's debounce + scan_once + any
+    // server round-trip time to finish before we count. Without this,
+    // conflicts that are just about to land would be missed and the
+    // test would falsely pass.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let conflicts_a = count_conflict_files(env.client_path(0));
+    let conflicts_b = count_conflict_files(env.client_path(1));
+    assert_eq!(
+        conflicts_a, 0,
+        "client 0 has {conflicts_a} `.conflict-*` files — the CLI's self-write loop generated conflict pairs from its own received writes (#107)"
+    );
+    assert_eq!(
+        conflicts_b, 0,
+        "client 1 has {conflicts_b} `.conflict-*` files — the CLI's self-write loop generated conflict pairs from its own received writes (#107)"
+    );
+}
+
+/// Hypothesis A2 for #107 — the actual production bug.
+///
+/// `reconcile_projection_to_disk` in `client_v1.rs` has a binary
+/// conflict branch (around line 1675): when a manifest update arrives
+/// with new chunks for a path whose local on-disk file has different
+/// chunks, it saves the local bytes as `<stem>.conflict-<actor>-<date>.<ext>`
+/// **on disk** and overwrites the original with the remote bytes.
+/// The conflict-sibling path is purely a disk artifact at that point —
+/// it is NOT in the projection.
+///
+/// The watcher then fires for the conflict-sibling write. `scan_once`
+/// calls `process_binary_file` against the conflict-sibling path.
+/// `proj.by_path.get(conflict_path)` returns `None` (the projection
+/// only knows the original path), so it falls into the
+/// `BinaryScanOutcome::Created` branch and mints a fresh manifest
+/// entry at the conflict-sibling path with the **CLI's actor**.
+///
+/// That entry then propagates to every other peer, which materializes
+/// a new conflict-sibling file on its own disk. The user sees a
+/// conflict file on every device even though no real conflict ever
+/// existed.
+///
+/// This test reproduces the failure with two CLIs and a single binary
+/// file that gets modified once during the bootstrap:
+///
+///   1. Client A writes binary foo.png (bytes A1).
+///   2. Both clients converge.
+///   3. Client A overwrites foo.png with bytes A2 (different content).
+///   4. Client B's reconcile sees disk-A1 vs manifest-A2 → creates
+///      a conflict sibling on disk.
+///   5. Client B's watcher fires → scan_once mints a manifest entry
+///      for the conflict-sibling path with B's actor.
+///   6. Client A receives this entry and materializes the conflict
+///      sibling on its own disk too.
+///
+/// Pre-fix: a `.conflict-*` file appears on **client A** (where the
+/// user never wrote any conflict file). That's the bug — A never
+/// triggered any conflict, but B's self-write loop pushed one back
+/// to it.
+///
+/// Post-fix: B's watcher should drop the fs-event for the
+/// reconcile-driven conflict-sibling write (it's a self-write). No
+/// scan, no mint, no propagation.
+#[tokio::test]
+async fn test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry() {
+    let env = TestEnv::new(2).await;
+
+    // 1. Client A writes binary file. Two clients converge.
+    let png_path = env.client_path(0).join("image.png");
+    let bytes_v1 = vec![0xAAu8; 4096]; // arbitrary binary content
+    fs::write(&png_path, &bytes_v1).unwrap();
+
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await,
+        "Initial binary file did not converge across clients"
+    );
+
+    // 2. Modify on A.
+    let bytes_v2 = vec![0xBBu8; 4096];
+    fs::write(&png_path, &bytes_v2).unwrap();
+
+    // 3. Wait for the modification to propagate to client B. Use a
+    //    file-content poll instead of `wait_for_convergence` —
+    //    convergence-by-file-set is too strict here: with the fix
+    //    in place, client B keeps a LOCAL conflict-sibling artifact
+    //    on disk (preserving the v1 bytes for user review) that
+    //    client A doesn't have. The bug is when that artifact
+    //    becomes a *manifest entry* and propagates back to A; the
+    //    artifact's existence on B alone is intended behavior.
+    let path_b = env.client_path(1).join("image.png");
+    let propagated = wait_for(
+        Duration::from_secs(20),
+        Duration::from_millis(500),
+        || async {
+            fs::read(&path_b).map(|got| got == bytes_v2).unwrap_or(false)
+        },
+    )
+    .await;
+    assert!(
+        propagated,
+        "Binary modification did not reach client 1 within 20 s"
+    );
+
+    // 4. Settle: give the post-conflict watcher fire + scan_once + any
+    //    server round-trip enough wall-clock to mint and propagate
+    //    the spurious entry, if the bug is present.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // 5. Client A should have NO conflict-sibling file. The bug
+    //    causes B's reconcile-driven local artifact to be minted by
+    //    scan_once and propagated back to A, materialising on A's
+    //    disk. With the fix, the artifact stays local-only on B.
+    let conflicts_a = count_conflict_files(env.client_path(0));
+    assert_eq!(
+        conflicts_a, 0,
+        "client 0 has {conflicts_a} `.conflict-*` / `(conflict ...)` files — \
+         client 1's reconcile-driven conflict sibling was minted into the \
+         manifest by its own scan_once, then propagated back to client 0 (#107)"
+    );
+
+    // Client B is allowed exactly one local conflict-sibling: the
+    // one its reconcile wrote when applying the v2 update over the
+    // v1 disk. More than one indicates the bug is firing on every
+    // pass.
+    let conflicts_b = count_conflict_files(env.client_path(1));
+    assert!(
+        conflicts_b <= 1,
+        "client 1 has {conflicts_b} `.conflict-*` / `(conflict ...)` files; \
+         exactly one local-only sibling from reconcile is expected, more \
+         indicates the bug is firing on every reconcile pass"
+    );
+}
+
+/// Lightweight polling helper used by tests that wait on a single
+/// async predicate (e.g. "this file's bytes == X"). The
+/// `wait_for_convergence` helper above is too strict for tests where
+/// peers are expected to disagree on local-only artifacts.
+async fn wait_for<F, Fut>(
+    timeout: Duration,
+    poll: Duration,
+    mut check: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    check().await
+}
+
+/// Hypothesis A3 for #107 — the **exact** user-reported scenario.
+///
+/// Reproduces the production sequence end-to-end:
+///
+///   1. Server starts. Database is empty.
+///   2. CLI sync ("server-side mirror") starts against an **empty**
+///      folder. This is the role of `syncline-sync.service` on the
+///      user's Linux box.
+///   3. A second CLI sync starts against a folder **pre-populated**
+///      with N files. This stands in for "Tom PC plugin pushes its
+///      existing vault" — both peers behave the same on the wire
+///      once the manifest is exchanged.
+///   4. Wait for convergence — the populated peer pushes the manifest
+///      and content; the empty-folder peer receives and materialises.
+///   5. Settle window for the receiving peer's watcher to fire on its
+///      own writes and (with the bug) emit phantom create / conflict
+///      ops back to the server.
+///   6. Assert: NO conflict files anywhere in either folder.
+///
+/// This is the simplest direct repro of "I started clean, plugin
+/// pushed the vault, conflicts appeared everywhere". CLI-only so it's
+/// deterministic in CI; the fix on the CLI side automatically helps
+/// the plugin case because the plugin's own writes don't trigger
+/// this branch (they go through `vault.modify` which fires inside the
+/// cookie window from #91).
+#[tokio::test]
+async fn test_initial_bootstrap_clean_server_does_not_create_phantom_conflicts() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Receiving peer ("server-side mirror") — empty folder, started
+    // first so it's already listening when the populated peer comes
+    // online. Mirrors the user's `syncline-sync.service` waiting
+    // before Tom's plugin pushed the vault.
+    let receiver_dir = TempDir::new().unwrap();
+    let _receiver = spawn_client(receiver_dir.path(), port).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Pre-populate the sender's folder BEFORE starting `syncline sync`
+    // there. The first scan after connect uploads everything in one
+    // burst — same shape as a plugin connecting with a populated
+    // vault.
+    let sender_dir = TempDir::new().unwrap();
+    // Production scale was ~1200 text + ~163 binary. Verified
+    // empirically in a Linux/podman container that this CLI-only
+    // scenario PASSES at both N=200 and N=1200 — the receiving
+    // peer's text-adoption rule covers the bootstrap-write race.
+    // Kept at N=200 to keep CI runtime reasonable; if this test
+    // ever starts failing it's a real regression.
+    //
+    // The user's production case still produced conflicts because
+    // the actual trigger requires either:
+    //   * a binary file rewrite during bootstrap (covered by
+    //     `test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry`
+    //     above), or
+    //   * the Obsidian plugin's specific protocol burst pattern,
+    //     not reproducible in CLI-only.
+    const N_TEXT: usize = 200;
+    for i in 0..N_TEXT {
+        let subdir = format!("dir-{:02}", i % 8);
+        let dir = sender_dir.path().join(&subdir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("note-{i:03}.md"));
+        let body = format!(
+            "# note {i}\n\n{}\n",
+            "lorem ipsum dolor sit amet ".repeat(5 + (i % 7))
+        );
+        fs::write(&path, body).unwrap();
+    }
+    // Some binary files too — the binary-conflict reconcile branch
+    // is exactly the one that mints phantom entries (see hypothesis
+    // A2 above).
+    for i in 0..10 {
+        let path = sender_dir.path().join(format!("img-{i:02}.bin"));
+        let bytes: Vec<u8> = (0..(1024 + i * 64))
+            .map(|n| (n as u8).wrapping_mul((i as u8).wrapping_add(7)))
+            .collect();
+        fs::write(&path, &bytes).unwrap();
+    }
+
+    let _sender = spawn_client(sender_dir.path(), port).await;
+
+    // Allow the bootstrap to settle: scan_once pushes from sender,
+    // server broadcasts, receiver materialises every entry, watcher
+    // fires on every materialisation, debounced scan runs, the
+    // (buggy) self-write loop creates phantoms.
+    let dirs = vec![
+        sender_dir.path().to_path_buf(),
+        receiver_dir.path().to_path_buf(),
+    ];
+    assert!(
+        wait_for_convergence(&dirs, Duration::from_secs(60)).await,
+        "Initial bootstrap did not converge in 60 s"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let conflicts_sender = count_conflict_files(sender_dir.path());
+    let conflicts_receiver = count_conflict_files(receiver_dir.path());
+
+    assert_eq!(
+        conflicts_sender, 0,
+        "Sender (the peer that was 'plugin-equivalent') has \
+         {conflicts_sender} `.conflict-*` / `(conflict ...)` files \
+         after a clean bootstrap. The receiving peer's self-write \
+         loop produced phantom conflicts and propagated them back. \
+         This is exactly #107."
+    );
+    assert_eq!(
+        conflicts_receiver, 0,
+        "Receiver (the peer that was 'server-side mirror') has \
+         {conflicts_receiver} `.conflict-*` / `(conflict ...)` files \
+         after a clean bootstrap. The receiver materialised valid \
+         remote content and then minted spurious siblings via its own \
+         scan. This is exactly #107."
+    );
+}
+
+/// Hypothesis A4 / "suspenders" for #107 — does scan_once mint manifest
+/// entries for stale conflict-sibling artifacts on disk?
+///
+/// This test isolates the periodic-scan path. The cookie fix
+/// (planned for `syncline/src/client/watcher.rs`, mirroring #91)
+/// suppresses watcher events for paths the CLI just wrote — but
+/// the periodic timer at `client_v1.rs:583` runs `scan_once`
+/// every `SCAN_INTERVAL` (30 s) regardless of recent writes. If a
+/// conflict-sibling-format file is sitting on disk when that timer
+/// fires (e.g. left over from a previous bug run, copied in by an
+/// external tool, or restored from backup), `scan_once` will walk
+/// it, find no projection entry at that path, and `create_text` /
+/// `create_binary` mint a fresh manifest entry with the local
+/// actor. The cookie does nothing for this — no recent self-write
+/// to suppress.
+///
+/// This test is the **decision point** the reviewer asked for:
+///   * If FAIL on current (unfixed) code → cookie alone is not
+///     enough; the fix must also teach `scan_once` to recognise
+///     the conflict-sibling regex and skip those paths.
+///   * If PASS on current code → the cookie alone closes everything;
+///     no suspenders needed.
+///
+/// Setup:
+///   1. Pre-populate client 0's folder with one legitimate file
+///      and five files matching `client_v1::conflict_sibling_path`'s
+///      output format (`<stem> (conflict YYYY-MM-DD <hash8>).<ext>`).
+///   2. Bring up two clients. Client 0's first `scan_once` walks
+///      everything that's already on disk; client 1 sits empty,
+///      receiving anything 0 pushes.
+///   3. Assert: the legitimate file propagates; the artifacts do
+///      not.
+#[tokio::test]
+async fn test_scan_once_skips_stale_conflict_sibling_artifacts() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let _server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Empty receiver, started first. Mirrors a peer that joins
+    // before the artifacts get pushed.
+    let receiver_dir = TempDir::new().unwrap();
+    let _receiver = spawn_client(receiver_dir.path(), port).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Pre-populate sender BEFORE starting `syncline sync`. The
+    // first scan_once after the WS handshake walks every file
+    // already on disk and decides whether to mint a manifest entry
+    // for each one.
+    let sender_dir = TempDir::new().unwrap();
+    fs::write(
+        sender_dir.path().join("real-note.md"),
+        "legitimate user content\n",
+    )
+    .unwrap();
+    for i in 0..5 {
+        let stale = sender_dir
+            .path()
+            .join(format!("phantom-{i} (conflict 2026-01-15 deadbeef).md"));
+        fs::write(&stale, format!("stale artifact {i}\n")).unwrap();
+    }
+
+    let _sender = spawn_client(sender_dir.path(), port).await;
+
+    // Wait long enough for: WS handshake → first MANIFEST_SYNC →
+    // first scan_once → push manifest update → server broadcast →
+    // receiver reconcile materialise. Keep the wait under
+    // SCAN_INTERVAL (30 s) so a second periodic scan_once doesn't
+    // muddy the picture.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // Sanity: legitimate file propagated. If this fails the test
+    // setup is broken, not the bug.
+    assert!(
+        receiver_dir.path().join("real-note.md").is_file(),
+        "real-note.md did not propagate to receiver — test setup broken"
+    );
+
+    // Hypothesis: stale conflict-sibling artifacts MUST NOT
+    // propagate. scan_once should recognise the format and refuse
+    // to mint manifest entries for those paths. Without the
+    // suspenders fix, scan_once treats them as normal new files
+    // and mints — which then propagates to every other peer.
+    let mut leaked = Vec::new();
+    for i in 0..5 {
+        let phantom = receiver_dir
+            .path()
+            .join(format!("phantom-{i} (conflict 2026-01-15 deadbeef).md"));
+        if phantom.is_file() {
+            leaked.push(phantom);
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "Suspenders missing: {} stale conflict-sibling artifact(s) on \
+         the sender's disk were minted into the manifest by `scan_once` \
+         and propagated to the receiver: {:?}. \
+         The cookie fix (#91-style) on the watcher does not cover this \
+         path because the artifacts were not written by the CLI itself; \
+         scan_once needs an explicit conflict-sibling-format check \
+         before calling `create_text` / `create_binary`. (#107)",
+        leaked.len(),
+        leaked,
+    );
+}
+
+/// Hypothesis B for #107 — the 100 % CPU + freeze the user observed
+/// on Obsidian startup is a downstream effect of the conflict
+/// explosion (hypothesis A2). With ~900 phantom conflict siblings in
+/// the manifest, the plugin's first reconcile pass has to materialize
+/// 2× the legitimate corpus, plus subscribe to twice as many content
+/// subdocs, plus request twice as many blobs. That's a real CPU
+/// burst — but once the burst settles, things return to normal,
+/// matching "after a few restarts ok now".
+///
+/// The risk hidden underneath is a feedback loop: if reconcile can
+/// trip itself into an infinite cycle (each reconcile creates new
+/// manifest mutations → observer fires → reconcile runs → ...), the
+/// burst would never end and the freeze would be permanent. The
+/// single-flight guard on `reconcileProjection` is supposed to
+/// collapse trailing reconciles, but the guard only helps if each
+/// reconcile is bounded.
+///
+/// This test pins down the boundedness: a CLI given a manifest with
+/// 200 entries (a heavy synthetic workload, but well within the
+/// user's 1200 + 921 conflict siblings range, scaled down so the
+/// test finishes in CI) converges within 60 seconds. If reconcile
+/// ever degenerates into an infinite loop, the test times out.
+///
+/// Doesn't directly measure CPU — that's environment-dependent — but
+/// "converges in bounded wall-clock time" is the actionable
+/// guarantee. CPU usage is a function of work × time; bound the time
+/// and the user-visible "freeze" stops being indefinite.
+#[tokio::test]
+async fn test_large_manifest_converges_within_bounded_time() {
+    let env = TestEnv::new(2).await;
+
+    const N: usize = 200;
+    for i in 0..N {
+        let path = env.client_path(0).join(format!("note-{i:04}.md"));
+        let body = format!("# note {i}\n\n{}\n", "lorem ipsum ".repeat(20));
+        fs::write(&path, body).unwrap();
+    }
+
+    // 60s timeout: comfortably bounds the legitimate work and would
+    // catch any infinite-loop regression. Production saw freezes
+    // resolve "after a few restarts" — i.e., the burst always
+    // terminated within order-of-minutes. 60s is a tighter bound
+    // for our smaller corpus, expected to pass with 30+ seconds of
+    // headroom.
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(60)).await,
+        "Large manifest ({} entries) did not converge within 60 s — \
+         either reconcile is not bounded or the inbound pipeline \
+         stalled (#107 follow-up)",
+        N,
+    );
+}
+
+/// Hypothesis C for #107 — "conflict files reappear on Mac after I
+/// deleted them on the server" is not a sync bug, it's a workflow
+/// rule the user hit by accident.
+///
+/// When the user's AI assistant ran `trash` on the server's mirror
+/// folder, the local `syncline sync` service was already stopped (a
+/// correct precaution against the conflict-loop bug). Filesystem
+/// operations on a peer whose `syncline sync` is not running do NOT
+/// reach the CRDT manifest — there's no watcher to translate them
+/// into delete ops. The Mac plugin therefore saw the unchanged
+/// manifest and kept materialising the phantom conflict files.
+///
+/// Recovery path for the user (not tested here, but worth noting):
+/// delete the conflict files via the Mac plugin (which IS running),
+/// so the deletes propagate as manifest tombstones. The
+/// `test_offline_creation_and_deletion` and
+/// `test_rename_then_delete_propagates` cases below already cover
+/// the running-peer delete-propagation path.
+///
+/// Caveat: when a stopped peer is *restarted*, its first
+/// `scan_once` detects projection entries whose disk paths weren't
+/// visited and emits delete ops for them — so restarting after an
+/// offline cleanup DOES propagate the deletes. The user's symptom
+/// applies only as long as the cleaned-up peer stays stopped.
+#[tokio::test]
+async fn test_fs_delete_on_stopped_peer_does_not_propagate() {
+    let mut env = TestEnv::new(2).await;
+
+    let path0 = env.client_path(0).join("docs/note.md");
+    fs::create_dir_all(path0.parent().unwrap()).unwrap();
+    fs::write(&path0, "shared content").unwrap();
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await,
+        "Initial setup did not converge"
+    );
+
+    let path1 = env.client_path(1).join("docs/note.md");
+    assert!(path1.is_file(), "client 1 should have the file before stopping");
+
+    // Stop client 1 entirely. Deletes on its filesystem now have no
+    // path to the CRDT manifest.
+    env.clients[1].kill().await.unwrap();
+    // wait for the kill to actually take effect — otherwise the
+    // watcher might still process the pending fs event.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    fs::remove_file(&path1).unwrap();
+    // Give the rest of the system 5 s to (mistakenly) react. With
+    // sync running on client 1 this would propagate to client 0
+    // within a debounce window. Stopped → it doesn't.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert!(
+        path0.is_file(),
+        "client 0 lost its copy of the file even though client 1's delete \
+         happened with sync stopped — fs ops on stopped peers must not \
+         propagate (this is the contract that explains #107's symptom C)"
+    );
+}
+
 #[tokio::test]
 async fn test_two_client_sync() {
     let env = TestEnv::new(2).await;
