@@ -564,15 +564,7 @@ async fn test_cli_does_not_self_loop_on_received_writes() {
 /// Post-fix: B's watcher should drop the fs-event for the
 /// reconcile-driven conflict-sibling write (it's a self-write). No
 /// scan, no mint, no propagation.
-///
-/// **Currently FAILS on `main`** — that's the point: this is the
-/// gating test for the fix. Marked `#[ignore]` so CI on the
-/// test-only PR (#108) stays green; the fix PR removes the
-/// `#[ignore]` and the test must pass for the fix to merge. Run
-/// locally with `cargo test --test e2e --
-/// --ignored test_binary_modification_during_bootstrap`.
 #[tokio::test]
-#[ignore = "TDD: fails on current code; the fix PR for #107 must remove this attribute and assert the test passes"]
 async fn test_binary_modification_during_bootstrap_does_not_create_phantom_conflict_entry() {
     let env = TestEnv::new(2).await;
 
@@ -590,13 +582,26 @@ async fn test_binary_modification_during_bootstrap_does_not_create_phantom_confl
     let bytes_v2 = vec![0xBBu8; 4096];
     fs::write(&png_path, &bytes_v2).unwrap();
 
-    // 3. Wait for the modification to propagate. Both clients should
-    //    converge on bytes_v2 — A holds it; B's reconcile path is the
-    //    one we expect to misbehave (saves disk-A1 as conflict
-    //    sibling, overwrites with A2 from manifest).
+    // 3. Wait for the modification to propagate to client B. Use a
+    //    file-content poll instead of `wait_for_convergence` —
+    //    convergence-by-file-set is too strict here: with the fix
+    //    in place, client B keeps a LOCAL conflict-sibling artifact
+    //    on disk (preserving the v1 bytes for user review) that
+    //    client A doesn't have. The bug is when that artifact
+    //    becomes a *manifest entry* and propagates back to A; the
+    //    artifact's existence on B alone is intended behavior.
+    let path_b = env.client_path(1).join("image.png");
+    let propagated = wait_for(
+        Duration::from_secs(20),
+        Duration::from_millis(500),
+        || async {
+            fs::read(&path_b).map(|got| got == bytes_v2).unwrap_or(false)
+        },
+    )
+    .await;
     assert!(
-        wait_for_convergence(&env.dirs(), Duration::from_secs(20)).await,
-        "Binary modification did not converge across clients"
+        propagated,
+        "Binary modification did not reach client 1 within 20 s"
     );
 
     // 4. Settle: give the post-conflict watcher fire + scan_once + any
@@ -604,29 +609,52 @@ async fn test_binary_modification_during_bootstrap_does_not_create_phantom_confl
     //    the spurious entry, if the bug is present.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 5. Neither client should have a `.conflict-*` file. B's
-    //    reconcile creates one transiently, but with the fix the
-    //    self-write suppression cookie should keep that local artifact
-    //    from minting a manifest entry — so it stays local-only and
-    //    doesn't propagate. Stricter: the original file is the only
-    //    sign anything was modified.
+    // 5. Client A should have NO conflict-sibling file. The bug
+    //    causes B's reconcile-driven local artifact to be minted by
+    //    scan_once and propagated back to A, materialising on A's
+    //    disk. With the fix, the artifact stays local-only on B.
     let conflicts_a = count_conflict_files(env.client_path(0));
-    let conflicts_b = count_conflict_files(env.client_path(1));
     assert_eq!(
         conflicts_a, 0,
-        "client 0 has {conflicts_a} `.conflict-*` files — client 1's reconcile-driven conflict sibling was minted into the manifest by its own scan_once, then propagated back to client 0 (#107)"
+        "client 0 has {conflicts_a} `.conflict-*` / `(conflict ...)` files — \
+         client 1's reconcile-driven conflict sibling was minted into the \
+         manifest by its own scan_once, then propagated back to client 0 (#107)"
     );
-    // Client 1 might still have a local conflict-sibling on disk
-    // from the reconcile pass — that's expected behavior. The bug is
-    // when that local artifact gets minted into the manifest and
-    // propagated. With the fix in place it should not propagate, so
-    // it should not exist on client 0. Whether it stays on client 1
-    // is a separate cleanup question (the conflict-sibling preserves
-    // local bytes for user review).
-    debug_assert!(
+
+    // Client B is allowed exactly one local conflict-sibling: the
+    // one its reconcile wrote when applying the v2 update over the
+    // v1 disk. More than one indicates the bug is firing on every
+    // pass.
+    let conflicts_b = count_conflict_files(env.client_path(1));
+    assert!(
         conflicts_b <= 1,
-        "client 1 has {conflicts_b} `.conflict-*` files; one local-only sibling from reconcile is expected, more indicates a deeper bug"
+        "client 1 has {conflicts_b} `.conflict-*` / `(conflict ...)` files; \
+         exactly one local-only sibling from reconcile is expected, more \
+         indicates the bug is firing on every reconcile pass"
     );
+}
+
+/// Lightweight polling helper used by tests that wait on a single
+/// async predicate (e.g. "this file's bytes == X"). The
+/// `wait_for_convergence` helper above is too strict for tests where
+/// peers are expected to disagree on local-only artifacts.
+async fn wait_for<F, Fut>(
+    timeout: Duration,
+    poll: Duration,
+    mut check: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    check().await
 }
 
 /// Hypothesis A3 for #107 — the **exact** user-reported scenario.
@@ -782,15 +810,7 @@ async fn test_initial_bootstrap_clean_server_does_not_create_phantom_conflicts()
 ///      receiving anything 0 pushes.
 ///   3. Assert: the legitimate file propagates; the artifacts do
 ///      not.
-///
-/// **Currently FAILS on `main`** — verified on Linux (podman): all
-/// 5 stale artifacts get minted by `scan_once` and propagate to the
-/// receiver. Marked `#[ignore]` so CI stays green on the test-only
-/// PR (#108); the fix PR removes the `#[ignore]` and the test must
-/// pass for the fix to merge. Run locally with `cargo test --test
-/// e2e -- --ignored test_scan_once_skips_stale_conflict_sibling_artifacts`.
 #[tokio::test]
-#[ignore = "TDD: fails on current code; the fix PR for #107 must remove this attribute and assert the test passes"]
 async fn test_scan_once_skips_stale_conflict_sibling_artifacts() {
     build_workspace().await;
     let port = get_available_port();

@@ -743,6 +743,26 @@ async fn scan_once(
         if is_unsafe_relative_path(&rel_str) {
             continue;
         }
+
+        // #107 suspenders: skip conflict-sibling artifact paths.
+        // These are local-only disk artifacts written by
+        // `reconcile_projection_to_disk` to preserve user bytes
+        // that diverged from a remote update. Treating them as
+        // candidates for manifest tracking propagates phantom
+        // conflicts to every peer (see
+        // `looks_like_conflict_sibling_artifact` for the full
+        // rationale). Note that we do NOT add to `visited_rel` so
+        // that any tracking the projection has for this path stays
+        // intact (none should — these paths are never minted post-
+        // fix — but it's the right invariant for forward
+        // compatibility).
+        if looks_like_conflict_sibling_artifact(&rel_str) {
+            debug!(
+                path = %rel_str,
+                "skipping conflict-sibling artifact during scan (#107)"
+            );
+            continue;
+        }
         visited_rel.insert(rel_str.clone());
 
         // Tombstone-shadow check (§5.2 LWW on `deleted`).
@@ -1782,6 +1802,117 @@ fn conflict_sibling_path(path: &str, actor_short: &str, date_ymd: &str) -> Strin
     match ext {
         Some(ext) => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short}).{ext}"),
         None => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short})"),
+    }
+}
+
+/// True iff `rel_path`'s filename matches the format produced by
+/// `conflict_sibling_path` — `<stem> (conflict <YYYY-MM-DD>
+/// <hash8>)[.<ext>]`. Used by `scan_once` to refuse to mint manifest
+/// entries for paths that are local-only conflict-sibling artifacts.
+///
+/// Why we need this check at all:
+/// `reconcile_projection_to_disk`'s binary-conflict branch writes a
+/// conflict sibling on disk to preserve local bytes that diverge
+/// from a manifest update. That sibling path is intentionally NOT in
+/// the manifest — it's a per-device disk artifact for user review.
+/// Without this check, scan_once walks the disk after the
+/// reconcile-driven write, sees a file at a path the projection
+/// doesn't know, and mints a fresh manifest entry with the local
+/// actor. That entry then propagates to every other peer, which
+/// materialises the artifact on its disk too — creating phantom
+/// conflict files everywhere from a real conflict on one device
+/// (#107).
+///
+/// The cookie pattern (suppressing watcher events for self-writes)
+/// closes the watcher-driven trigger. This filter closes the
+/// periodic-scan and stale-on-disk triggers. Both are needed.
+fn looks_like_conflict_sibling_artifact(rel_path: &str) -> bool {
+    let last_slash = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let last = &rel_path[last_slash..];
+    // Strip optional extension.
+    let stem = match last.rfind('.') {
+        Some(dot) if dot > 0 => &last[..dot],
+        _ => last,
+    };
+    // Stem must contain " (conflict YYYY-MM-DD HASH8)" as suffix.
+    let Some(open) = stem.rfind(" (conflict ") else {
+        return false;
+    };
+    if !stem.ends_with(')') {
+        return false;
+    }
+    let inner = &stem[open + " (conflict ".len()..stem.len() - 1];
+    // inner must look like "YYYY-MM-DD HASH8".
+    let mut parts = inner.splitn(2, ' ');
+    let date = parts.next().unwrap_or("");
+    let hash = parts.next().unwrap_or("");
+    if date.len() != 10 {
+        return false;
+    }
+    let date_ok = date.as_bytes().iter().enumerate().all(|(i, &b)| match i {
+        4 | 7 => b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    if hash.len() != 8 || !hash.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod conflict_sibling_recognizer_tests {
+    use super::looks_like_conflict_sibling_artifact;
+
+    #[test]
+    fn recognises_text_artifact() {
+        assert!(looks_like_conflict_sibling_artifact(
+            "notes/hi (conflict 2026-04-21 abcd1234).md"
+        ));
+    }
+    #[test]
+    fn recognises_no_extension() {
+        assert!(looks_like_conflict_sibling_artifact(
+            "README (conflict 2026-04-21 abcd1234)"
+        ));
+    }
+    #[test]
+    fn recognises_nested_path() {
+        assert!(looks_like_conflict_sibling_artifact(
+            "a/b/c/file (conflict 2026-04-21 ffff0000).bin"
+        ));
+    }
+    #[test]
+    fn rejects_normal_path() {
+        assert!(!looks_like_conflict_sibling_artifact("notes/hi.md"));
+        assert!(!looks_like_conflict_sibling_artifact(
+            "deep/nested/Some Note.md"
+        ));
+    }
+    #[test]
+    fn rejects_partial_match() {
+        // Wrong date format
+        assert!(!looks_like_conflict_sibling_artifact(
+            "x (conflict 2026-4-21 abcd1234).md"
+        ));
+        // Wrong hash length
+        assert!(!looks_like_conflict_sibling_artifact(
+            "x (conflict 2026-04-21 abcd123).md"
+        ));
+        // Non-hex hash
+        assert!(!looks_like_conflict_sibling_artifact(
+            "x (conflict 2026-04-21 zzzz1234).md"
+        ));
+        // Missing parens
+        assert!(!looks_like_conflict_sibling_artifact(
+            "x conflict 2026-04-21 abcd1234.md"
+        ));
+        // User-named file that contains "conflict"
+        assert!(!looks_like_conflict_sibling_artifact(
+            "Merge conflict resolution.md"
+        ));
     }
 }
 
