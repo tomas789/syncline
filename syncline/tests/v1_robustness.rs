@@ -2110,3 +2110,50 @@ fn auto_apr28_019_huge_lamport_gap_observes_correctly() {
     assert!(pb.by_path.contains_key("after-catchup.md"));
     assert_converged("auto-apr28-019", &[&small, &big]);
 }
+
+// ===========================================================================
+// auto-apr28-020: filenames with embedded NUL bytes. POSIX disallows
+// these — `fs::write` would fail. But a buggy or malicious peer might
+// synthesize an entry whose `name` field contains \0. The manifest
+// must ACCEPT the entry (CRDT is content-agnostic) and the projection
+// must include it as a path with the NUL preserved. The disk layer
+// (separately) is responsible for refusing to materialize unsafe paths.
+//
+// This test only covers the manifest/projection layer's handling.
+// ===========================================================================
+#[test]
+fn auto_apr28_020_filename_with_nul_byte_in_manifest_handled() {
+    let mut a = Manifest::new(ActorId::new());
+
+    // Construct a name with an embedded NUL via direct manifest API.
+    let weird_name = format!("file{}.md", '\0');
+    assert!(
+        weird_name.contains('\0'),
+        "test setup: name should have a NUL"
+    );
+    let id = a.create_node(&weird_name, None, NodeKind::Text, &[], 0);
+
+    // Sync to a fresh peer.
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-020", &[&a, &b]);
+
+    // Both peers see the NUL-bearing name in projection.
+    let pa = project(&a);
+    let pb = project(&b);
+    assert!(
+        pa.by_path.contains_key(&weird_name),
+        "A's projection must include NUL-bearing name; got {:?}",
+        pa.by_path.keys().map(|k| format!("{:?}", k)).collect::<Vec<_>>()
+    );
+    assert!(
+        pb.by_path.contains_key(&weird_name),
+        "B's projection must include NUL-bearing name"
+    );
+
+    // The path's id matches across peers.
+    let pa_e = &pa.by_path[&weird_name];
+    let pb_e = &pb.by_path[&weird_name];
+    assert_eq!(pa_e.id, id);
+    assert_eq!(pb_e.id, id);
+}
