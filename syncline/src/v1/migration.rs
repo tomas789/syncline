@@ -70,6 +70,22 @@ pub fn migrate_v0_vault(vault_root: &Path, actor: ActorId) -> Result<Migration> 
                     ));
                     continue;
                 }
+                // Defend against malformed v0 paths — leading slash,
+                // double slashes, trailing slash. Without this, the
+                // parent-chain builder would create a Directory node
+                // with name="" (or several), which corrupts every
+                // projection that walks through it. v0 was supposed
+                // to store vault-relative paths but didn't always
+                // sanitise — drop these snapshots and surface a
+                // warning so the user knows.
+                if v0.rel_path.split('/').any(|s| s.is_empty()) {
+                    warnings.push(format!(
+                        "skipped snapshot {} — meta.path {:?} has empty path segments",
+                        snap.display(),
+                        v0.rel_path,
+                    ));
+                    continue;
+                }
                 // v0's "delete = empty text content" projection is also
                 // ghosted: if a text file has empty content AND no
                 // blob_hash (so isn't a binary), treat as deleted.
@@ -438,6 +454,33 @@ mod tests {
             p.by_path["folder/pic.png"].chunk_hashes,
             vec!["deadbeef".to_string()],
         );
+    }
+
+    #[test]
+    fn migrate_drops_paths_with_empty_segments() {
+        // v0 snapshots with malformed paths (leading slash, double
+        // slashes, trailing slash) shouldn't end up as Directory nodes
+        // with name="" — that would corrupt every projection that
+        // walks through them. Skip with a warning instead.
+        let vault = TempDir::new().unwrap();
+        let data = vault.path().join(".syncline/data");
+        make_v0_snapshot(&data, "/leading.md", "text", Some("oops"), None);
+        make_v0_snapshot(&data, "double//slash.md", "text", Some("oops2"), None);
+        make_v0_snapshot(&data, "valid.md", "text", Some("ok"), None);
+
+        let m = migrate_v0_vault(vault.path(), ActorId::new()).unwrap();
+
+        // No Directory entries with empty names should exist.
+        for entry in m.manifest.live_entries() {
+            assert!(
+                !entry.name.is_empty(),
+                "migration created an entry with empty name: {:?}",
+                entry,
+            );
+        }
+        // The valid entry still made it.
+        let p = crate::v1::projection::project(&m.manifest);
+        assert!(p.by_path.contains_key("valid.md"));
     }
 
     #[test]

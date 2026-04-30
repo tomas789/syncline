@@ -165,10 +165,12 @@ fn build_path(entry: &NodeEntry, all: &HashMap<NodeId, NodeEntry>) -> Option<Str
             return None;
         }
         let parent = all.get(&pid)?;
-        if parent.deleted && parent.kind == NodeKind::Directory {
-            // Parent directory is tombstoned → child is orphaned; drop.
-            // (Cascade delete is expressed explicitly in §5.6 so this is
-            // merely a safety net.)
+        // Cascade-safety net (§5.6): a parent directory whose tombstone
+        // wins over any modify_stamp orphans its children. Use the
+        // same `is_live` rule as the projection — without this, a
+        // directory that was deleted-then-modify-resurrected (legal
+        // per §6.3) would still drop its children at projection time.
+        if parent.kind == NodeKind::Directory && !is_live(parent) {
             return None;
         }
         segments.push(parent.name.clone());
@@ -194,16 +196,33 @@ fn conflict_path(base: &str, stamp: Stamp, id: NodeId) -> String {
     }
 }
 
-fn split_ext(path: &str) -> (&str, Option<&str>) {
+/// Split a path into (stem, ext) for conflict-suffix and artifact-
+/// recognition purposes. The split happens on the *last* `.` of the
+/// final path segment, with one important exception: leading dots are
+/// part of the basename, not an extension separator.
+///
+/// This means `.hidden` → (`.hidden`, None), `..hidden` → (`..hidden`,
+/// None), `.env.local` → (`.env`, Some("local")). Without the leading-
+/// dots exception, `..hidden` would split as (`.`, "hidden"), producing
+/// garbled conflict-copy paths like `.conflict-...-NNNN.hidden`.
+pub(crate) fn split_ext(path: &str) -> (&str, Option<&str>) {
     // Split on the last '.', but only in the final segment (don't
-    // corrupt "foo.bar/baz").
+    // corrupt "foo.bar/baz") — and only if there's a non-dot character
+    // BEFORE that last dot (so `..hidden` is not mis-split).
     let last_slash = path.rfind('/').map(|i| i + 1).unwrap_or(0);
     let last = &path[last_slash..];
-    if let Some(dot) = last.rfind('.') {
-        if dot == 0 {
-            return (path, None); // ".hidden" → no extension
-        }
-        let stem_end = last_slash + dot;
+
+    // Number of leading dots in `last`. These are part of the
+    // basename, not separators.
+    let leading_dots = last.bytes().take_while(|&b| b == b'.').count();
+    if leading_dots == last.len() {
+        // All dots — no extension to split off.
+        return (path, None);
+    }
+    let body = &last[leading_dots..];
+    if let Some(dot) = body.rfind('.') {
+        // Map `dot` (offset into `body`) back to an offset into `path`.
+        let stem_end = last_slash + leading_dots + dot;
         return (&path[..stem_end], Some(&path[stem_end + 1..]));
     }
     (path, None)
@@ -338,6 +357,22 @@ mod tests {
         let (stem, ext) = split_ext(".hidden");
         assert_eq!(stem, ".hidden");
         assert_eq!(ext, None);
+    }
+
+    #[test]
+    fn split_ext_treats_leading_dots_as_part_of_basename() {
+        // Two leading dots: not split — basename stays whole.
+        assert_eq!(split_ext("..hidden"), ("..hidden", None));
+        // Three leading dots, no trailing extension.
+        assert_eq!(split_ext("...weird"), ("...weird", None));
+        // All-dots filename: no extension.
+        assert_eq!(split_ext(".."), ("..", None));
+        assert_eq!(split_ext("..."), ("...", None));
+        // Leading dots + a real extension still split correctly.
+        assert_eq!(split_ext("..weird.txt"), ("..weird", Some("txt")));
+        // Leading dot in the directory part doesn't trigger the rule.
+        assert_eq!(split_ext("..hidden/foo.bar"), ("..hidden/foo", Some("bar")));
+        assert_eq!(split_ext("..d/..baz"), ("..d/..baz", None));
     }
 
     #[test]
