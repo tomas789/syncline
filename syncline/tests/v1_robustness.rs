@@ -1987,3 +1987,64 @@ fn auto_apr28_016_modify_resurrect_visible_to_late_joiner() {
     );
     assert_converged("auto-apr28-016", &[&a, &b, &c]);
 }
+
+// ===========================================================================
+// auto-apr28-017: two peers accidentally sharing an ActorId (vault
+// folder copied to a second device including `.syncline/actor_id`).
+// Both peers create distinct files concurrently, then sync. Both files
+// must survive (different NodeIds, identical actor stamps), and
+// projection must agree.
+// ===========================================================================
+#[test]
+fn auto_apr28_017_duplicate_actor_id_does_not_cause_data_loss() {
+    let shared_actor = ActorId::new();
+    let mut a = Manifest::new(shared_actor);
+    let mut b = Manifest::new(shared_actor);
+
+    // Each creates a unique file.
+    create_text(&mut a, "from-a.md", 1).unwrap();
+    create_text(&mut b, "from-b.md", 2).unwrap();
+
+    // Sync them (two passes for the bidirectional CRDT exchange).
+    sync(&mut a, &mut b);
+    sync(&mut a, &mut b);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both files must surface on both peers.
+    assert!(
+        pa.by_path.contains_key("from-a.md"),
+        "A missing from-a.md (got {:?})",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(pa.by_path.contains_key("from-b.md"), "A missing from-b.md");
+    assert!(pb.by_path.contains_key("from-a.md"), "B missing from-a.md");
+    assert!(pb.by_path.contains_key("from-b.md"), "B missing from-b.md");
+
+    // Convergence still required — different NodeIds for each file
+    // even though actor IDs match.
+    assert_converged("auto-apr28-017", &[&a, &b]);
+
+    // Now stress: each peer creates the SAME path with different
+    // content (logically a same-path collision). Both peers share
+    // actor_id, so the conflict-suffix tiebreak (which uses actor)
+    // can't distinguish — it falls back to NodeId tiebreak.
+    let mut a2 = Manifest::new(shared_actor);
+    let mut b2 = Manifest::new(shared_actor);
+    create_text(&mut a2, "shared.md", 1).unwrap();
+    create_text(&mut b2, "shared.md", 2).unwrap();
+    sync(&mut a2, &mut b2);
+    assert_converged("auto-apr28-017-collision", &[&a2, &b2]);
+    let pa2 = project(&a2);
+    // Both files survive — one canonical at "shared.md", the other
+    // under a conflict-suffixed sibling.
+    assert_eq!(
+        pa2.by_path.len(),
+        2,
+        "same-actor same-path collision must still produce two distinct \
+         live entries; got: {:?}",
+        pa2.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(pa2.by_path.contains_key("shared.md"));
+}
