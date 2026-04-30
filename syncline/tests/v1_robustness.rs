@@ -1933,7 +1933,7 @@ fn auto_apr28_015_parent_cycle_drops_both_from_projection_no_hang() {
 fn auto_apr28_016_modify_resurrect_visible_to_late_joiner() {
     // Peer A creates note.md
     let mut a = Manifest::new(ActorId::new());
-    create_text(&mut a, "note.md", 7).unwrap();
+    let note_id = create_text(&mut a, "note.md", 7).unwrap();
 
     // Peer B copies A's state.
     let mut b = Manifest::from_update(
@@ -1947,12 +1947,15 @@ fn auto_apr28_016_modify_resurrect_visible_to_late_joiner() {
     delete_path(&mut a, "note.md").unwrap();
     // Peer B modifies note.md (concurrent with A's delete).
     record_modify_text(&mut b, "note.md").unwrap();
-    // Sync A and B. Whichever has the higher stamp wins. The robust
-    // assertion is convergence; we'll set up so B's modify is later.
+    // Sync A and B. After sync, B may see note.md as either alive (if
+    // B's modify won the LWW tiebreak) or deleted (if A's delete
+    // won).
     sync(&mut a, &mut b);
-    // Make sure B's modify wins by having B observe the delete and
-    // then issue another modify with a higher lamport.
-    record_modify_text(&mut b, "note.md").unwrap();
+    // Issue another modify on B's side via NodeId — path-resolution
+    // would fail if B's projection currently sees note.md as deleted.
+    // The NodeId-level `record_modify` on B advances mod_lamp past
+    // any del_lamp B observed from A, guaranteeing modify wins.
+    b.record_modify(note_id);
     sync(&mut a, &mut b);
 
     // After convergence both A and B should see note.md alive (the
