@@ -1287,4 +1287,68 @@ mod tests {
             recv_result
         );
     }
+
+    // =====================================================================
+    // auto-apr28-037: a peer sends MSG_BLOB_REQUEST for a SHA-256 hash
+    // that doesn't exist on the server. The server must NOT crash, NOT
+    // reply with garbage, and must remain responsive for subsequent
+    // requests on the same connection. Per `handle_blob_request`,
+    // a missing blob is silently logged and no frame is emitted —
+    // tests both halves of that contract.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_037_blob_request_for_missing_hash_silent_then_responsive() {
+        use sha2::{Digest, Sha256};
+        let (port, state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        // Pre-seed ONE real blob so the responsive-after-miss check has
+        // something to ask for.
+        let real_payload: &[u8] = b"present-blob-bytes";
+        let real_hash = format!("{:x}", Sha256::digest(real_payload));
+        state.db.save_blob(&real_hash, real_payload).await.unwrap();
+
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let frame_v = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws, frame_v).await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Step 1: request a hash that's definitely not present.
+        let missing_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        let req_frame = encode_message(
+            MSG_BLOB_REQUEST,
+            "node-doesnt-matter",
+            missing_hash.as_bytes(),
+        );
+        send_bin(&mut ws, req_frame).await;
+
+        // Server must stay silent on the missing-blob branch (≤ 400 ms
+        // is plenty — the handler is a single DB lookup).
+        let silent =
+            tokio::time::timeout(Duration::from_millis(400), ws.next()).await;
+        assert!(
+            silent.is_err(),
+            "missing blob must produce silence, got reply {:?}",
+            silent
+        );
+
+        // Step 2: the connection must still be alive and the server
+        // must respond to a *real* blob request afterward.
+        let real_req = encode_message(
+            MSG_BLOB_REQUEST,
+            "real-doc-id",
+            real_hash.as_bytes(),
+        );
+        send_bin(&mut ws, real_req).await;
+        let reply = recv_bin(&mut ws).await;
+        let (t, d, p) = decode_message(&reply).expect("real blob reply framed");
+        assert_eq!(t, MSG_BLOB_UPDATE);
+        assert_eq!(d, "real-doc-id");
+        assert_eq!(p, real_payload, "server must return the real bytes");
+    }
 }
