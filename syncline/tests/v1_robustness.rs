@@ -1431,3 +1431,73 @@ fn auto_apr28_001_pathological_filenames_roundtrip_exactly() {
         "both nodes survive the same-path collision"
     );
 }
+
+// ===========================================================================
+// auto-apr28-002: out-of-order delta delivery — child update arrives
+// before its parent directory. The child must remain orphaned (dropped
+// from projection) while the parent is missing, then self-heal into the
+// projection once the parent's update arrives. No crash, no loss.
+// ===========================================================================
+#[test]
+fn auto_apr28_002_orphaned_child_self_heals_when_parent_arrives() {
+    use yrs::{ReadTxn, Transact};
+
+    // Peer A builds: root → "Folder/" → "child.md"
+    // We capture two distinct deltas: one with only the directory
+    // creation, one with only the child creation, and feed them to a
+    // fresh peer B in REVERSE ORDER.
+    let mut a = Manifest::new(ActorId::new());
+
+    // Snapshot 0: empty.
+    let sv0 = a.doc().transact().state_vector();
+    // Op 1: create the directory.
+    use syncline::v1::ids::NodeId;
+    let dir: NodeId = a.create_node("Folder", None, NodeKind::Directory, &[], 0);
+    let sv1 = a.doc().transact().state_vector();
+    let dir_delta = a
+        .doc()
+        .transact()
+        .encode_state_as_update_v1(&sv0);
+    // Op 2: create the child under the directory.
+    let _child = a.create_node("child.md", Some(dir), NodeKind::Text, &[], 7);
+    let child_delta = a
+        .doc()
+        .transact()
+        .encode_state_as_update_v1(&sv1);
+
+    // Sanity: peer A's child projects under the directory.
+    // (Directories don't have their own row in `by_path` — see
+    // projection.rs §5.6 — but the file does.)
+    let pa = project(&a);
+    assert!(pa.by_path.contains_key("Folder/child.md"));
+
+    // Peer B: apply ONLY the child delta first.
+    let mut b = Manifest::new(ActorId::new());
+    b.apply_update(&child_delta).unwrap();
+    let pb_partial = project(&b);
+    assert!(
+        !pb_partial.by_path.contains_key("Folder/child.md"),
+        "child must not appear before parent has been received"
+    );
+    // Either the child shows nowhere, or under just its leaf name (if
+    // projection mistakenly treats missing parent as root). The
+    // dangling-parent guarantee says "dropped from projection".
+    assert!(
+        !pb_partial.by_path.contains_key("child.md"),
+        "child must not be silently re-rooted at vault root when its \
+         parent is missing — got pb_partial: {:?}",
+        pb_partial.by_path.keys().collect::<Vec<_>>()
+    );
+
+    // Now apply the parent's delta. The child must appear at its
+    // intended nested path. (Directory itself isn't projected.)
+    b.apply_update(&dir_delta).unwrap();
+    let pb_full = project(&b);
+    assert!(
+        pb_full.by_path.contains_key("Folder/child.md"),
+        "child must self-heal into projection after parent arrives — \
+         got pb_full: {:?}",
+        pb_full.by_path.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(projection_hash(&a), projection_hash(&b));
+}
