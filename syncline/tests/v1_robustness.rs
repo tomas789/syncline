@@ -1634,3 +1634,66 @@ fn auto_apr28_005_concurrent_same_named_directories_keep_all_children() {
         "peers diverged on directory layout for concurrent same-named dirs"
     );
 }
+
+// ===========================================================================
+// auto-apr28-007: two peers each rename their existing file to the same
+// nested target path that requires creating new directories. Each peer's
+// rename auto-creates the same directory chain. After sync, both peers
+// must converge — likely with conflict suffix on one of the files — and
+// the directory structure must agree.
+// ===========================================================================
+#[test]
+fn auto_apr28_007_concurrent_rename_to_same_nested_target_converges() {
+    // Both peers start with two distinct files at the root.
+    let mut a = Manifest::new(ActorId::new());
+    create_text(&mut a, "left.md", 1).unwrap();
+    create_text(&mut a, "right.md", 1).unwrap();
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    // Concurrent: A renames left.md to inbox/today/note.md.
+    //             B renames right.md to inbox/today/note.md (same path!).
+    rename(&mut a, "left.md", "inbox/today/note.md").unwrap();
+    rename(&mut b, "right.md", "inbox/today/note.md").unwrap();
+
+    // Each peer's rename was locally legal (target was free at the time
+    // the local op ran). After merge, both files claim the same target
+    // → conflict resolution must kick in.
+    sync(&mut a, &mut b);
+    sync(&mut a, &mut b); // another pass for the conflict path
+    assert_converged("auto-apr28-007", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both files must surface — neither was deleted.
+    assert_eq!(
+        pa.by_path.len(),
+        2,
+        "both files still alive on A; got: {:?}",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(pb.by_path.len(), 2);
+
+    // Exactly one file at canonical "inbox/today/note.md", the other
+    // under a conflict-suffixed sibling in the same dir.
+    assert!(
+        pa.by_path.contains_key("inbox/today/note.md"),
+        "canonical path present on A: {:?}",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    let conflict_count = pa
+        .by_path
+        .keys()
+        .filter(|p| p.contains("inbox/today/") && p.contains(".conflict-"))
+        .count();
+    assert_eq!(
+        conflict_count, 1,
+        "exactly one conflict sibling expected; paths: {:?}",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+}
