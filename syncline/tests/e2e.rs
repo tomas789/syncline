@@ -3443,3 +3443,74 @@ async fn auto_apr28_030_server_immediate_crash_then_restart_clients_connect() {
     client_b.kill().await.unwrap();
     server2.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-031: server SIGKILLed while a multi-MiB binary blob is
+// being uploaded. The blob is large enough that the upload almost
+// certainly straddles the kill window. After the server is restarted
+// against the same DB, the original peer (which still has the file on
+// disk) and a fresh second peer must converge — bytes preserved, no
+// half-blob orphans, no phantom conflict copies.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_031_server_killed_mid_blob_upload_recovers() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+
+    let mut server1 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Write a binary file big enough to be chunked (FastCDC kicks in
+    // beyond a few KiB; 4 MiB is comfortably multi-chunk and gives the
+    // upload pipeline a real window to be killed in.)
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(2654435761u32) >> 24) as u8)
+        .collect();
+    let blob_path = dir_a.path().join("big.bin");
+    fs::write(&blob_path, &bytes).unwrap();
+
+    // Tiny window — give the watcher time to fire and the client time
+    // to begin streaming MSG_BLOB_UPDATE chunks, but kill before it
+    // can finish.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    server1.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Restart server against same DB.
+    let mut server2 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Bring up a fresh peer B; it must observe the binary file with the
+    // exact bytes once peer A finishes re-uploading.
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+
+    let target = dir_b.path().join("big.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let saw = poll_until(deadline, || {
+        target.is_file()
+            && fs::read(&target).map(|b| b == bytes).unwrap_or(false)
+    })
+    .await;
+    assert!(
+        saw,
+        "peer B should observe the same bytes after server restart \
+         (file exists? {}, size? {})",
+        target.is_file(),
+        target.metadata().map(|m| m.len()).unwrap_or(0),
+    );
+
+    // No phantom conflict copies on either side.
+    assert_eq!(count_conflict_files(dir_a.path()), 0, "no conflicts on A");
+    assert_eq!(count_conflict_files(dir_b.path()), 0, "no conflicts on B");
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server2.kill().await.unwrap();
+}
