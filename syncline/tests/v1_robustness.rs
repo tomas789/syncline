@@ -2343,3 +2343,56 @@ fn auto_apr28_027_same_peer_self_resurrect_via_post_delete_modify() {
     );
     assert_eq!(pb.by_path["doc.md"].id, id);
 }
+
+// ===========================================================================
+// auto-apr28-028: forward slash inside a single name field. The
+// manifest's `name` is treated as opaque, but projection joins names
+// with '/' to build paths. A name containing '/' would create an
+// ambiguous path. We document the current behaviour: the slash gets
+// embedded in the projected path string, effectively giving the entry
+// a sub-path that doesn't correspond to any real directory chain.
+// This might mislead the disk layer into a deeper hierarchy than the
+// manifest intends.
+// ===========================================================================
+#[test]
+fn auto_apr28_028_slash_in_name_creates_ambiguous_projection_path() {
+    let mut a = Manifest::new(ActorId::new());
+    // Direct manifest API — `create_text` would split on '/' and
+    // treat as a nested path. We want to bypass that.
+    let weird_id = a.create_node("foo/bar.md", None, NodeKind::Text, &[], 1);
+    let normal_id = a.create_node("normal.md", None, NodeKind::Text, &[], 1);
+
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-028", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // The "weird" entry projects at literal "foo/bar.md" — which
+    // collides with what would be a normally-created file inside dir
+    // "foo". The current implementation embeds the slash in the path
+    // string. Both peers must agree.
+    assert_eq!(
+        pa.by_id.get(&weird_id).map(|e| &e.path),
+        pb.by_id.get(&weird_id).map(|e| &e.path),
+        "peers disagree on slash-in-name projection path"
+    );
+
+    // Normal entry sanity.
+    assert!(pa.by_path.contains_key("normal.md"));
+    assert!(pb.by_path.contains_key("normal.md"));
+    assert_eq!(pa.by_id.get(&normal_id).unwrap().path, "normal.md");
+
+    // The weird entry's path string starts with "foo/" — an attacker
+    // could use this to trick a naive disk layer into writing a file
+    // inside a directory the manifest did NOT actually create. The
+    // disk layer's `is_unsafe_relative_path` doesn't currently
+    // detect this case (no `..`, no absolute, no NUL). Documented
+    // here for follow-up.
+    let weird_path = &pa.by_id.get(&weird_id).unwrap().path;
+    assert!(
+        weird_path.contains('/'),
+        "name with embedded slash currently embeds in projection path: {weird_path:?}"
+    );
+}
