@@ -1920,3 +1920,70 @@ fn auto_apr28_015_parent_cycle_drops_both_from_projection_no_hang() {
         "cyclic-parent nodes must be dropped from projection, got {paths:?}"
     );
 }
+
+// ===========================================================================
+// auto-apr28-016: a peer joins with no state, the existing pair has
+// already done a delete-then-modify-resurrect cycle on a file. The
+// late-joining peer must see the file as alive (modify-wins).
+// Validates that the LWW resolution is properly encoded in the CRDT
+// updates a fresh peer pulls down — not just a function of in-memory
+// state on a long-running peer.
+// ===========================================================================
+#[test]
+fn auto_apr28_016_modify_resurrect_visible_to_late_joiner() {
+    // Peer A creates note.md
+    let mut a = Manifest::new(ActorId::new());
+    create_text(&mut a, "note.md", 7).unwrap();
+
+    // Peer B copies A's state.
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    // Peer A deletes note.md
+    delete_path(&mut a, "note.md").unwrap();
+    // Peer B modifies note.md (concurrent with A's delete).
+    record_modify_text(&mut b, "note.md").unwrap();
+    // Sync A and B. Whichever has the higher stamp wins. The robust
+    // assertion is convergence; we'll set up so B's modify is later.
+    sync(&mut a, &mut b);
+    // Make sure B's modify wins by having B observe the delete and
+    // then issue another modify with a higher lamport.
+    record_modify_text(&mut b, "note.md").unwrap();
+    sync(&mut a, &mut b);
+
+    // After convergence both A and B should see note.md alive (the
+    // second modify on B has the highest stamp).
+    let pa_after = project(&a);
+    let pb_after = project(&b);
+    assert!(
+        pa_after.by_path.contains_key("note.md"),
+        "after modify-resurrects-delete, A must see note.md alive; got {:?}",
+        pa_after.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pb_after.by_path.contains_key("note.md"),
+        "after modify-resurrects-delete, B must see note.md alive"
+    );
+
+    // Now a fresh peer C joins, applying A's full state. C should
+    // ALSO see note.md alive — the resurrection must be encoded in
+    // the wire-level update bytes.
+    let c = Manifest::from_update(
+        ActorId::new(),
+        Lamport::ZERO,
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+    let pc = project(&c);
+    assert!(
+        pc.by_path.contains_key("note.md"),
+        "late-joining peer C must see note.md alive (modify-wins encoded \
+         in wire bytes), got {:?}",
+        pc.by_path.keys().collect::<Vec<_>>()
+    );
+    assert_converged("auto-apr28-016", &[&a, &b, &c]);
+}
