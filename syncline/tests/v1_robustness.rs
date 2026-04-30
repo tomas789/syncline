@@ -2709,6 +2709,37 @@ fn auto_apr28_046_entry_with_missing_parent_id_dropped_from_projection() {
 }
 
 // ===========================================================================
+// auto-apr28-047: malformed user-facing paths (empty, leading "/",
+// trailing "/", "//" double-slash, single ".") must be rejected by
+// `create_text` with an error — the manifest must never accept a
+// path that would project ambiguously.
+// ===========================================================================
+#[test]
+fn auto_apr28_047_create_text_rejects_malformed_paths() {
+    let bad_paths: &[&str] = &[
+        "",          // wholly empty
+        "/",         // root only
+        "/abs.md",   // absolute path attempt
+        "trailing/", // trailing slash → empty leaf
+        "a//b.md",   // double slash → empty middle segment
+        "/leading.md",
+    ];
+    let mut m = Manifest::new(ActorId::new());
+    for bad in bad_paths {
+        let result = create_text(&mut m, bad, 0);
+        assert!(
+            result.is_err(),
+            "create_text({bad:?}) must error, got {result:?}"
+        );
+    }
+    // No node was created.
+    assert!(
+        m.live_entries().is_empty(),
+        "no entries should have been minted for malformed paths"
+    );
+}
+
+// ===========================================================================
 // auto-apr28-043: file with a very long single-segment name (just
 // under the typical 255-byte filesystem segment limit). Manifest
 // must accept it, sync should preserve every byte, and projection
