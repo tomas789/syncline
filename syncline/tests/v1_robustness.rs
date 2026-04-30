@@ -2157,3 +2157,56 @@ fn auto_apr28_020_filename_with_nul_byte_in_manifest_handled() {
     assert_eq!(pa_e.id, id);
     assert_eq!(pb_e.id, id);
 }
+
+// ===========================================================================
+// auto-apr28-021: 4-peer all-different-ops convergence. Each peer
+// performs a different op type on the same shared NodeId from the
+// same baseline:
+//   - peer 0: rename to "ren-0.md"
+//   - peer 1: delete
+//   - peer 2: record_modify (text)
+//   - peer 3: leave alone (no-op)
+//
+// After full mesh sync, all four peers must reach identical
+// projections. The exact alive/dead/path state is decided by LWW
+// stamps; we only assert convergence.
+// ===========================================================================
+#[test]
+fn auto_apr28_021_four_peer_all_different_ops_converges() {
+    use syncline::v1::ids::NodeId;
+
+    // Baseline: all peers start with note.md
+    let baseline = {
+        let mut m = Manifest::new(ActorId::new());
+        let _id = create_text(&mut m, "note.md", 0).unwrap();
+        m.encode_state_as_update()
+    };
+
+    let mut peers: Vec<Manifest> = (0..4)
+        .map(|_| Manifest::from_update(ActorId::new(), Lamport::ZERO, &baseline).unwrap())
+        .collect();
+
+    // Each peer's view of the original NodeId — projections agree.
+    let note_id: NodeId = peers[0]
+        .all_entries()
+        .into_values()
+        .find(|e| e.kind == NodeKind::Text && e.name == "note.md")
+        .map(|e| e.id)
+        .expect("baseline has note.md");
+
+    // Different concurrent ops:
+    rename(&mut peers[0], "note.md", "ren-0.md").unwrap();
+    delete_path(&mut peers[1], "note.md").unwrap();
+    peers[2].record_modify(note_id);
+    // peer 3: no-op
+
+    full_mesh_sync(&mut peers, 6);
+    let head = projection_hash(&peers[0]);
+    for (i, p) in peers.iter().enumerate().skip(1) {
+        assert_eq!(
+            projection_hash(p),
+            head,
+            "peer {i} diverged from peer 0 in 4-way op race"
+        );
+    }
+}
