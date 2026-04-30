@@ -3592,6 +3592,45 @@ async fn auto_apr28_033_deeply_nested_tree_single_peer_bootstraps() {
 }
 
 // ===========================================================================
+// auto-apr28-038: five peers each create five distinct files at the
+// same vault root simultaneously (one batch per peer, written in a
+// tight loop with no inter-peer coordination). After full mesh sync,
+// every peer must hold all 25 files with identical bytes.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_038_five_peer_unique_file_burst_converges() {
+    const PEERS: usize = 5;
+    const FILES_PER_PEER: usize = 5;
+
+    let env = TestEnv::new(PEERS).await;
+
+    // Each peer authors FILES_PER_PEER files under unique names.
+    for p in 0..PEERS {
+        for f in 0..FILES_PER_PEER {
+            let name = format!("peer{p}-file{f}.md");
+            let body = format!("from-peer={p} file={f}\n");
+            fs::write(env.client_path(p).join(name), body).unwrap();
+        }
+    }
+
+    // 60s timeout — 25 files across 5 peers should converge well
+    // within that.
+    assert!(
+        wait_for_convergence(&env.dirs(), Duration::from_secs(60)).await,
+        "5-peer 25-file burst did not converge"
+    );
+
+    // No conflict copies anywhere (all paths were globally unique).
+    for p in 0..PEERS {
+        let conflicts = count_conflict_files(env.client_path(p));
+        assert_eq!(
+            conflicts, 0,
+            "peer {p} has {conflicts} conflict copies — paths were unique"
+        );
+    }
+}
+
+// ===========================================================================
 // auto-apr28-035: server is started, peers converge on a baseline,
 // server is killed, the on-disk SQLite file is truncated to half its
 // size (simulating disk corruption / a power-loss tear), then the
