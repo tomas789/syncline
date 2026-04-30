@@ -3238,3 +3238,100 @@ async fn auto_apr28_014_rapid_create_modify_delete_churn_converges() {
         "no conflict copies on B"
     );
 }
+
+// ===========================================================================
+// auto-apr28-018: 3 peers each write 30 distinct files at roughly the
+// same instant. After the dust settles every peer must have all 90
+// unique files with the right content; no conflict copies, no losses.
+// Stress for the manifest broadcast path under concurrent contention.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_018_three_peer_concurrent_burst_writes_converge() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    let mut clients: Vec<Child> = Vec::new();
+    for (i, d) in dirs.iter().enumerate() {
+        let name = format!("peer-{i}");
+        clients.push(spawn_client_with_name(d.path(), port, &name).await);
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Every peer writes 30 unique-named files at once. Use peer index
+    // as a namespace so paths are guaranteed distinct.
+    const PER_PEER: usize = 30;
+    for (peer_idx, d) in dirs.iter().enumerate() {
+        for i in 0..PER_PEER {
+            fs::write(
+                d.path().join(format!("p{peer_idx}-{i:02}.md")),
+                format!("peer {peer_idx} file {i}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    let dir_paths: Vec<PathBuf> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    let converged = wait_for_convergence(&dir_paths, Duration::from_secs(60)).await;
+
+    // Helper to list user files.
+    let user_files = |dir: &Path| -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let rel = p.strip_prefix(dir).unwrap();
+            let s = rel.to_string_lossy().to_string();
+            if s.starts_with(".syncline") {
+                continue;
+            }
+            out.push(s);
+        }
+        out.sort();
+        out
+    };
+
+    assert!(
+        converged,
+        "3-peer 30-each burst convergence required\n0: {:?}\n1: {:?}\n2: {:?}",
+        user_files(dirs[0].path()),
+        user_files(dirs[1].path()),
+        user_files(dirs[2].path()),
+    );
+
+    // Every peer must end with exactly 90 user files.
+    for (i, d) in dirs.iter().enumerate() {
+        let files = user_files(d.path());
+        assert_eq!(
+            files.len(),
+            3 * PER_PEER,
+            "peer {i}: expected {} files, got {}: {:?}",
+            3 * PER_PEER,
+            files.len(),
+            files
+        );
+    }
+
+    // No conflict copies.
+    for (i, d) in dirs.iter().enumerate() {
+        assert_eq!(
+            count_conflict_files(d.path()),
+            0,
+            "peer {i}: no conflict copies expected"
+        );
+    }
+
+    for c in clients.iter_mut() {
+        c.kill().await.unwrap();
+    }
+    server.kill().await.unwrap();
+}
