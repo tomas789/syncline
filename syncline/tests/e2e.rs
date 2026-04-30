@@ -3592,6 +3592,76 @@ async fn auto_apr28_033_deeply_nested_tree_single_peer_bootstraps() {
 }
 
 // ===========================================================================
+// auto-apr28-044: `syncline verify` exit-code semantics. After a peer
+// writes a file and converges with the server, verify should report
+// "converged" (exit 0). A second peer started in a brand-new vault
+// (empty manifest, zero local content) should report "diverged" against
+// the same server — projection hashes mismatch, exit 1.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_044_verify_reports_convergence_and_divergence() {
+    use std::process::Stdio;
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    fs::write(dir_a.path().join("anchor.md"), "anchor\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Stop A's sync so the manifest on disk is stable for verify.
+    client_a.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Run `syncline verify` against the same folder + server. Since
+    // the local manifest matches the server's, expect exit 0.
+    let url = format!("ws://127.0.0.1:{}/sync", port);
+    let status_a = Command::new(syncline_bin())
+        .arg("verify")
+        .arg("--folder")
+        .arg(dir_a.path())
+        .env("SYNCLINE_URL", &url)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        status_a.success(),
+        "verify on converged vault should exit 0; got {:?}",
+        status_a
+    );
+
+    // Brand-new fresh peer (no local manifest, nothing on disk) →
+    // local projection hash is "empty manifest" while server has
+    // anchor.md → divergent. Expect exit 1.
+    let dir_b = TempDir::new().unwrap();
+    let status_b = Command::new(syncline_bin())
+        .arg("verify")
+        .arg("--folder")
+        .arg(dir_b.path())
+        .env("SYNCLINE_URL", &url)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        !status_b.success(),
+        "verify on fresh-vault-vs-populated-server must exit non-zero (diverged); got {:?}",
+        status_b
+    );
+
+    server.kill().await.unwrap();
+}
+
+// ===========================================================================
 // auto-apr28-038: five peers each create five distinct files at the
 // same vault root simultaneously (one batch per peer, written in a
 // tight loop with no inter-peer coordination). After full mesh sync,
