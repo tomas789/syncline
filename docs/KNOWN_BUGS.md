@@ -253,3 +253,73 @@ On macOS, FSEvents reports the canonical `/private/var/…` path, while `root_di
 **Impact**: File deletion events may be silently dropped on macOS in environments where the watched directory lives under a symlinked path prefix. The deleted file is not propagated as an empty-content update to the server.
 
 **Proposed Fix**: When `strip_prefix` fails in `get_doc_id`, try stripping with the non-canonicalized `root_dir` as a fallback before returning an error.
+
+### 16. BUG: Phantom Conflict Copies After `.syncline/` Wipe-Recovery (OPEN)
+
+**Location**: `syncline/src/client_v1.rs`, `scan_once` adoption logic
+(approx. lines 855–910).
+
+**Issue**: When a peer's `.syncline/` directory is wiped (user
+`rm -rf .syncline/`, disk corruption, failed install, plugin upgrade
+that rebuilds the local cache, etc.) but its vault user files remain
+on disk, reconnecting the peer to the server produces **phantom
+conflict copies of every existing file** on both this peer and any
+other peer connected to the same server.
+
+**Repro**: `syncline/tests/e2e.rs::auto_apr28_008_wiped_syncline_dir_recovers_via_resync`
+(currently `#[ignore]`d). Setup:
+
+1. Server + peers A and B converge on N text files.
+2. Kill peer B; `rm -rf <peer-b vault>/.syncline/`.
+3. Reconnect peer B against the same server.
+
+After step 3 every original file `file-i.md` ends up paired with a
+`file-i.conflict-<actor>-<lamp>-<id>.md` sibling. Both peers carry
+2N files instead of N. Bytes are correct on both copies but the user
+sees an explosion of conflict files matching the file count of their
+vault.
+
+**Root cause**: in `scan_once`, the adoption guard at the same-path
+text branch is:
+
+```rust
+let adopt_existing = proj
+    .by_path
+    .get(&rel_str)
+    .filter(|e| e.kind == NodeKind::Text)
+    .filter(|e| content.has_persisted(e.id) || body.is_empty());
+```
+
+After `.syncline/` wipe, `content.has_persisted(e.id)` is **false**
+for every node (the local content store is empty). The on-disk body
+is non-empty, so `body.is_empty()` is also false. The adopt path is
+skipped and the code falls through to
+`create_text_allowing_collision`, which mints a brand-new NodeId
+under the same path. The projection then emits a conflict suffix on
+the loser — for every single file on the disk.
+
+**Why it's hard to fix without breaking other paths**: the same code
+path also handles the legitimate offline-collision case
+(`test_both_offline_same_name_conflict`), where the disk content is
+genuinely different from the eventual remote content and we **want**
+a conflict suffix. Distinguishing wipe-recovery from offline-collision
+requires comparing the disk body to the (not-yet-arrived) remote
+content subdoc body. A correct fix would either:
+
+1. Defer adoption when there's a same-path text entry without
+   persisted content; once the content subdoc lands, compare disk to
+   remote and either no-op (wipe case) or mint a fresh NodeId for
+   the local body via `create_text_allowing_collision` (collision
+   case). This requires queuing deferred-adopt entries through to
+   the STEP_2 handler.
+2. Fingerprint the disk body (e.g., SHA-256) at scan time, store
+   alongside the just-minted node, and after STEP_2 arrives detect
+   that the freshly-minted node and the remote node have identical
+   bodies → atomically delete-and-merge the redundant fresh node.
+
+**Workaround**: users hit by this can `rm` the `.conflict-*` files
+manually after the dust settles — both copies are byte-equal so no
+data loss. But the UX is poor.
+
+**Severity**: medium — no data loss, but produces N phantom files
+on every wipe-recovery. Likely to occur on plugin upgrade too.
