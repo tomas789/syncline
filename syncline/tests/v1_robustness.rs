@@ -2653,3 +2653,32 @@ fn auto_apr28_041_name_swap_race_converges_no_data_loss() {
         .collect();
     assert_eq!(conflicts.len(), 1, "exactly one conflict-suffixed sibling");
 }
+
+// ===========================================================================
+// auto-apr28-043: file with a very long single-segment name (just
+// under the typical 255-byte filesystem segment limit). Manifest
+// must accept it, sync should preserve every byte, and projection
+// must surface the same path on both peers.
+// ===========================================================================
+#[test]
+fn auto_apr28_043_long_single_name_segment_roundtrips() {
+    // 250-byte name (+ 3-byte ".md" → 253 bytes total, just under
+    // ext4's 255-byte segment limit).
+    let stem: String = std::iter::repeat('x').take(250).collect();
+    let name = format!("{stem}.md");
+    assert_eq!(name.len(), 253);
+
+    let mut a = Manifest::new(ActorId::new());
+    let id = create_text(&mut a, &name, 0).unwrap();
+
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-043", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+    assert!(pa.by_path.contains_key(&name));
+    assert!(pb.by_path.contains_key(&name));
+    assert_eq!(pa.by_id[&id].path, name);
+    assert_eq!(pb.by_id[&id].path, name);
+}
