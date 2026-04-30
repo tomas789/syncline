@@ -2655,6 +2655,60 @@ fn auto_apr28_041_name_swap_race_converges_no_data_loss() {
 }
 
 // ===========================================================================
+// auto-apr28-046: a manifest entry references a parent NodeId that
+// does not exist in the manifest at all (J: a buggy/malicious peer
+// can synthesise this; or it can occur if a partial yrs update
+// arrives without the parent's create op for some transient reason).
+// `build_path` returns None for the orphan, so the entry is dropped
+// from projection — never surfaces with a half-built path.
+// ===========================================================================
+#[test]
+fn auto_apr28_046_entry_with_missing_parent_id_dropped_from_projection() {
+    use syncline::v1::ids::NodeId;
+
+    let mut a = Manifest::new(ActorId::new());
+    // Create one legitimate file at the root so the manifest isn't
+    // empty.
+    let root_id = create_text(&mut a, "root.md", 0).unwrap();
+
+    // Synthesise an entry whose parent points to a NodeId that has
+    // never existed. We use the manifest's create_node API directly
+    // with a fabricated parent.
+    let phantom = NodeId::new();
+    assert!(a.get_entry(phantom).is_none(), "phantom is unknown");
+    let _ghost = a.create_node(
+        "ghost.md",
+        Some(phantom),
+        NodeKind::Text,
+        &[],
+        0,
+    );
+
+    // Sync to a fresh peer.
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-046", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both peers must agree the orphaned ghost is NOT in projection.
+    assert!(
+        !pa.by_id.contains_key(&_ghost),
+        "ghost with missing parent must not be in A's projection"
+    );
+    assert!(
+        !pb.by_id.contains_key(&_ghost),
+        "ghost with missing parent must not be in B's projection"
+    );
+
+    // The legitimate root file is unaffected.
+    assert!(pa.by_id.contains_key(&root_id));
+    assert!(pb.by_id.contains_key(&root_id));
+    assert_eq!(pa.by_id[&root_id].path, "root.md");
+}
+
+// ===========================================================================
 // auto-apr28-043: file with a very long single-segment name (just
 // under the typical 255-byte filesystem segment limit). Manifest
 // must accept it, sync should preserve every byte, and projection
