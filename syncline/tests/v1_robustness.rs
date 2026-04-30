@@ -2524,3 +2524,69 @@ fn auto_apr28_036_unicode_rtl_and_emoji_filenames_preserved() {
         "manifest collapsed two distinct RTL-trick names"
     );
 }
+
+// ===========================================================================
+// auto-apr28-039: simulate `client_v1::load_manifest`'s rehydrate path.
+// `Manifest::from_update(actor, Lamport::ZERO, bytes)` rebuilds the
+// doc but does NOT scan the doc for the highest lamport in any
+// existing entry. If the peer immediately performs a local op
+// BEFORE syncing with the server, the new op stamps at lamport=1
+// even though entries with lamport ≥ N already exist on disk —
+// any concurrent edit on another peer with a "real" lamport would
+// then beat the local edit's stamp tiebreak and silently overwrite
+// the user's just-typed change.
+//
+// This test reproduces the lamport-rollback after rehydrate and
+// asserts the desired property: the rehydrated peer's first
+// post-load op must stamp strictly above any pre-existing entry's
+// stamp.
+// ===========================================================================
+#[test]
+fn auto_apr28_039_rehydrate_then_modify_must_outstamp_existing_entries() {
+    use syncline::v1::ids::Lamport;
+
+    // Build a manifest with a few ops so created_at on the entries is
+    // ≥ 3.
+    let mut a = Manifest::new(ActorId::new());
+    let _ = create_text(&mut a, "x.md", 0).unwrap();
+    let _ = create_text(&mut a, "y.md", 0).unwrap();
+    let _ = create_text(&mut a, "z.md", 0).unwrap(); // lamport now == 3
+    assert_eq!(a.lamport(), Lamport(3));
+
+    // Find max lamport stamp on z.md so we know what we must beat.
+    let pre_proj = project(&a);
+    let z_pre = &pre_proj.by_path["z.md"];
+    let z_id = z_pre.id;
+    let z_node_pre = a.get_entry(z_id).unwrap();
+    let max_existing = z_node_pre.created_at.get();
+    assert!(max_existing >= 3, "test setup sanity, got {max_existing}");
+
+    // Encode and rehydrate via the production `load_manifest` path
+    // (Lamport::ZERO).
+    let encoded = a.encode_state_as_update();
+    let actor = a.actor();
+    let mut a_rehydrated =
+        Manifest::from_update(actor, Lamport::ZERO, &encoded).unwrap();
+
+    // Issue a local modify on the rehydrated manifest BEFORE any
+    // sync. This is the realistic case: user opens Obsidian, types
+    // a character, and the local lamport must already be at least
+    // max_existing + 1 — otherwise the modify is silently
+    // outranked by anything other peers may have stamped concurrently.
+    a_rehydrated.record_modify(z_id);
+    let z_after = a_rehydrated.get_entry(z_id).unwrap();
+    let mod_lamp = z_after
+        .modify_stamp
+        .expect("modify must record modify_stamp")
+        .lamport
+        .get();
+
+    assert!(
+        mod_lamp > max_existing,
+        "rehydrated peer's first modify stamped at lamport={mod_lamp} \
+         but pre-existing entries already use lamport={max_existing}. \
+         A concurrent edit from another peer at lamport={} would \
+         silently win the LWW race and erase the user's change.",
+        max_existing + 1,
+    );
+}
