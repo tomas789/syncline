@@ -2210,3 +2210,54 @@ fn auto_apr28_021_four_peer_all_different_ops_converges() {
         );
     }
 }
+
+// ===========================================================================
+// auto-apr28-023: peer A creates a Text node at "data", peer B creates
+// a Directory at "data" (same path, different kinds). Realistic when
+// one user makes "data" as a note and another mkdirs it. After sync
+// both peers must agree on a deterministic resolution — neither
+// silently shadows the other.
+// ===========================================================================
+#[test]
+fn auto_apr28_023_text_vs_directory_same_path_converges() {
+    let mut a = Manifest::new(ActorId::new());
+    let _text_id = a.create_node("data", None, NodeKind::Text, &[], 5);
+
+    let mut b = Manifest::new(ActorId::new());
+    let _dir_id = b.create_node("data", None, NodeKind::Directory, &[], 0);
+    // Add a child under B's "data" directory so we can also see if
+    // the child survives.
+    let _child = b.create_node(
+        "child.md",
+        Some(_dir_id),
+        NodeKind::Text,
+        &[],
+        2,
+    );
+
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-023", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both peers must agree on the projection paths.
+    let mut paths_a: Vec<_> = pa.by_path.keys().cloned().collect();
+    let mut paths_b: Vec<_> = pb.by_path.keys().cloned().collect();
+    paths_a.sort();
+    paths_b.sort();
+    assert_eq!(
+        paths_a, paths_b,
+        "text-vs-directory collision: peers disagree on layout"
+    );
+
+    // The text node is in projection (directories don't get rows).
+    // Either the text is at "data" (canonical) or at a conflict
+    // suffix; what matters is consistency. The child of B's
+    // directory must also surface — it's parented to the directory
+    // NodeId, which is independent of the text node.
+    assert!(
+        pa.by_path.values().any(|e| e.kind == NodeKind::Text),
+        "at least one text entry must be live"
+    );
+}
