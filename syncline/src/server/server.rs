@@ -1289,6 +1289,70 @@ mod tests {
     }
 
     // =====================================================================
+    // auto-apr28-040: a malicious / mis-deployed peer sends MSG_VERSION
+    // claiming major=99 (a far-future protocol). Per the handshake at
+    // `ws_handler:190`, the server must close the connection without
+    // echoing a VERSION reply. A subsequent v1 client must still get a
+    // clean handshake — the bad client mustn't poison the server.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_040_incompatible_major_version_closes_then_recovers() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        // First connection: claim major=99.
+        let (mut ws_bad, _) = connect_async(&url).await.unwrap();
+        let bogus_version = vec![99u8, 0u8];
+        let frame = encode_message(MSG_VERSION, MANIFEST_DOC_ID, &bogus_version);
+        send_bin(&mut ws_bad, frame).await;
+
+        // Server should drop the connection without sending VERSION.
+        // It might either close cleanly OR just stop reading; either
+        // way, the next read call shouldn't see a VERSION echo.
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(800), ws_bad.next()).await;
+        match outcome {
+            Ok(Some(Ok(TungsteniteMessage::Binary(b)))) => {
+                // If server replied at all, it must NOT be a VERSION
+                // echo claiming our bogus version is OK.
+                let (t, _d, _p) = decode_message(&b).expect("framed");
+                assert_ne!(
+                    t, MSG_VERSION,
+                    "server should not echo VERSION on incompatible major"
+                );
+            }
+            Ok(Some(Ok(TungsteniteMessage::Close(_)))) | Ok(None) => {
+                // Clean close — ideal.
+            }
+            Ok(Some(Err(_))) => {
+                // Transport error from the closed socket — also fine.
+            }
+            Ok(Some(Ok(_))) => { /* unrelated frame, ignore */ }
+            Err(_) => {
+                // Timeout: server stayed silent. Acceptable too.
+            }
+        }
+        drop(ws_bad);
+
+        // Second connection: a normal v1 peer must still get a clean
+        // handshake. If the bad client wedged the server, this fails.
+        let (mut ws_good, _) = connect_async(&url).await.unwrap();
+        let good_frame = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws_good, good_frame).await;
+        let echo = recv_bin(&mut ws_good).await;
+        let (t, d, p) = decode_message(&echo).expect("good handshake reply framed");
+        assert_eq!(t, MSG_VERSION);
+        assert_eq!(d, MANIFEST_DOC_ID);
+        let (major, minor) =
+            decode_version_handshake(p).expect("valid version payload");
+        assert_eq!((major, minor), (V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR));
+    }
+
+    // =====================================================================
     // auto-apr28-037: a peer sends MSG_BLOB_REQUEST for a SHA-256 hash
     // that doesn't exist on the server. The server must NOT crash, NOT
     // reply with garbage, and must remain responsive for subsequent
