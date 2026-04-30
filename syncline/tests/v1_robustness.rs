@@ -1754,3 +1754,52 @@ fn auto_apr28_009_concurrent_directory_rename_with_descendant_modify_converges()
     let r = pa.by_path.get("Archive/note.md").unwrap();
     assert_eq!(r.id, note, "rename of parent does not mint a new file");
 }
+
+// ===========================================================================
+// auto-apr28-012: two files differing only in case at the manifest layer.
+// On POSIX both are legal; on case-insensitive FS (macOS APFS, NTFS) the
+// disk layer can only materialise one. The manifest itself must keep
+// both as distinct projections (different paths, different NodeIds) —
+// case collapsing at the disk layer is a separate concern (see
+// `e2e/test/specs/issue56.e2e.ts`). This test pins the manifest-level
+// behaviour: case-different paths are distinct rows in `by_path`.
+// ===========================================================================
+#[test]
+fn auto_apr28_012_case_only_difference_keeps_distinct_manifest_rows() {
+    let mut a = Manifest::new(ActorId::new());
+    let upper = create_text(&mut a, "README.md", 1).unwrap();
+    let lower = create_text(&mut a, "readme.md", 2).unwrap();
+    let mixed = create_text(&mut a, "ReadMe.md", 3).unwrap();
+
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-012-case", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // All three must surface byte-distinct on both peers.
+    for p in &["README.md", "readme.md", "ReadMe.md"] {
+        assert!(
+            pa.by_path.contains_key(*p),
+            "peer A missing {p}; got {:?}",
+            pa.by_path.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pb.by_path.contains_key(*p),
+            "peer B missing {p}; got {:?}",
+            pb.by_path.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Distinct NodeIds — manifest must not have collapsed them.
+    assert_ne!(upper, lower);
+    assert_ne!(lower, mixed);
+    assert_ne!(upper, mixed);
+
+    // Their projection sizes match the source file sizes (sanity
+    // they didn't get cross-wired).
+    assert_eq!(pa.by_path["README.md"].size, 1);
+    assert_eq!(pa.by_path["readme.md"].size, 2);
+    assert_eq!(pa.by_path["ReadMe.md"].size, 3);
+}
