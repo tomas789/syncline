@@ -2303,3 +2303,43 @@ fn auto_apr28_025_six_peer_long_random_fuzz_converges() {
         }
     }
 }
+
+// ===========================================================================
+// auto-apr28-027: same-peer self-resurrect via modify after delete.
+// A peer deletes a file (it leaves projection), then issues a modify
+// on the same NodeId. The modify's lamport > delete's lamport, so the
+// entry resurrects on this peer. Other peers must observe the
+// resurrection.
+// ===========================================================================
+#[test]
+fn auto_apr28_027_same_peer_self_resurrect_via_post_delete_modify() {
+    let mut a = Manifest::new(ActorId::new());
+    let id = create_text(&mut a, "doc.md", 0).unwrap();
+
+    // Delete on A.
+    delete_path(&mut a, "doc.md").unwrap();
+    let pa_after_delete = project(&a);
+    assert!(
+        pa_after_delete.by_path.is_empty(),
+        "after delete, A has no live entries"
+    );
+
+    // Modify the same NodeId on A. mod_lamp now > del_lamp.
+    a.record_modify(id);
+    let pa_after_modify = project(&a);
+    assert!(
+        pa_after_modify.by_path.contains_key("doc.md"),
+        "after self-modify, A must see doc.md alive again (modify-wins-over-delete)"
+    );
+
+    // Sync to a fresh peer B. B must also see it alive.
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-027", &[&a, &b]);
+    let pb = project(&b);
+    assert!(
+        pb.by_path.contains_key("doc.md"),
+        "B must observe the resurrection"
+    );
+    assert_eq!(pb.by_path["doc.md"].id, id);
+}
