@@ -2051,3 +2051,62 @@ fn auto_apr28_017_duplicate_actor_id_does_not_cause_data_loss() {
     );
     assert!(pa2.by_path.contains_key("shared.md"));
 }
+
+// ===========================================================================
+// auto-apr28-019: a peer reconnecting after months of being offline
+// while other peers did 1000s of ops. Local lamport is small (~10),
+// remote lamport is huge (~10_000). After applying remote state, the
+// local lamport must observe correctly so the next local op is
+// stamped above the remote — no LWW backwards-compat issues.
+// ===========================================================================
+#[test]
+fn auto_apr28_019_huge_lamport_gap_observes_correctly() {
+    // Build a "big" peer with many ops to push lamport high.
+    let mut big = Manifest::new(ActorId::new());
+    for i in 0..2000 {
+        let _ = create_text(&mut big, &format!("note_{i}.md"), 0);
+    }
+    let big_lamp = big.lamport().get();
+    assert!(
+        big_lamp >= 2000,
+        "big peer should have lamport ≥ 2000, got {big_lamp}"
+    );
+
+    // Build a "small" peer that's been offline. Few ops, small lamport.
+    let mut small = Manifest::new(ActorId::new());
+    create_text(&mut small, "tiny.md", 0).unwrap();
+    let small_lamp_pre = small.lamport().get();
+    assert!(small_lamp_pre <= 5, "small peer lamport should still be small");
+
+    // Small peer pulls big's state.
+    small.apply_update(&big.encode_state_as_update()).unwrap();
+
+    // Small's lamport must have observed past big's lamport.
+    assert!(
+        small.lamport().get() >= big_lamp,
+        "small lamport must observe up to big's: {} vs {}",
+        small.lamport().get(),
+        big_lamp,
+    );
+
+    // Now small does a local op. Its stamp must beat any of big's
+    // existing stamps.
+    create_text(&mut small, "after-catchup.md", 0).unwrap();
+    let after_lamp = small.lamport().get();
+    assert!(
+        after_lamp > big_lamp,
+        "post-catchup local op must produce a higher stamp than \
+         any of big's existing stamps; got after={} big={}",
+        after_lamp,
+        big_lamp
+    );
+
+    // And big, when pulling small's state, must observe small's new
+    // op and rank it as the most recent.
+    big.apply_update(&small.encode_state_as_update()).unwrap();
+    let pa = project(&small);
+    let pb = project(&big);
+    assert!(pa.by_path.contains_key("after-catchup.md"));
+    assert!(pb.by_path.contains_key("after-catchup.md"));
+    assert_converged("auto-apr28-019", &[&small, &big]);
+}
