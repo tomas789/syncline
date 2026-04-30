@@ -318,4 +318,81 @@ mod tests {
         assert!(db.load_blob("nonexistent").await.unwrap().is_none());
         assert!(!db.has_blob("nonexistent").await.unwrap());
     }
+
+    // =====================================================================
+    // auto-apr28-010: a corrupted `update_data` row in the `updates`
+    // table must NOT crash the server's read path. Models partial disk
+    // corruption (a sector flip on the SQLite file, a bad BLOB inserted
+    // by a buggy peer) — the server should defensively skip the bad
+    // row, return the well-formed updates, and let new writes proceed.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_010_db_survives_corrupted_update_row() {
+        let db = Db::new("sqlite::memory:").await.unwrap();
+        let doc_id = "content:00000000-0000-0000-0000-000000000000";
+
+        // Insert one well-formed yrs update and one garbage row into
+        // the same doc_id. The well-formed one must survive; the
+        // garbage one must be silently skipped.
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("text");
+        let good_update = {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "hello world");
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let garbage_update: Vec<u8> = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+
+        // Order: garbage first, then good. The decode loop must not
+        // bail on the garbage and must still apply the good one.
+        db.save_update(doc_id, &garbage_update).await.unwrap();
+        db.save_update(doc_id, &good_update).await.unwrap();
+
+        // get_doc_state_vector applies both; the bad one is skipped.
+        // The returned SV must reflect the good update's state.
+        let sv_bytes = db.get_doc_state_vector(doc_id).await.unwrap();
+        let sv = StateVector::decode_v1(&sv_bytes).expect("server SV decodes");
+        // SV must be non-trivial — the good update inserted 11 bytes
+        // of text, so the encoded SV has at least one actor entry.
+        assert!(
+            !sv.is_empty(),
+            "state vector must reflect the good update; got empty SV"
+        );
+
+        // get_all_updates_since with a default SV must return a yrs
+        // update that, when applied to a fresh doc, yields the same
+        // text body as the original good update.
+        let merged = db
+            .get_all_updates_since(doc_id, &StateVector::default())
+            .await
+            .unwrap();
+        let parsed = Update::decode_v1(&merged).expect("merged update decodes");
+        let fresh = Doc::new();
+        let fresh_text = fresh.get_or_insert_text("text");
+        fresh.transact_mut().apply_update(parsed);
+        let body = fresh_text.get_string(&fresh.transact());
+        assert_eq!(body, "hello world", "good update must survive the garbage row");
+
+        // And new writes must still succeed afterwards.
+        let extra = {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 11, "!");
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        db.save_update(doc_id, &extra).await.unwrap();
+
+        // Final state should now read "hello world!" via the same path.
+        let merged2 = db
+            .get_all_updates_since(doc_id, &StateVector::default())
+            .await
+            .unwrap();
+        let parsed2 = Update::decode_v1(&merged2).expect("merged update decodes (round 2)");
+        let fresh2 = Doc::new();
+        let fresh2_text = fresh2.get_or_insert_text("text");
+        fresh2.transact_mut().apply_update(parsed2);
+        let body2 = fresh2_text.get_string(&fresh2.transact());
+        assert_eq!(body2, "hello world!");
+    }
 }
