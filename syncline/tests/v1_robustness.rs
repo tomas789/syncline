@@ -2590,3 +2590,66 @@ fn auto_apr28_039_rehydrate_then_modify_must_outstamp_existing_entries() {
         max_existing + 1,
     );
 }
+
+// ===========================================================================
+// auto-apr28-041: name-swap race. Both peers start with two synced
+// files X.md and Y.md. Peer A renames X.md → Y.md (collides with
+// existing Y.md on its own side, prevented by `rename`). Peer B
+// concurrently renames Y.md → X.md (also collides). After sync, both
+// peers must converge — the manifest state must agree, neither side
+// silently loses entries, and projections must list the same paths.
+// We don't pin which exact path each NodeId ends up at; we only
+// require determinism and no data loss.
+// ===========================================================================
+#[test]
+fn auto_apr28_041_name_swap_race_converges_no_data_loss() {
+    let mut a = Manifest::new(ActorId::new());
+    let x_id = create_text(&mut a, "X.md", 0).unwrap();
+    let y_id = create_text(&mut a, "Y.md", 0).unwrap();
+
+    // Bootstrap B from A's pre-rename state.
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    // Concurrent same-stamp swap: A renames X→"NewName"; B renames
+    // Y→"NewName". Both target the same name → conflict suffix on
+    // the loser. (A direct A:X→Y / B:Y→X is illegal because `rename`
+    // refuses to overwrite an existing path; we test the
+    // "both peers want the same target name" race instead.)
+    rename(&mut a, "X.md", "shared.md").unwrap();
+    rename(&mut b, "Y.md", "shared.md").unwrap();
+
+    sync(&mut a, &mut b);
+    assert_converged("name-swap-race", &[&a, &b]);
+    assert_same_paths("name-swap-race", &a, &b);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both NodeIds must survive on both peers — neither file silently
+    // lost. Y.md on A and X.md on B are intact (the unrenamed
+    // siblings).
+    assert!(pa.by_id.contains_key(&x_id));
+    assert!(pa.by_id.contains_key(&y_id));
+    assert!(pb.by_id.contains_key(&x_id));
+    assert!(pb.by_id.contains_key(&y_id));
+
+    // Exactly one peer's renamed entry projects at "shared.md"; the
+    // other gets a conflict suffix. Both peers must agree on which.
+    let canonical_id_a = pa.by_path["shared.md"].id;
+    let canonical_id_b = pb.by_path["shared.md"].id;
+    assert_eq!(
+        canonical_id_a, canonical_id_b,
+        "both peers must agree on which NodeId wins the rename collision"
+    );
+    let conflicts: Vec<_> = pa
+        .by_path
+        .iter()
+        .filter(|(k, _)| k.contains(".conflict-"))
+        .collect();
+    assert_eq!(conflicts.len(), 1, "exactly one conflict-suffixed sibling");
+}
