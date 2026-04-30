@@ -1153,4 +1153,66 @@ mod tests {
         // subscribe. So accept ≥ 0.
         assert!(json["connected_clients"].as_u64().unwrap() <= 1);
     }
+
+    // =====================================================================
+    // auto-apr28-026: a malicious peer sends a MSG_BLOB_UPDATE with a
+    // doc_id (the "claimed hash") that does NOT match the SHA-256 of
+    // the payload. The server must:
+    //   - re-compute the actual SHA-256 of the payload
+    //   - persist the blob under the *true* hash (not the claimed one)
+    // After the bad peer disconnects, an honest client requesting
+    // the TRUE hash must get the correct bytes; requesting the
+    // claimed (fake) hash must fail.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_026_blob_update_with_mismatched_doc_id_stores_under_true_hash() {
+        use sha2::{Digest, Sha256};
+        let (port, state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let (mut ws, _) = connect_async(url).await.unwrap();
+
+        // Handshake.
+        let frame = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws, frame).await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Send a blob with mismatched doc_id.
+        let real_payload: &[u8] = b"the real content";
+        let true_hash = format!("{:x}", Sha256::digest(real_payload));
+        let claimed_fake_hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        assert_ne!(claimed_fake_hash, true_hash);
+
+        let bad_frame = encode_message(MSG_BLOB_UPDATE, claimed_fake_hash, real_payload);
+        send_bin(&mut ws, bad_frame).await;
+
+        // Give the server a moment to persist.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The blob is stored under the TRUE hash.
+        let loaded_true = state
+            .db
+            .load_blob(&true_hash)
+            .await
+            .expect("load blob with true hash");
+        assert_eq!(
+            loaded_true.as_deref(),
+            Some(real_payload),
+            "blob must be stored under the actual SHA-256, not the claimed one"
+        );
+
+        // The claimed (fake) hash is NOT a key in the blob table.
+        let loaded_fake = state
+            .db
+            .load_blob(claimed_fake_hash)
+            .await
+            .expect("load blob with claimed fake hash");
+        assert!(
+            loaded_fake.is_none(),
+            "no blob should be stored under the (forged) claimed hash"
+        );
+    }
 }
