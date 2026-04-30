@@ -2396,3 +2396,68 @@ fn auto_apr28_028_slash_in_name_creates_ambiguous_projection_path() {
         "name with embedded slash currently embeds in projection path: {weird_path:?}"
     );
 }
+
+// ===========================================================================
+// auto-apr28-032: two peers whose lamport clocks have ALREADY
+// saturated at u64::MAX — every subsequent local op stamps at the
+// same saturated value. They concurrently create a file at the same
+// path. Convergence must still be deterministic via the stamp
+// (lamport, actor) tiebreak — losing-actor's row gets the
+// .conflict-* suffix; both peers agree on which side wins. This
+// catches the "saturated lamport => permanent stamp tie" failure mode.
+// ===========================================================================
+#[test]
+fn auto_apr28_032_saturated_lamport_two_peers_still_converge() {
+    use syncline::v1::ids::Lamport;
+
+    // Build a tiny baseline so each manifest is non-empty.
+    let mut seed = Manifest::new(ActorId::new());
+    let _ = create_text(&mut seed, "seed.md", 0).unwrap();
+    let baseline = seed.encode_state_as_update();
+
+    // Two peers with the SAME baseline state but distinct actor IDs.
+    // Both lamports start at u64::MAX (saturated).
+    let actor_a = ActorId::new();
+    let actor_b = ActorId::new();
+    let mut a = Manifest::from_update(actor_a, Lamport(u64::MAX), &baseline).unwrap();
+    let mut b = Manifest::from_update(actor_b, Lamport(u64::MAX), &baseline).unwrap();
+
+    // Both create the same-named file. Each tick saturates at u64::MAX
+    // (`Lamport::tick` is saturating_add). So both creates land at the
+    // identical stamp lamport=u64::MAX, but the c_actor differs →
+    // tiebreak resolves.
+    let _id_a = create_text(&mut a, "race.md", 0).unwrap();
+    let _id_b = create_text(&mut b, "race.md", 0).unwrap();
+
+    // Sanity: lamport is still saturated after the tick.
+    assert_eq!(a.lamport().get(), u64::MAX);
+    assert_eq!(b.lamport().get(), u64::MAX);
+
+    sync(&mut a, &mut b);
+    assert_converged("saturated-lamport-race", &[&a, &b]);
+    assert_same_paths("saturated-lamport-race", &a, &b);
+
+    let p = project(&a);
+    let mut paths: Vec<_> = p.by_path.keys().cloned().collect();
+    paths.sort();
+    // Both race.md nodes must surface (one canonical at race.md, one
+    // conflict-suffixed) plus the unrelated seed.md. Neither silently
+    // lost despite identical saturated lamport stamps.
+    assert!(
+        paths.contains(&"seed.md".to_string()),
+        "seed.md must persist, paths = {paths:?}"
+    );
+    assert!(
+        paths.contains(&"race.md".to_string()),
+        "race.md canonical winner must exist, paths = {paths:?}"
+    );
+    let conflict_count = paths.iter().filter(|p| p.contains(".conflict-")).count();
+    assert_eq!(
+        conflict_count, 1,
+        "exactly one conflict-suffixed loser expected, paths = {paths:?}"
+    );
+
+    // Lamport stayed saturated through the whole exercise.
+    assert_eq!(a.lamport().get(), u64::MAX);
+    assert_eq!(b.lamport().get(), u64::MAX);
+}
