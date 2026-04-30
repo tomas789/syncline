@@ -1867,3 +1867,56 @@ fn auto_apr28_013_five_peer_concurrent_rename_storm_converges() {
         targets
     );
 }
+
+// ===========================================================================
+// auto-apr28-015: adversarial parent-cycle. Synthesize a manifest where
+// node A's parent is B, and B's parent is A. The projection's
+// build_path must detect this and refuse to project either node —
+// neither should appear in `by_path`. The manifest must also not
+// crash, hang, or take quadratic time.
+// ===========================================================================
+#[test]
+fn auto_apr28_015_parent_cycle_drops_both_from_projection_no_hang() {
+    use syncline::v1::ids::NodeId;
+
+    let mut m = Manifest::new(ActorId::new());
+
+    // Create two nodes at root (parent=None for now), then re-parent
+    // them into a cycle.
+    let a = m.create_node("a.md", None, NodeKind::Text, &[], 0);
+    let b = m.create_node("b.md", None, NodeKind::Text, &[], 0);
+
+    // Re-parent: a→b and b→a. Now both nodes have parents that form a
+    // 2-cycle.
+    m.set_parent(a, Some(b));
+    m.set_parent(b, Some(a));
+
+    // Bound the projection time — if MAX_HOPS isn't honoured we'd
+    // loop forever. Run on a fresh thread with a 5s timeout.
+    let m_clone_update = m.encode_state_as_update();
+    let actor = ActorId::new();
+    let handle = std::thread::spawn(move || {
+        let m_rebuilt =
+            Manifest::from_update(actor, Lamport::ZERO, &m_clone_update).unwrap();
+        let proj = project(&m_rebuilt);
+        proj.by_path.keys().cloned().collect::<Vec<String>>()
+    });
+
+    // Poll for completion with a timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        handle.is_finished(),
+        "projection on a 2-cycle must terminate within 5s"
+    );
+
+    let paths = handle.join().expect("projection thread panicked");
+    // Both cyclic nodes must be dropped — the projection should be
+    // empty.
+    assert!(
+        paths.is_empty(),
+        "cyclic-parent nodes must be dropped from projection, got {paths:?}"
+    );
+}
