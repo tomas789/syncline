@@ -3590,3 +3590,81 @@ async fn auto_apr28_033_deeply_nested_tree_single_peer_bootstraps() {
     client_b.kill().await.unwrap();
     server.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-034: a single CLI peer is restarted three times in a row.
+// Each restart, a different file is added to the vault before the next
+// restart. The peer's actor_id (from `.syncline/actor_id`) survives,
+// and its lamport (from `.syncline/lamport`) is monotonic. After all
+// restarts, a fresh second peer must observe every file authored
+// across the restart cycles.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_034_cli_peer_restart_cycle_preserves_history() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+
+    // Track actor_id across restarts: must be stable.
+    let actor_id_path = dir_a.path().join(".syncline/actor_id");
+
+    let mut actor_observed: Option<String> = None;
+    let restart_count = 3;
+    for cycle in 0..restart_count {
+        let mut client = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        // Write a per-cycle file.
+        let body = format!("cycle={cycle}\n");
+        fs::write(dir_a.path().join(format!("note-{cycle}.md")), &body).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let id = fs::read_to_string(&actor_id_path)
+            .expect("actor_id file should exist after first run")
+            .trim()
+            .to_string();
+        match &actor_observed {
+            None => actor_observed = Some(id),
+            Some(prev) => assert_eq!(
+                prev, &id,
+                "actor_id must be stable across restart cycle {cycle}"
+            ),
+        }
+
+        client.kill().await.unwrap();
+        // Wait for the kill_on_drop task to actually reap.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    // Final restart so peer A is alive while peer B joins.
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let saw_all = poll_until(deadline, || {
+        (0..restart_count).all(|cycle| {
+            let p = dir_b.path().join(format!("note-{cycle}.md"));
+            p.is_file()
+                && fs::read_to_string(&p)
+                    .map(|s| s == format!("cycle={cycle}\n"))
+                    .unwrap_or(false)
+        })
+    })
+    .await;
+    assert!(saw_all, "peer B should observe all per-restart files");
+
+    assert_eq!(count_conflict_files(dir_a.path()), 0);
+    assert_eq!(count_conflict_files(dir_b.path()), 0);
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server.kill().await.unwrap();
+}
