@@ -3385,3 +3385,61 @@ async fn auto_apr28_024_binary_rename_across_folders_propagates() {
     assert_eq!(count_conflict_files(env.client_path(0)), 0);
     assert_eq!(count_conflict_files(env.client_path(1)), 0);
 }
+
+// ===========================================================================
+// auto-apr28-030: server crashes IMMEDIATELY after starting (before
+// any client connects), then restarts with the same DB. Models a flaky
+// server / failed first-start. Clients must connect cleanly to the
+// second instance.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_030_server_immediate_crash_then_restart_clients_connect() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+
+    // First server instance: kill it almost immediately.
+    let mut server1 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server1.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second instance same DB.
+    let mut server2 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Connect a fresh client.
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Make sure the client actually connected (has a manifest).
+    assert!(
+        dir_a.path().join(".syncline").join("manifest.bin").is_file(),
+        "client should have re-bootstrapped against the second server"
+    );
+
+    // Write a file and verify it's persisted server-side via a second
+    // client.
+    fs::write(dir_a.path().join("hello.md"), "after restart\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+
+    let target = dir_b.path().join("hello.md");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let saw = poll_until(deadline, || {
+        target.is_file()
+            && fs::read_to_string(&target)
+                .map(|s| s == "after restart\n")
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(saw, "second client should observe the post-restart write");
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server2.kill().await.unwrap();
+}
