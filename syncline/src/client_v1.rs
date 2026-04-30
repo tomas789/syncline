@@ -1623,121 +1623,182 @@ fn reconcile_projection_to_disk(
     let mut created_binary = 0usize;
     let mut pending_binary = 0usize;
     let mut conflicts_created = 0usize;
+    let mut skipped_failures = 0usize;
+
+    /// Per-entry materialisation outcome; tracks whatever the caller
+    /// has to bump in the surrounding counters. `Skip` is the
+    /// non-error variant for "nothing changed" / "deferred" cases
+    /// (e.g. binary placeholder with no chunks yet).
+    #[derive(Default)]
+    struct EntryDelta {
+        created_dirs: usize,
+        created_text: usize,
+        created_binary: usize,
+        pending_binary: usize,
+        conflicts_created: usize,
+    }
 
     for (path, entry) in &proj.by_path {
         if is_unsafe_relative_path(path) {
             warn!("skipping unsafe projection path {:?}", path);
             continue;
         }
-        let full = folder.join(path);
-        if let Some(parent) = full.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("mkdir -p {} for projected {:?}", parent.display(), path)
-                })?;
-                created_dirs += 1;
-            }
-        }
-        match entry.kind {
-            NodeKind::Text => {
-                if !full.exists() {
-                    // Use any subdoc content we already have so the
-                    // placeholder isn't empty when we're materialising a
-                    // conflict sibling whose bytes we ingested locally.
-                    // Missing / not-loaded / empty subdoc → empty file.
-                    let seed = content
-                        .and_then(|c| c.current_text(entry.id))
-                        .unwrap_or_default();
-                    if seed.is_empty() {
-                        fs::File::create(&full).with_context(|| {
-                            format!("create empty text placeholder {}", full.display())
-                        })?;
-                    } else {
-                        atomic_write(&full, seed.as_bytes()).with_context(|| {
-                            format!(
-                                "seed text placeholder {} with cached subdoc body",
-                                full.display()
-                            )
-                        })?;
-                    }
-                    created_text += 1;
-                }
-            }
-            NodeKind::Binary => {
-                let chunk_hashes = &entry.chunk_hashes;
-                if chunk_hashes.is_empty() {
-                    // Manifest entry with no chunks is a placeholder —
-                    // either the emitting peer hasn't written content
-                    // yet, or it's a truly empty file. Treat as
-                    // "nothing materialised yet" and try again later.
-                    debug!("binary {:?} has no chunks, skipping", path);
-                    continue;
-                }
-                // Need every chunk in local CAS before we can materialise.
-                let missing_chunks =
-                    chunk_hashes.iter().any(|h| !blobs.has(h));
-                if missing_chunks {
-                    pending_binary += 1;
-                    continue;
-                }
-
-                if full.exists() {
-                    let local_bytes = fs::read(&full)
-                        .with_context(|| format!("read local {}", full.display()))?;
-                    let local_chunk_hashes: Vec<String> =
-                        crate::v1::chunker::chunks_with_hashes(&local_bytes)
-                            .into_iter()
-                            .map(|c| c.hash)
-                            .collect();
-                    if &local_chunk_hashes == chunk_hashes {
-                        continue;
-                    }
-                    // Disk diverged from manifest. LWW: remote wins
-                    // (we reach this branch only after a remote
-                    // manifest update landed). Save local bytes as a
-                    // conflict sibling so nothing gets silently
-                    // clobbered.
-                    blobs.insert_bytes(&local_bytes).with_context(|| {
-                        format!("stash conflict bytes for {:?}", path)
+        let result: Result<EntryDelta> = (|| {
+            let mut delta = EntryDelta::default();
+            let full = folder.join(path);
+            if let Some(parent) = full.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("mkdir -p {} for projected {:?}", parent.display(), path)
                     })?;
-                    let actor_short = manifest.actor().short();
-                    let conflict_rel =
-                        conflict_sibling_path(path, &actor_short, &today_ymd());
-                    let conflict_full = folder.join(&conflict_rel);
-                    atomic_write(&conflict_full, &local_bytes).with_context(
-                        || format!("write conflict copy {}", conflict_full.display()),
-                    )?;
-                    let remote_bytes =
-                        assemble_chunks(blobs, chunk_hashes).with_context(|| {
-                            format!("assemble remote chunks for {:?}", path)
-                        })?;
-                    atomic_write(&full, &remote_bytes).with_context(|| {
-                        format!("overwrite with remote {}", full.display())
-                    })?;
-                    warn!(
-                        path = %path,
-                        conflict_copy = %conflict_rel,
-                        local_chunks = local_chunk_hashes.len(),
-                        remote_chunks = chunk_hashes.len(),
-                        "binary conflict: local bytes preserved, remote applied"
-                    );
-                    conflicts_created += 1;
-                    continue;
+                    delta.created_dirs += 1;
                 }
-
-                let bytes = assemble_chunks(blobs, chunk_hashes)
-                    .with_context(|| format!("assemble chunks for {:?}", path))?;
-                atomic_write(&full, &bytes).with_context(|| {
-                    format!(
-                        "materialize binary {} from {} chunks",
-                        full.display(),
-                        chunk_hashes.len()
-                    )
-                })?;
-                created_binary += 1;
             }
-            NodeKind::Directory => {
-                // Emergent — directories never appear in projection.by_path.
+            match entry.kind {
+                NodeKind::Text => {
+                    if !full.exists() {
+                        // Use any subdoc content we already have so the
+                        // placeholder isn't empty when we're materialising a
+                        // conflict sibling whose bytes we ingested locally.
+                        // Missing / not-loaded / empty subdoc → empty file.
+                        let seed = content
+                            .and_then(|c| c.current_text(entry.id))
+                            .unwrap_or_default();
+                        if seed.is_empty() {
+                            fs::File::create(&full).with_context(|| {
+                                format!("create empty text placeholder {}", full.display())
+                            })?;
+                        } else {
+                            atomic_write(&full, seed.as_bytes()).with_context(|| {
+                                format!(
+                                    "seed text placeholder {} with cached subdoc body",
+                                    full.display()
+                                )
+                            })?;
+                        }
+                        delta.created_text += 1;
+                    }
+                }
+                NodeKind::Binary => {
+                    let chunk_hashes = &entry.chunk_hashes;
+                    if chunk_hashes.is_empty() {
+                        // Empty chunk list has two possible meanings,
+                        // disambiguated by `size`:
+                        //   • `size == 0` → a *truly empty* binary file
+                        //     (e.g. `.gitkeep`). Materialise as a 0-byte
+                        //     file so it shows up on every peer.
+                        //   • `size > 0`  → a placeholder whose chunks
+                        //     haven't been authored or fetched yet. Try
+                        //     again on the next reconcile.
+                        if entry.size == 0 {
+                            if !full.exists() {
+                                fs::File::create(&full).with_context(|| {
+                                    format!(
+                                        "create empty binary placeholder {}",
+                                        full.display()
+                                    )
+                                })?;
+                                delta.created_binary += 1;
+                            }
+                        } else {
+                            debug!(
+                                "binary {:?} has no chunks (size={}), skipping",
+                                path, entry.size
+                            );
+                        }
+                        return Ok(delta);
+                    }
+                    // Need every chunk in local CAS before we can materialise.
+                    let missing_chunks =
+                        chunk_hashes.iter().any(|h| !blobs.has(h));
+                    if missing_chunks {
+                        delta.pending_binary += 1;
+                        return Ok(delta);
+                    }
+
+                    if full.exists() {
+                        let local_bytes = fs::read(&full)
+                            .with_context(|| format!("read local {}", full.display()))?;
+                        let local_chunk_hashes: Vec<String> =
+                            crate::v1::chunker::chunks_with_hashes(&local_bytes)
+                                .into_iter()
+                                .map(|c| c.hash)
+                                .collect();
+                        if &local_chunk_hashes == chunk_hashes {
+                            return Ok(delta);
+                        }
+                        // Disk diverged from manifest. LWW: remote wins
+                        // (we reach this branch only after a remote
+                        // manifest update landed). Save local bytes as a
+                        // conflict sibling so nothing gets silently
+                        // clobbered.
+                        blobs.insert_bytes(&local_bytes).with_context(|| {
+                            format!("stash conflict bytes for {:?}", path)
+                        })?;
+                        let actor_short = manifest.actor().short();
+                        let conflict_rel =
+                            conflict_sibling_path(path, &actor_short, &today_ymd());
+                        let conflict_full = folder.join(&conflict_rel);
+                        atomic_write(&conflict_full, &local_bytes).with_context(
+                            || format!("write conflict copy {}", conflict_full.display()),
+                        )?;
+                        let remote_bytes =
+                            assemble_chunks(blobs, chunk_hashes).with_context(|| {
+                                format!("assemble remote chunks for {:?}", path)
+                            })?;
+                        atomic_write(&full, &remote_bytes).with_context(|| {
+                            format!("overwrite with remote {}", full.display())
+                        })?;
+                        warn!(
+                            path = %path,
+                            conflict_copy = %conflict_rel,
+                            local_chunks = local_chunk_hashes.len(),
+                            remote_chunks = chunk_hashes.len(),
+                            "binary conflict: local bytes preserved, remote applied"
+                        );
+                        delta.conflicts_created += 1;
+                        return Ok(delta);
+                    }
+
+                    let bytes = assemble_chunks(blobs, chunk_hashes)
+                        .with_context(|| format!("assemble chunks for {:?}", path))?;
+                    atomic_write(&full, &bytes).with_context(|| {
+                        format!(
+                            "materialize binary {} from {} chunks",
+                            full.display(),
+                            chunk_hashes.len()
+                        )
+                    })?;
+                    delta.created_binary += 1;
+                }
+                NodeKind::Directory => {
+                    // Emergent — directories never appear in projection.by_path.
+                }
+            }
+            Ok(delta)
+        })();
+        match result {
+            Ok(d) => {
+                created_dirs += d.created_dirs;
+                created_text += d.created_text;
+                created_binary += d.created_binary;
+                pending_binary += d.pending_binary;
+                conflicts_created += d.conflicts_created;
+            }
+            Err(e) => {
+                // Per-entry failures are typically caused by a
+                // local FS state that disagrees with the projection
+                // (e.g. file/dir name collision: a Text node and a
+                // Directory node share the same name, so a Unix
+                // filesystem cannot represent both). Skip the
+                // offender, log loudly, and let the rest of the
+                // projection materialise. Bailing out here would
+                // strand every subsequent entry.
+                warn!(
+                    path = %path,
+                    "skipping projection entry: {e:#}",
+                );
+                skipped_failures += 1;
             }
         }
     }
@@ -1764,6 +1825,7 @@ fn reconcile_projection_to_disk(
         + pending_binary
         + conflicts_created
         + removed_stale
+        + skipped_failures
         > 0
     {
         info!(
@@ -1773,6 +1835,7 @@ fn reconcile_projection_to_disk(
             pending_binary,
             conflicts_created,
             removed_stale,
+            skipped_failures,
             "reconciled projection → disk"
         );
     }
@@ -1791,17 +1854,14 @@ fn reconcile_projection_to_disk(
 /// multiple conflicts on the same file — whether from different peers or
 /// from a restart-induced re-detection — don't collide.
 fn conflict_sibling_path(path: &str, actor_short: &str, date_ymd: &str) -> String {
-    let last_slash = path.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let dir_prefix = &path[..last_slash];
-    let last = &path[last_slash..];
-    let (stem, ext) = match last.rfind('.') {
-        // Hidden files like ".env" have no stem → keep the full name.
-        Some(dot) if dot > 0 => (&last[..dot], Some(&last[dot + 1..])),
-        _ => (last, None),
-    };
+    // Reuse the projection-layer helper so the rules for "what counts
+    // as an extension" stay in one place. In particular, leading dots
+    // are part of the basename — `..hidden` is not an extension on
+    // `.`. See `split_ext` for the full rationale.
+    let (stem, ext) = crate::v1::projection::split_ext(path);
     match ext {
-        Some(ext) => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short}).{ext}"),
-        None => format!("{dir_prefix}{stem} (conflict {date_ymd} {actor_short})"),
+        Some(ext) => format!("{stem} (conflict {date_ymd} {actor_short}).{ext}"),
+        None => format!("{stem} (conflict {date_ymd} {actor_short})"),
     }
 }
 
@@ -1827,13 +1887,14 @@ fn conflict_sibling_path(path: &str, actor_short: &str, date_ymd: &str) -> Strin
 /// closes the watcher-driven trigger. This filter closes the
 /// periodic-scan and stale-on-disk triggers. Both are needed.
 fn looks_like_conflict_sibling_artifact(rel_path: &str) -> bool {
-    let last_slash = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let last = &rel_path[last_slash..];
-    // Strip optional extension.
-    let stem = match last.rfind('.') {
-        Some(dot) if dot > 0 => &last[..dot],
-        _ => last,
-    };
+    // Use the projection-layer split so we treat hidden / multi-dot
+    // basenames the same way `conflict_sibling_path` builds them. A
+    // path like `..hidden (conflict 2026-04-21 abcd1234)` has stem
+    // `..hidden (conflict 2026-04-21 abcd1234)` (no extension).
+    let (stem_full, _ext) = crate::v1::projection::split_ext(rel_path);
+    // Drop any directory prefix — we only care about the final segment's stem.
+    let last_slash = stem_full.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let stem = &stem_full[last_slash..];
     // Stem must contain " (conflict YYYY-MM-DD HASH8)" as suffix.
     let Some(open) = stem.rfind(" (conflict ") else {
         return false;
@@ -2254,6 +2315,91 @@ mod tests {
         assert!(is_unsafe_relative_path("a/../b"));
         assert!(!is_unsafe_relative_path("a/b/c.md"));
         assert!(!is_unsafe_relative_path("file.md"));
+    }
+
+    #[test]
+    fn reconcile_materialises_truly_empty_binary_file() {
+        // Edge case from real users: a binary file that's literally
+        // 0 bytes (empty .png placeholders, an empty `.gitkeep`, etc.)
+        // chunks_with_hashes returns an empty list for empty input, so
+        // the manifest entry has chunk_hashes=[] AND size=0. The
+        // receiving peer's reconcile must understand "empty" vs
+        // "placeholder pending blob" — for an entry with size=0 and no
+        // chunks, materialise the file on disk as a 0-byte file.
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+
+        let mut m = Manifest::new(ActorId::new());
+        let proj = project(&m);
+        let outcome =
+            process_binary_file("empty.png", &[], &proj, &mut m, &blobs).unwrap();
+        assert!(
+            matches!(outcome, BinaryScanOutcome::Created { .. }),
+            "expected Created, got {outcome:?}"
+        );
+
+        reconcile_projection_to_disk(
+            folder,
+            &m,
+            &blobs,
+            &mut HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        let path = folder.join("empty.png");
+        assert!(
+            path.exists(),
+            "empty binary file should be materialised on receiving peer",
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "materialised binary must be 0 bytes",
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_bail_when_file_and_dir_share_a_name() {
+        // Pathological-but-reachable manifest state: peer A creates
+        // text file "docs.md", peer B (concurrent, before sync)
+        // creates "docs.md/README.md", which materialises a Directory
+        // node also named "docs.md". After sync both nodes coexist.
+        // Reconcile cannot represent this on a Unix filesystem (a
+        // file and a directory cannot share a name), but it MUST
+        // NOT bail out with `?` — that strands every other manifest
+        // entry in pre-reconcile state. Skip the loser, log a
+        // warning, materialise the rest.
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let (_bs_tmp, blobs) = fresh_blob_store();
+
+        let mut m = Manifest::new(ActorId::new());
+        crate::v1::ops::create_text(&mut m, "docs.md", 0).unwrap();
+        crate::v1::ops::create_text(&mut m, "docs.md/README.md", 0).unwrap();
+        // Add an unrelated file so we can confirm reconcile got past
+        // the conflict and processed later entries too.
+        crate::v1::ops::create_text(&mut m, "unrelated.md", 0).unwrap();
+
+        let result = reconcile_projection_to_disk(
+            folder,
+            &m,
+            &blobs,
+            &mut HashMap::new(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "reconcile must not bail on path conflict: {:?}",
+            result.err()
+        );
+        // Whichever arm wins on disk, the unrelated file must
+        // materialise — proves the loop kept going past the conflict.
+        assert!(
+            folder.join("unrelated.md").exists(),
+            "unrelated entry skipped by an early bail-out",
+        );
     }
 
     #[test]
@@ -2696,6 +2842,35 @@ mod tests {
         // without a leading stem.
         let got = conflict_sibling_path(".env", "aaaa1111", "2026-04-21");
         assert_eq!(got, ".env (conflict 2026-04-21 aaaa1111)");
+    }
+
+    #[test]
+    fn conflict_sibling_path_double_dot_filename_keeps_basename_intact() {
+        // `..hidden` had a bug where the second dot was treated as the
+        // extension separator, splitting into stem="." and ext="hidden"
+        // — so the conflict copy came out as
+        // `. (conflict …).hidden`, mangling the user-visible name.
+        // Now the entire `..hidden` is the stem.
+        let got = conflict_sibling_path("..hidden", "aaaa1111", "2026-04-21");
+        assert_eq!(got, "..hidden (conflict 2026-04-21 aaaa1111)");
+    }
+
+    #[test]
+    fn conflict_sibling_path_double_dot_with_extension() {
+        let got = conflict_sibling_path("..weird.txt", "aaaa1111", "2026-04-21");
+        assert_eq!(got, "..weird (conflict 2026-04-21 aaaa1111).txt");
+    }
+
+    #[test]
+    fn looks_like_conflict_recognises_double_dot_filename_artifact() {
+        // The recognizer must agree with `conflict_sibling_path`'s
+        // output: if it would be produced, it must be recognised.
+        assert!(looks_like_conflict_sibling_artifact(
+            "..hidden (conflict 2026-04-21 abcd1234)"
+        ));
+        assert!(looks_like_conflict_sibling_artifact(
+            "..weird (conflict 2026-04-21 abcd1234).txt"
+        ));
     }
 
     #[test]

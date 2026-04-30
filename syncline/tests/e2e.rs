@@ -2688,3 +2688,190 @@ async fn test_chunked_binary_modify_propagates() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+// =============================================================================
+// Obsidian-like onboarding scenarios
+// =============================================================================
+//
+// User flow under test:
+//   1. The user runs `syncline server` somewhere.
+//   2. They start a CLI client on a fresh, empty folder (their server proxy
+//      / "always on" peer) and let it connect.
+//   3. They start the Obsidian plugin pointed at the same server, except
+//      their vault folder ALREADY HAS a typical mix of pre-existing
+//      content: a couple of `.md` notes (one nested), a binary attachment,
+//      and the `.obsidian/` folder with both a "should-sync" plugin
+//      config AND the device-local `workspace.json` (which is in the
+//      default ignore list — must NOT propagate).
+//
+// The Obsidian plugin and the CLI client share the entire `v1::*`
+// portable layer; the WASM client mirrors the CLI's bootstrap path
+// (scan disk → manifest → push). So the CLI-vs-CLI test below is the
+// closest in-process proxy we have for "Obsidian onboarding into a
+// non-empty server" without spinning up real Obsidian. It exercises:
+//   - default ignore-list defaults (`.obsidian/workspace.json`)
+//   - nested directory creation on the receiving peer
+//   - binary blob upload + chunk fetch → byte-identical disk file
+//   - bidirectional sync after onboarding
+//   - cold-restart of the seeded peer with offline edits applied to
+//     the fresh peer in between
+async fn poll_until<F>(deadline: std::time::Instant, mut check: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    check()
+}
+
+#[tokio::test]
+async fn test_obsidian_like_onboarding_with_pre_existing_vault() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Step 2: empty/fresh client connects first.
+    let fresh_dir = TempDir::new().unwrap();
+    let mut client_fresh = spawn_client_with_name(fresh_dir.path(), port, "fresh").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Step 3: pre-seed an "Obsidian-like" vault.
+    let seeded_dir = TempDir::new().unwrap();
+    let seeded = seeded_dir.path();
+    fs::create_dir_all(seeded.join("notes/daily")).unwrap();
+    fs::create_dir_all(seeded.join(".obsidian")).unwrap();
+    fs::write(seeded.join("welcome.md"), "hello from seeded\n").unwrap();
+    fs::write(
+        seeded.join("notes/daily/day1.md"),
+        "# Day 1\nfirst entry",
+    )
+    .unwrap();
+    let photo_bytes: Vec<u8> = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00pretend-jpeg-bytes".to_vec();
+    fs::write(seeded.join("photo.jpg"), &photo_bytes).unwrap();
+    fs::write(
+        seeded.join(".obsidian/community-plugins.json"),
+        b"[\"dataview\",\"templater\"]",
+    )
+    .unwrap();
+    // workspace.json is in the default ignore list → MUST NOT sync.
+    fs::write(
+        seeded.join(".obsidian/workspace.json"),
+        b"{\"layout\":\"device-local\"}",
+    )
+    .unwrap();
+
+    let mut client_seeded = spawn_client_with_name(seeded, port, "seeded").await;
+
+    // Wait for all four user-visible files to land on the fresh peer.
+    let fresh = fresh_dir.path().to_path_buf();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let bootstrap_ok = poll_until(deadline, || {
+        fresh.join("welcome.md").is_file()
+            && fresh.join("notes/daily/day1.md").is_file()
+            && fresh.join("photo.jpg").is_file()
+            && fresh.join(".obsidian/community-plugins.json").is_file()
+    })
+    .await;
+    assert!(
+        bootstrap_ok,
+        "expected files did not arrive on fresh peer within 20s; \
+         present = {:?}",
+        walkdir::WalkDir::new(&fresh)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .filter(|e| !e.path().to_string_lossy().contains(".syncline"))
+            .map(|e| e.path().strip_prefix(&fresh).unwrap().to_path_buf())
+            .collect::<Vec<_>>(),
+    );
+
+    // Byte-identical content — text, nested text, binary, and an
+    // un-ignored .obsidian config.
+    assert_eq!(
+        fs::read_to_string(fresh.join("welcome.md")).unwrap(),
+        "hello from seeded\n",
+    );
+    assert_eq!(
+        fs::read_to_string(fresh.join("notes/daily/day1.md")).unwrap(),
+        "# Day 1\nfirst entry",
+    );
+    assert_eq!(fs::read(fresh.join("photo.jpg")).unwrap(), photo_bytes);
+    assert_eq!(
+        fs::read(fresh.join(".obsidian/community-plugins.json")).unwrap(),
+        b"[\"dataview\",\"templater\"]",
+    );
+
+    // The default-ignored workspace.json must NOT have propagated.
+    assert!(
+        !fresh.join(".obsidian/workspace.json").exists(),
+        ".obsidian/workspace.json must be excluded by the default ignore list",
+    );
+
+    // Bidirectional: fresh appends to a synced file and creates a new
+    // one; seeded picks both up.
+    fs::write(
+        fresh.join("welcome.md"),
+        "hello from seeded\nappended on fresh\n",
+    )
+    .unwrap();
+    fs::write(fresh.join("notes/daily/day2.md"), "## Day 2\nfrom fresh\n").unwrap();
+
+    let seeded_path = seeded.to_path_buf();
+    let bidi_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let bidi_ok = poll_until(bidi_deadline, || {
+        seeded_path.join("notes/daily/day2.md").is_file()
+            && fs::read_to_string(seeded_path.join("welcome.md"))
+                .map(|s| s.contains("appended on fresh"))
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        bidi_ok,
+        "bidirectional propagation timed out: day2 exists? {}, welcome.md = {:?}",
+        seeded_path.join("notes/daily/day2.md").exists(),
+        fs::read_to_string(seeded_path.join("welcome.md")).ok(),
+    );
+
+    // Cold-restart the seeded client and apply offline edits on fresh
+    // in between. After restart, the offline edits must arrive.
+    client_seeded.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    fs::write(
+        fresh.join("notes/daily/day3.md"),
+        "offline edit from fresh\n",
+    )
+    .unwrap();
+    fs::write(
+        fresh.join("welcome.md"),
+        "hello from seeded\nappended on fresh\nedit while seeded was offline\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let mut client_seeded2 = spawn_client_with_name(seeded, port, "seeded").await;
+    let restart_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let restart_ok = poll_until(restart_deadline, || {
+        seeded_path.join("notes/daily/day3.md").is_file()
+            && fs::read_to_string(seeded_path.join("welcome.md"))
+                .map(|s| s.contains("edit while seeded was offline"))
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        restart_ok,
+        "post-restart catch-up failed: day3 exists? {}, welcome.md = {:?}",
+        seeded_path.join("notes/daily/day3.md").exists(),
+        fs::read_to_string(seeded_path.join("welcome.md")).ok(),
+    );
+
+    client_fresh.kill().await.unwrap();
+    client_seeded2.kill().await.unwrap();
+    server.kill().await.unwrap();
+}

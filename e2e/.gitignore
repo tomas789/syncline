@@ -22,3 +22,10 @@ test-vault/*
 issue*-cli-vault/
 phase*-cli-vault/
 profile-cli-vault/
+*-cli-vault/
+*-cli/
+
+# Per-spec server DBs spawned alongside *-cli/ folders.
+*.db
+*.db-shm
+*.db-wal

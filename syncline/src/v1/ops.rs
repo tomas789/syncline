@@ -103,14 +103,34 @@ pub fn rename(manifest: &mut Manifest, from: &str, to: &str) -> Result<()> {
 
 /// Stamp a text-content modification on the entry at `path`. Used to
 /// beat a stale delete under the modify-wins-over-delete rule (§6.3).
+///
+/// Errors if the entry at `path` is not a Text node — calling
+/// `record_modify_text` on a binary file would otherwise silently
+/// stamp the binary entry's `mod_lamp`, masking that the caller meant
+/// to operate on text content. Force the caller to use the binary
+/// API or look up the right path.
 pub fn record_modify_text(manifest: &mut Manifest, path: &str) -> Result<()> {
     let id = resolve_path(manifest, path)?;
+    let entry = manifest
+        .get_entry(id)
+        .ok_or_else(|| anyhow!("entry vanished mid-record-modify for {:?}", path))?;
+    if entry.kind != NodeKind::Text {
+        return Err(anyhow!(
+            "record_modify_text: entry at {:?} is {:?}, not Text",
+            path,
+            entry.kind
+        ));
+    }
     manifest.record_modify(id);
     Ok(())
 }
 
 /// Update the chunk-hash list of a binary entry at `path`. Also stamps
 /// modify so a stale delete can't resurrect older content.
+///
+/// Errors if the entry at `path` is not a Binary node — without this
+/// check `set_chunk_hashes` would silently corrupt a Text node by
+/// adding binary-only fields (`chunks`, `blob`, `size`).
 pub fn record_modify_binary(
     manifest: &mut Manifest,
     path: &str,
@@ -118,6 +138,16 @@ pub fn record_modify_binary(
     size: u64,
 ) -> Result<()> {
     let id = resolve_path(manifest, path)?;
+    let entry = manifest
+        .get_entry(id)
+        .ok_or_else(|| anyhow!("entry vanished mid-record-modify for {:?}", path))?;
+    if entry.kind != NodeKind::Binary {
+        return Err(anyhow!(
+            "record_modify_binary: entry at {:?} is {:?}, not Binary",
+            path,
+            entry.kind
+        ));
+    }
     manifest.set_chunk_hashes(id, chunk_hashes, size);
     Ok(())
 }

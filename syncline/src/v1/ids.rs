@@ -120,15 +120,29 @@ impl Lamport {
 
     /// Produce the next local timestamp and advance `self`. Used at the
     /// top of every local transaction.
+    ///
+    /// Saturates at `u64::MAX` rather than panicking (`+= 1` overflow
+    /// in debug, wraparound in release). Reaching that saturation
+    /// would require ~2^63 ops at 1 ns each — practically unreachable
+    /// — but the wraparound case in release builds would silently
+    /// corrupt every LWW comparison thereafter (a Lamport of 0 reads
+    /// as "the oldest stamp on every entry"), so saturating is
+    /// strictly safer than letting it wrap.
     pub fn tick(&mut self) -> Lamport {
-        self.0 += 1;
+        self.0 = self.0.saturating_add(1);
         *self
     }
 
     /// Observe a remote timestamp; self becomes `max(self, remote + 1)`.
+    ///
+    /// Saturates at `u64::MAX` for the same reason as [`tick`]: a
+    /// peer that synthesises `remote = u64::MAX` (intentionally or
+    /// not) must not be able to crash us in debug or wrap our
+    /// counter to 0 in release.
     pub fn observe(&mut self, remote: Lamport) {
-        if remote.0 + 1 > self.0 {
-            self.0 = remote.0 + 1;
+        let next = remote.0.saturating_add(1);
+        if next > self.0 {
+            self.0 = next;
         }
     }
 }
@@ -228,6 +242,34 @@ mod tests {
         let mut l = Lamport(100);
         l.observe(Lamport(5));
         assert_eq!(l, Lamport(100));
+    }
+
+    #[test]
+    fn lamport_observe_does_not_overflow_at_u64_max() {
+        // A peer with a maxed-out lamport must not crash us. The
+        // counter saturates instead of wrapping back to 0 (which would
+        // silently corrupt every subsequent LWW comparison: a
+        // Lamport(0) is "younger" than every existing stamp).
+        let mut l = Lamport::ZERO;
+        l.observe(Lamport(u64::MAX));
+        assert_eq!(l.get(), u64::MAX);
+    }
+
+    #[test]
+    fn lamport_observe_just_below_max_advances_to_max() {
+        let mut l = Lamport::ZERO;
+        l.observe(Lamport(u64::MAX - 1));
+        assert_eq!(l.get(), u64::MAX);
+    }
+
+    #[test]
+    fn lamport_tick_at_max_does_not_panic() {
+        let mut l = Lamport(u64::MAX);
+        // Tick past MAX must saturate (stay at MAX) rather than
+        // wrap to 0 — see overflow rationale above.
+        let next = l.tick();
+        assert_eq!(next.get(), u64::MAX);
+        assert_eq!(l.get(), u64::MAX);
     }
 
     #[test]

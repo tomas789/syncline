@@ -1,0 +1,65 @@
+# Convenience wrapper around the Dockerfile so callers don't have to
+# remember the volume layout. Usage from repo root:
+#
+#   # Build the image once (~5-10 min the first time, cached afterwards):
+#   docker compose -f e2e/docker/docker-compose.yml build
+#
+#   # Run the full wdio suite:
+#   docker compose -f e2e/docker/docker-compose.yml run --rm e2e
+#
+#   # Run a single spec:
+#   docker compose -f e2e/docker/docker-compose.yml run --rm e2e \
+#       bash e2e/docker/run-tests.sh \
+#       --spec test/specs/plugin-cross-vault-install.e2e.ts
+#
+#   # Drop into a shell:
+#   docker compose -f e2e/docker/docker-compose.yml run --rm e2e bash
+
+services:
+  e2e:
+    build:
+      # The Dockerfile builds a self-contained toolchain (Rust + Node
+      # + Xvfb + Electron deps) and never COPYs anything from the
+      # repo - the source tree comes in via the bind mount below.
+      # So we keep the build context as small as possible: just the
+      # docker/ subdir. This keeps `docker build` from sending the
+      # entire repo (target/, node_modules/, .git/) to the daemon.
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Match host UID/GID so files written into the bind mount don't
+        # come back owned by root on Linux hosts. macOS / Windows hosts
+        # ignore this; Linux hosts can override with:
+        #   USER_UID=$(id -u) USER_GID=$(id -g) docker compose build
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    # Bind-mount the repo so iteration is fast.
+    volumes:
+      - ../..:/workspace
+      # Linux node_modules differ from macOS; keep them out of the
+      # bind mount via named volumes.
+      - obsidian-plugin-node-modules:/workspace/obsidian-plugin/node_modules
+      - e2e-node-modules:/workspace/e2e/node_modules
+      # Cargo cache + target/ — survive across runs so incremental
+      # `cargo build` is fast.
+      - cargo-cache:/home/runner/.cargo
+      - cargo-target:/workspace/target
+      # Obsidian / chromedriver downloads — don't redownload every run.
+      - obsidian-cache:/workspace/e2e/.obsidian-cache
+    # Electron / Chromium needs more shared memory than the Docker
+    # default (64 MB) or it crashes mid-launch with "Out of memory".
+    shm_size: "2gb"
+    # Xvfb screen-rendering needs no IPC namespace, but be defensive.
+    init: true
+    # Stable hostname helps when reading container logs.
+    hostname: syncline-e2e
+    # No ports exposed by default — server / CLI / wdio all live in
+    # the container. If you want to attach a host browser to the
+    # session for debugging, add `ports: ["57195:57195"]` etc.
+
+volumes:
+  obsidian-plugin-node-modules:
+  e2e-node-modules:
+  cargo-cache:
+  cargo-target:
+  obsidian-cache:
