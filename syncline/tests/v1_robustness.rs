@@ -2261,3 +2261,45 @@ fn auto_apr28_023_text_vs_directory_same_path_converges() {
         "at least one text entry must be live"
     );
 }
+
+// ===========================================================================
+// auto-apr28-025: stress fuzz — 6 peers, 100 random ops each, repeated
+// across 6 seeds. Catches convergence bugs that only surface in higher-
+// dimensional concurrent state spaces. Existing `random_n_peer_fuzz_converges`
+// uses 4 peers / 30 ops / 4 seeds; this widens both axes.
+// ===========================================================================
+#[test]
+fn auto_apr28_025_six_peer_long_random_fuzz_converges() {
+    for seed in [10001u64, 20002, 30003, 40004, 50005, 60006] {
+        let names: Vec<String> = (0..10).map(|i| format!("doc_{i}.md")).collect();
+        let mut peers: Vec<Manifest> = (0..6).map(|_| Manifest::new(ActorId::new())).collect();
+        let mut rngs: Vec<Xs> = (0..peers.len())
+            .map(|i| Xs(seed.wrapping_add(i as u64).wrapping_mul(0xD7)))
+            .collect();
+
+        // Every 25 ops, do a partial mesh sync so peers see each other's
+        // ops mid-stream — closer to a real running system.
+        for round in 0..4 {
+            for _ in 0..25 {
+                for i in 0..peers.len() {
+                    random_op(&mut rngs[i], &mut peers[i], &names);
+                }
+            }
+            full_mesh_sync(&mut peers, 2);
+            // Don't assert convergence mid-stream — peers may be in
+            // varying "still flushing" states. Just keep merging.
+            let _ = round;
+        }
+
+        // Final full-mesh-sync.
+        full_mesh_sync(&mut peers, 8);
+        let head = projection_hash(&peers[0]);
+        for (i, m) in peers.iter().enumerate().skip(1) {
+            assert_eq!(
+                projection_hash(m),
+                head,
+                "seed {seed}: peer {i} diverged from peer 0 after fuzz"
+            );
+        }
+    }
+}
