@@ -1215,4 +1215,76 @@ mod tests {
             "no blob should be stored under the (forged) claimed hash"
         );
     }
+
+    // =====================================================================
+    // auto-apr28-029: MSG_MANIFEST_VERIFY behaviour. When a client
+    // claims a projection hash that DOESN'T match the server's, the
+    // server must respond with a MSG_MANIFEST_SYNC STEP_1 (kicking
+    // off a re-sync). When the hashes match, server stays silent
+    // (converged). Reactive: the test verifies both branches.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_029_verify_with_mismatch_triggers_step1_else_silent() {
+        let (port, state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        // Populate the server with one manifest entry so the verify
+        // hash is non-trivial.
+        {
+            let mut m = state.manifest.lock().await;
+            crate::v1::create_text(&mut m, "anchor.md", 0).unwrap();
+        }
+
+        // CASE A: send VERIFY with a wrong (all-zero) hash → expect
+        // a MSG_MANIFEST_SYNC reply (STEP_1).
+        let (mut ws_a, _) = connect_async(&url).await.unwrap();
+        let frame_v = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws_a, frame_v).await;
+        let _ = recv_bin(&mut ws_a).await; // VERSION echo
+
+        let bogus_hash = [0u8; 32];
+        let verify_payload =
+            crate::v1::sync::encode_verify_payload(&bogus_hash);
+        let verify_frame =
+            encode_message(MSG_MANIFEST_VERIFY, MANIFEST_DOC_ID, &verify_payload);
+        send_bin(&mut ws_a, verify_frame).await;
+
+        let reply = recv_bin(&mut ws_a).await;
+        let (t, d, _p) = decode_message(&reply).expect("verify reply framed");
+        assert_eq!(t, MSG_MANIFEST_SYNC, "mismatch should trigger MANIFEST_SYNC");
+        assert_eq!(d, MANIFEST_DOC_ID);
+        drop(ws_a);
+
+        // CASE B: send VERIFY with the CORRECT hash → expect silence.
+        let true_hash = {
+            let manifest = state.manifest.lock().await;
+            crate::v1::projection_hash(&manifest)
+        };
+        let (mut ws_b, _) = connect_async(&url).await.unwrap();
+        let frame_v = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws_b, frame_v).await;
+        let _ = recv_bin(&mut ws_b).await;
+
+        let verify_payload = crate::v1::sync::encode_verify_payload(&true_hash);
+        let verify_frame =
+            encode_message(MSG_MANIFEST_VERIFY, MANIFEST_DOC_ID, &verify_payload);
+        send_bin(&mut ws_b, verify_frame).await;
+
+        // Wait briefly — if server is going to respond, it'd be
+        // within ~50ms. Use a short timeout: silence == converged.
+        let recv_result = tokio::time::timeout(Duration::from_millis(500), ws_b.next()).await;
+        assert!(
+            recv_result.is_err(),
+            "match should produce silence; got reply: {:?}",
+            recv_result
+        );
+    }
 }
