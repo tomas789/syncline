@@ -3188,3 +3188,53 @@ async fn auto_apr28_011_empty_text_file_roundtrip() {
         "peer 0 should observe peer 1's modification to the once-empty file"
     );
 }
+
+// ===========================================================================
+// auto-apr28-014: rapid file create→write→delete churn at the same
+// path. Watcher debounce, scan_once, and manifest LWW must converge —
+// the final state on both peers must be: file exists with the final
+// content, OR file does not exist (depending on whether the last op
+// was create or delete). No spurious empty files, no conflict copies.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_014_rapid_create_modify_delete_churn_converges() {
+    let env = TestEnv::new(2).await;
+    let path = env.client_path(0).join("churn.md");
+
+    // 30 rounds of: create with version-N content, then delete.
+    for i in 0..30 {
+        fs::write(&path, format!("version {i}\n")).unwrap();
+        // Tiny delay so the watcher event ordering is stable.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if i % 2 == 1 {
+            // Delete every other round so the manifest sees both
+            // create and delete stamps interleaving.
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    // Final write — this should be the surviving content on both peers.
+    fs::write(&path, "FINAL\n").unwrap();
+
+    let dirs = env.dirs();
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(30)).await;
+    assert!(converged, "post-churn convergence required");
+
+    // Both peers must have the FINAL content.
+    let final_a = fs::read_to_string(env.client_path(0).join("churn.md")).unwrap();
+    let final_b = fs::read_to_string(env.client_path(1).join("churn.md")).unwrap();
+    assert_eq!(final_a, "FINAL\n", "peer A churn.md not the final write");
+    assert_eq!(final_b, "FINAL\n", "peer B churn.md not the final write");
+
+    // No conflict copies.
+    assert_eq!(
+        count_conflict_files(env.client_path(0)),
+        0,
+        "no conflict copies on A"
+    );
+    assert_eq!(
+        count_conflict_files(env.client_path(1)),
+        0,
+        "no conflict copies on B"
+    );
+}
