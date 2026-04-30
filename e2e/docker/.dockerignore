@@ -1,0 +1,7 @@
+# The Dockerfile doesn't COPY anything from the build context (the
+# whole source tree comes in via the compose bind mount at runtime),
+# so the safest .dockerignore is one that ignores everything except
+# the Dockerfile itself. Keeps `docker build` instant even if a
+# future change widens the context.
+*
+!Dockerfile
