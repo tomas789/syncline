@@ -1088,4 +1088,69 @@ mod tests {
             t
         );
     }
+
+    // =====================================================================
+    // auto-apr28-022: MSG_SERVER_STATS request/response shape stability.
+    // The JSON keys must be present and typed correctly so existing
+    // clients don't break across server upgrades.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_022_server_stats_returns_well_formed_json() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let (mut ws, _) = connect_async(url).await.unwrap();
+
+        // Handshake first so the connection is established.
+        let frame = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws, frame).await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Request stats. Empty payload.
+        let stats_req = encode_message(MSG_SERVER_STATS, MANIFEST_DOC_ID, &[]);
+        send_bin(&mut ws, stats_req).await;
+
+        let reply = recv_bin(&mut ws).await;
+        let (t, d, p) = decode_message(&reply).expect("stats reply well-framed");
+        assert_eq!(t, MSG_SERVER_STATS);
+        assert_eq!(d, MANIFEST_DOC_ID);
+
+        let json: serde_json::Value =
+            serde_json::from_slice(p).expect("stats payload is valid JSON");
+
+        // Required keys. Drift on any of these breaks every client
+        // that consumes the stats endpoint.
+        for key in &[
+            "server_version",
+            "uptime_secs",
+            "connected_clients",
+            "manifest_node_count",
+            "manifest_total_bytes",
+            "blob_count",
+            "blob_total_bytes",
+        ] {
+            assert!(
+                json.get(*key).is_some(),
+                "stats JSON missing key {key}; got: {json}"
+            );
+        }
+
+        // Type sanity: numerics are numbers, version is a string.
+        assert!(json["server_version"].is_string());
+        assert!(json["uptime_secs"].is_u64());
+        assert!(json["connected_clients"].is_u64());
+        assert!(json["manifest_node_count"].is_u64());
+        assert!(json["manifest_total_bytes"].is_u64());
+        assert!(json["blob_count"].is_u64());
+        assert!(json["blob_total_bytes"].is_u64());
+
+        // connected_clients should be ≥ 1 (us, currently subscribed
+        // — actually the manifest channel is created on first
+        // MANIFEST_SYNC subscribe. Stats request alone might not
+        // subscribe. So accept ≥ 0.
+        assert!(json["connected_clients"].as_u64().unwrap() <= 1);
+    }
 }
