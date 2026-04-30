@@ -1501,3 +1501,74 @@ fn auto_apr28_002_orphaned_child_self_heals_when_parent_arrives() {
     );
     assert_eq!(projection_hash(&a), projection_hash(&b));
 }
+
+// ===========================================================================
+// auto-apr28-004: three-way op divergence on the same node — A renames,
+// B deletes, C modifies content. Modify-wins-over-delete (§6.3) means
+// the entry survives. The rename and modify both produce non-trivial
+// stamps; the projection must agree across all three peers, no peer
+// can see a different name or a different live/dead state.
+// ===========================================================================
+#[test]
+fn auto_apr28_004_three_way_rename_delete_modify_converges() {
+    let mut a = Manifest::new(ActorId::new());
+    let id = create_text(&mut a, "note.md", 0).unwrap();
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+    let mut c = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    // Three concurrent ops, all stamped before any peer observes the
+    // others.
+    rename(&mut a, "note.md", "renamed.md").unwrap();
+    delete_path(&mut b, "note.md").unwrap();
+    record_modify_text(&mut c, "note.md").unwrap();
+
+    // Full mesh sync — convergence requires several passes for ops
+    // that interact across LWW dimensions.
+    let mut peers = [a, b, c];
+    full_mesh_sync(&mut peers, 4);
+    let [a, b, c] = peers;
+    assert_converged("auto-apr28-004", &[&a, &b, &c]);
+
+    // The KEY robustness property here is that all three peers reach
+    // **identical projections** — whichever way LWW resolves, every
+    // peer must agree. Whether the entry is alive or dead is a
+    // consequence of who wins on lamport+actor ordering: modify-wins-
+    // over-delete is strict (`mod.beats(del)`), so a tie on lamport
+    // with `del.actor > mod.actor` keeps the file deleted.
+    let pa = project(&a);
+    let pb = project(&b);
+    let pc = project(&c);
+
+    // Path agreement (most important): if there is a survivor, every
+    // peer must see it at the same path.
+    let path_a: Vec<_> = pa.by_path.keys().cloned().collect();
+    let path_b: Vec<_> = pb.by_path.keys().cloned().collect();
+    let path_c: Vec<_> = pc.by_path.keys().cloned().collect();
+    assert_eq!(path_a, path_b, "A and B disagree on path");
+    assert_eq!(path_a, path_c, "A and C disagree on path");
+
+    // The survivor (if any) must keep the original NodeId — rename and
+    // modify both target the same node.
+    if let Some(survivor) = pa.by_path.values().next() {
+        assert_eq!(survivor.id, id, "rename/modify preserves NodeId");
+        // And the path must be the renamed one (only A renamed, the
+        // other peers didn't): if the entry survived, the rename's
+        // name change is still part of the merged state.
+        let p = path_a.first().unwrap();
+        assert_eq!(p, "renamed.md", "rename took effect");
+    } else {
+        // Else: delete won. Then nobody sees a live entry.
+        assert!(pb.by_path.is_empty());
+        assert!(pc.by_path.is_empty());
+    }
+}
