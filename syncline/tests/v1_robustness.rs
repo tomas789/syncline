@@ -2709,6 +2709,39 @@ fn auto_apr28_046_entry_with_missing_parent_id_dropped_from_projection() {
 }
 
 // ===========================================================================
+// auto-apr28-048: directory and file names containing spaces, mixed
+// case, and unicode characters all in the same path. Sync should
+// preserve every byte and project the same path on both peers. This
+// is the realistic Obsidian "Projekty/05 BVP/Návrh – v2.md"
+// scenario.
+// ===========================================================================
+#[test]
+fn auto_apr28_048_path_with_spaces_unicode_mixed_case_roundtrips() {
+    let path = "Projekty/05 BVP/Návrh – v2.md";
+
+    let mut a = Manifest::new(ActorId::new());
+    let id = create_text(&mut a, path, 0).unwrap();
+
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-048", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+    assert!(
+        pa.by_path.contains_key(path),
+        "peer A missing path {path:?}, got {:?}",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pb.by_path.contains_key(path),
+        "peer B missing path {path:?}"
+    );
+    assert_eq!(pa.by_id[&id].path, path);
+    assert_eq!(pb.by_id[&id].path, path);
+}
+
+// ===========================================================================
 // auto-apr28-047: malformed user-facing paths (empty, leading "/",
 // trailing "/", "//" double-slash) must be rejected by `create_text`
 // with an error. The manifest must never produce a *projected text
