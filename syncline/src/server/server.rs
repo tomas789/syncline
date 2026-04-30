@@ -1289,6 +1289,80 @@ mod tests {
     }
 
     // =====================================================================
+    // auto-apr28-049: blob size limit boundary check. A blob exactly
+    // at MAX_BLOB_SIZE is accepted; a blob 1 byte above is rejected
+    // (silently — server logs and returns). Important: a request for
+    // a blob below the limit always succeeds afterwards, proving the
+    // size-limit branch doesn't taint the persistence path.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_049_blob_at_size_limit_accepted_above_rejected() {
+        use sha2::{Digest, Sha256};
+        let (port, state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let frame_v = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws, frame_v).await;
+        let _ = recv_bin(&mut ws).await;
+
+        // 1) Exactly MAX_BLOB_SIZE bytes — must be accepted.
+        let at_limit_payload = vec![0xAAu8; crate::protocol::MAX_BLOB_SIZE];
+        let at_limit_hash = format!("{:x}", Sha256::digest(&at_limit_payload));
+        let at_limit_frame =
+            encode_message(MSG_BLOB_UPDATE, "boundary-doc", &at_limit_payload);
+        send_bin(&mut ws, at_limit_frame).await;
+        // Persisting 5 MiB through the full WS → handler → sqlite path
+        // isn't instant — give it a generous deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut stored: Option<Vec<u8>> = None;
+        while std::time::Instant::now() < deadline {
+            stored = state.db.load_blob(&at_limit_hash).await.unwrap();
+            if stored.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            stored.as_deref(),
+            Some(at_limit_payload.as_slice()),
+            "blob at exactly MAX_BLOB_SIZE must be persisted"
+        );
+
+        // 2) MAX_BLOB_SIZE + 1 — must be rejected (silently).
+        let over_payload = vec![0xBBu8; crate::protocol::MAX_BLOB_SIZE + 1];
+        let over_hash = format!("{:x}", Sha256::digest(&over_payload));
+        let over_frame =
+            encode_message(MSG_BLOB_UPDATE, "over-doc", &over_payload);
+        send_bin(&mut ws, over_frame).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let over_stored = state.db.load_blob(&over_hash).await.unwrap();
+        assert!(
+            over_stored.is_none(),
+            "blob over MAX_BLOB_SIZE must NOT be persisted"
+        );
+
+        // 3) Connection must still be alive after the rejection. A
+        // tiny new blob still goes through.
+        let tiny: &[u8] = b"tiny";
+        let tiny_hash = format!("{:x}", Sha256::digest(tiny));
+        let tiny_frame = encode_message(MSG_BLOB_UPDATE, "tiny-doc", tiny);
+        send_bin(&mut ws, tiny_frame).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let tiny_stored = state.db.load_blob(&tiny_hash).await.unwrap();
+        assert_eq!(
+            tiny_stored.as_deref(),
+            Some(tiny),
+            "post-rejection persistence path must still work"
+        );
+    }
+
+    // =====================================================================
     // auto-apr28-042: a peer sends MSG_MANIFEST_VERIFY with a payload
     // that is NOT 32 bytes (the spec'd length). Per
     // `decode_verify_payload`, the decoder returns None and
