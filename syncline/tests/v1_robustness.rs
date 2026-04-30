@@ -1572,3 +1572,65 @@ fn auto_apr28_004_three_way_rename_delete_modify_converges() {
         assert!(pc.by_path.is_empty());
     }
 }
+
+// ===========================================================================
+// auto-apr28-005: concurrent same-named directory creation. Two fresh
+// peers each create a directory `Inbox/` at the vault root, then create
+// a file inside it (`Inbox/note-A.md` on peer A, `Inbox/note-B.md` on
+// peer B). After sync, both files must surface — there must NOT be two
+// `Inbox` projections at the root that orphan one peer's children.
+// ===========================================================================
+#[test]
+fn auto_apr28_005_concurrent_same_named_directories_keep_all_children() {
+    let mut a = Manifest::new(ActorId::new());
+    create_text(&mut a, "Inbox/note-A.md", 1).unwrap();
+
+    let mut b = Manifest::new(ActorId::new());
+    create_text(&mut b, "Inbox/note-B.md", 1).unwrap();
+
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-005-dirs", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // Both children must surface, regardless of which directory wins
+    // ownership. The robust property is: every file we created is in
+    // the projection on every peer, with the correct stem.
+    let names_a: Vec<_> = pa
+        .by_path
+        .keys()
+        .map(|s| s.split('/').next_back().unwrap().to_string())
+        .collect();
+    let names_b: Vec<_> = pb
+        .by_path
+        .keys()
+        .map(|s| s.split('/').next_back().unwrap().to_string())
+        .collect();
+    assert!(
+        names_a.iter().any(|n| n == "note-A.md"),
+        "peer A missing note-A.md (paths: {:?})",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        names_a.iter().any(|n| n == "note-B.md"),
+        "peer A missing note-B.md (paths: {:?})",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(names_b.iter().any(|n| n == "note-A.md"));
+    assert!(names_b.iter().any(|n| n == "note-B.md"));
+
+    // Critically: the *parent paths* on both peers must be byte-equal,
+    // i.e. both files must end up in the SAME canonical directory or
+    // the SAME conflict-suffixed pair of directories. If A sees them
+    // both under `Inbox/` and B sees them under `Inbox/` and
+    // `Inbox.conflict-…/`, that's a divergence.
+    let mut paths_a: Vec<_> = pa.by_path.keys().cloned().collect();
+    let mut paths_b: Vec<_> = pb.by_path.keys().cloned().collect();
+    paths_a.sort();
+    paths_b.sort();
+    assert_eq!(
+        paths_a, paths_b,
+        "peers diverged on directory layout for concurrent same-named dirs"
+    );
+}
