@@ -1289,6 +1289,68 @@ mod tests {
     }
 
     // =====================================================================
+    // auto-apr28-042: a peer sends MSG_MANIFEST_VERIFY with a payload
+    // that is NOT 32 bytes (the spec'd length). Per
+    // `decode_verify_payload`, the decoder returns None and
+    // `handle_verify_payload` errors out — the server must log and
+    // continue, neither crashing nor responding with a malformed
+    // STEP_1. Connection must remain alive afterwards.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_042_verify_with_wrong_length_payload_silent_then_responsive() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let frame = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws, frame).await;
+        let _ = recv_bin(&mut ws).await;
+
+        // Wrong-length verify: 7 bytes instead of 32.
+        let bad_verify = encode_message(
+            MSG_MANIFEST_VERIFY,
+            MANIFEST_DOC_ID,
+            &[0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78],
+        );
+        send_bin(&mut ws, bad_verify).await;
+
+        // Server must NOT respond to a malformed verify.
+        let silent =
+            tokio::time::timeout(Duration::from_millis(400), ws.next()).await;
+        assert!(
+            silent.is_err(),
+            "wrong-length verify must produce silence, got reply {:?}",
+            silent
+        );
+
+        // Subsequent good-faith MANIFEST_VERIFY (with a clearly wrong
+        // 32-byte hash) must trigger a STEP_1 reply — proving the
+        // connection is still live and the prior bad frame did not
+        // wedge the handler.
+        let bad_hash = [0u8; 32];
+        let good_verify_payload =
+            crate::v1::sync::encode_verify_payload(&bad_hash);
+        let good_frame = encode_message(
+            MSG_MANIFEST_VERIFY,
+            MANIFEST_DOC_ID,
+            &good_verify_payload,
+        );
+        send_bin(&mut ws, good_frame).await;
+
+        let reply = recv_bin(&mut ws).await;
+        let (t, d, _p) = decode_message(&reply).expect("verify reply framed");
+        assert_eq!(d, MANIFEST_DOC_ID);
+        assert_eq!(
+            t, MSG_MANIFEST_SYNC,
+            "well-formed verify should still get a STEP_1 after bad frame"
+        );
+    }
+
+    // =====================================================================
     // auto-apr28-040: a malicious / mis-deployed peer sends MSG_VERSION
     // claiming major=99 (a far-future protocol). Per the handshake at
     // `ws_handler:190`, the server must close the connection without
