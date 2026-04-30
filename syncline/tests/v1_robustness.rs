@@ -1697,3 +1697,60 @@ fn auto_apr28_007_concurrent_rename_to_same_nested_target_converges() {
         pa.by_path.keys().collect::<Vec<_>>()
     );
 }
+
+// ===========================================================================
+// auto-apr28-009: peer A modifies a text file while peer B concurrently
+// renames the parent directory. After sync, the modify must surface at
+// the NEW (renamed) path on both peers — and the rename must propagate
+// to all descendants. This is the directory-refactor + active-edit
+// race that's bread-and-butter Obsidian usage.
+// ===========================================================================
+#[test]
+fn auto_apr28_009_concurrent_directory_rename_with_descendant_modify_converges() {
+    use syncline::v1::ids::NodeId;
+
+    // Both peers start synced: dir/note.md
+    let mut a = Manifest::new(ActorId::new());
+    let dir = a.create_node("Projects", None, NodeKind::Directory, &[], 0);
+    let note: NodeId = a.create_node("note.md", Some(dir), NodeKind::Text, &[], 5);
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    // Peer A modifies the descendant. Peer B renames the directory
+    // by NodeId (rename-by-path doesn't work on directories — they
+    // don't appear in the projection's `by_path`).
+    record_modify_text(&mut a, "Projects/note.md").unwrap();
+    record_modify_text(&mut a, "Projects/note.md").unwrap();
+
+    // B looks up the directory NodeId — same as A's because both came
+    // from the shared baseline.
+    b.set_name(dir, "Archive");
+
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-009", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // The note must surface on both peers under the renamed dir.
+    // (The rename moves the directory NodeId; the file's parent NodeId
+    // is the directory NodeId, so projection follows.)
+    assert!(
+        pa.by_path.contains_key("Archive/note.md"),
+        "A should see the renamed-dir descendant; got {:?}",
+        pa.by_path.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pb.by_path.contains_key("Archive/note.md"),
+        "B should see the renamed-dir descendant; got {:?}",
+        pb.by_path.keys().collect::<Vec<_>>()
+    );
+
+    // The note's NodeId is preserved.
+    let r = pa.by_path.get("Archive/note.md").unwrap();
+    assert_eq!(r.id, note, "rename of parent does not mint a new file");
+}
