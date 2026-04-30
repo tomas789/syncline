@@ -2461,3 +2461,66 @@ fn auto_apr28_032_saturated_lamport_two_peers_still_converge() {
     assert_eq!(a.lamport().get(), u64::MAX);
     assert_eq!(b.lamport().get(), u64::MAX);
 }
+
+// ===========================================================================
+// auto-apr28-036: filenames with Unicode "right-to-left override"
+// (U+202E), zero-width joiner (U+200D), and emoji. These are legal
+// UTF-8 strings on POSIX but cause display-spoofing attacks on naive
+// renderers ("evil.txt" rendered as "txt.live" via RTL trick). The
+// manifest must:
+//   - accept these names byte-for-byte (it's an opaque string layer);
+//   - converge two peers that each create such a file;
+//   - not collapse distinct names that look identical to a human.
+// ===========================================================================
+#[test]
+fn auto_apr28_036_unicode_rtl_and_emoji_filenames_preserved() {
+    // Three different evil-looking names. The first two differ only
+    // in the position of the U+202E control char — visually similar
+    // but byte-distinct.
+    let names = [
+        "evil\u{202E}txt.exe.md",     // RTL override mid-name
+        "evil.\u{202E}txt.exe.md",    // RTL override a byte later
+        "report\u{200D}final.md",     // zero-width joiner
+        "🦋note🦋.md",                // emoji bookends
+        "ar\u{202E}ihps.md",          // shorter RTL example
+    ];
+
+    let mut a = Manifest::new(ActorId::new());
+    let mut ids = Vec::new();
+    for name in names {
+        let id = create_text(&mut a, name, 0)
+            .unwrap_or_else(|e| panic!("manifest must accept {name:?}: {e:?}"));
+        ids.push((name, id));
+    }
+
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-036", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+
+    // All five names must surface byte-identical on both peers.
+    for (name, _id) in &ids {
+        assert!(
+            pa.by_path.contains_key(*name),
+            "peer A missing {name:?} (bytes = {:?}); paths = {:?}",
+            name.as_bytes(),
+            pa.by_path.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pb.by_path.contains_key(*name),
+            "peer B missing {name:?}; paths = {:?}",
+            pb.by_path.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // The two RTL-override variants differ only in the control char's
+    // byte position — they MUST stay distinct entries (no silent
+    // normalisation).
+    assert_ne!(names[0], names[1], "test setup sanity");
+    assert!(
+        pa.by_path.contains_key(names[0]) && pa.by_path.contains_key(names[1]),
+        "manifest collapsed two distinct RTL-trick names"
+    );
+}
