@@ -143,6 +143,15 @@ impl Manifest {
 
     /// Rehydrate a manifest from a Yrs state update (as produced by
     /// `encode_state_as_update`).
+    ///
+    /// The rehydrated manifest's lamport is the max of the caller-
+    /// supplied `lamport` and the highest stamp present in the
+    /// decoded doc (`created_at`, `mod_lamp`, `del_lamp` across all
+    /// entries). This guarantees the next local op stamps strictly
+    /// above any pre-existing entry — without it, a peer that
+    /// rehydrates with `Lamport::ZERO` (the CLI `load_manifest` path)
+    /// would emit a local modify at lamport=1 and lose every LWW race
+    /// against any other peer that observed the original ops.
     pub fn from_update(actor: ActorId, lamport: Lamport, update: &[u8]) -> anyhow::Result<Self> {
         use yrs::updates::decoder::Decode;
         let doc = Doc::new();
@@ -152,12 +161,16 @@ impl Manifest {
             let update = yrs::Update::decode_v1(update)?;
             txn.apply_update(update);
         }
-        Ok(Self {
+        let mut m = Self {
             doc,
             nodes,
             actor,
             lamport,
-        })
+        };
+        if let Some(max_in_doc) = m.max_lamport_in_doc() {
+            m.lamport.observe(max_in_doc);
+        }
+        Ok(m)
     }
 
     pub fn actor(&self) -> ActorId {
@@ -680,6 +693,33 @@ mod tests {
         m2.apply_update(&m1.encode_state_as_update()).unwrap();
         // Must be at least 3 after observing m1's stamps (lamport advance rule).
         assert!(m2.lamport().get() >= 3);
+    }
+
+    #[test]
+    fn from_update_observes_existing_lamport() {
+        // Build a manifest with stamps up to lamport=4.
+        let mut m1 = Manifest::new(ActorId::new());
+        m1.create_node("a", None, NodeKind::Text, &[], 0);
+        m1.create_node("b", None, NodeKind::Text, &[], 0);
+        m1.create_node("c", None, NodeKind::Text, &[], 0);
+        let id = m1.create_node("d", None, NodeKind::Text, &[], 0);
+        assert_eq!(m1.lamport(), Lamport(4));
+        m1.set_name(id, "renamed"); // bump to 5
+        assert_eq!(m1.lamport(), Lamport(5));
+
+        let encoded = m1.encode_state_as_update();
+        // Rehydrate with caller passing the now-stale ZERO (the CLI
+        // `load_manifest` path). The rehydrated manifest MUST scan the
+        // doc and bump its lamport accordingly — otherwise the next
+        // local op would stamp at lamport=1 and silently lose every
+        // LWW race against any peer that has the original ops.
+        let m2 =
+            Manifest::from_update(ActorId::new(), Lamport::ZERO, &encoded).unwrap();
+        assert!(
+            m2.lamport().get() >= 5,
+            "from_update must observe the doc's max lamport (got {})",
+            m2.lamport().get()
+        );
     }
 
     #[test]
