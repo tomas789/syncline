@@ -321,6 +321,51 @@ mod tests {
         assert_eq!(id1, id2);
     }
 
+    // =====================================================================
+    // auto-apr28-045: a corrupted `.syncline/actor_id` file (garbage
+    // bytes that don't parse as a UUID) must NOT cause `read_or_create`
+    // to error out. It should fall through to minting a fresh ID and
+    // overwriting the bad file, so the peer can still start. Subsequent
+    // calls return that new ID stably.
+    // =====================================================================
+    #[test]
+    fn auto_apr28_045_corrupted_actor_id_recovers_via_fresh_mint() {
+        let dir = TempDir::new().unwrap();
+        let sd = dir.path().to_path_buf();
+        // First call creates and persists.
+        let id1 = read_or_create_actor_id(&sd).unwrap();
+
+        // Corrupt the file: write garbage that won't parse as a UUID.
+        let bad_bytes = b"this-is-not-a-uuid-it-is-garbage-content\n";
+        std::fs::write(sd.join("actor_id"), bad_bytes).unwrap();
+
+        // Second call must detect the corruption, mint a fresh ID, and
+        // succeed (NOT error out — the peer must boot). Stable on
+        // subsequent calls.
+        let id2 = read_or_create_actor_id(&sd).unwrap();
+        assert_ne!(id1, id2, "fresh ID expected after corruption");
+        let id3 = read_or_create_actor_id(&sd).unwrap();
+        assert_eq!(id2, id3, "post-recovery ID must persist");
+    }
+
+    // =====================================================================
+    // auto-apr28-045b: an EMPTY actor_id file (zero bytes — could
+    // happen if a previous atomic_write was interrupted between
+    // truncate and write) must also gracefully fall back to a fresh
+    // mint, not panic or hang.
+    // =====================================================================
+    #[test]
+    fn auto_apr28_045b_empty_actor_id_file_recovers_via_fresh_mint() {
+        let dir = TempDir::new().unwrap();
+        let sd = dir.path().to_path_buf();
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(sd.join("actor_id"), b"").unwrap();
+
+        let id1 = read_or_create_actor_id(&sd).unwrap();
+        let id2 = read_or_create_actor_id(&sd).unwrap();
+        assert_eq!(id1, id2, "post-empty-file recovery must be stable");
+    }
+
     #[test]
     fn migrate_relocates_stale_bak_without_data_loss() {
         // Simulate a situation where a previous migration left a
