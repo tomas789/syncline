@@ -1349,3 +1349,85 @@ fn lamport_advances_past_observed_remote() {
         a_lamp,
     );
 }
+
+// ===========================================================================
+// auto-apr28-001: pathological filenames (trailing whitespace, reserved
+// names, leading-space segments). The manifest should preserve every
+// byte exactly and converge after a two-peer sync — these names are
+// awkward on Windows / case-insensitive FS but legal on POSIX, and a
+// Linux peer will absolutely see them.
+// ===========================================================================
+#[test]
+fn auto_apr28_001_pathological_filenames_roundtrip_exactly() {
+    let cases: &[&str] = &[
+        "trailing space .md",
+        "  leading spaces.md",
+        "tab\there.md",
+        "CON.md",       // Windows reserved
+        "PRN.md",       // Windows reserved
+        "aux.md",       // Windows reserved (lowercase variant)
+        "NUL",          // Windows reserved, no extension
+        "name.with.many.dots.md",
+        "ends-in-dot.",
+        "..",           // not legal as a file name on POSIX, but let's see what manifest does
+    ];
+
+    let mut a = Manifest::new(ActorId::new());
+    let mut created = Vec::new();
+    for (i, name) in cases.iter().enumerate() {
+        match create_text(&mut a, name, i as u64) {
+            Ok(id) => created.push((*name, Some(id))),
+            Err(_) => created.push((*name, None)), // manifest may reject
+        }
+    }
+
+    // Bootstrap B from A's state.
+    let mut b = Manifest::from_update(
+        ActorId::new(),
+        a.lamport(),
+        &a.encode_state_as_update(),
+    )
+    .unwrap();
+
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-001-paths", &[&a, &b]);
+
+    // Every accepted name must show up byte-identical in both peers'
+    // projections.
+    let pa = project(&a);
+    let pb = project(&b);
+    for (name, id_opt) in &created {
+        if id_opt.is_none() {
+            continue; // legitimately rejected by create_text
+        }
+        assert!(
+            pa.by_path.contains_key(*name),
+            "peer A missing accepted path {name:?}"
+        );
+        assert!(
+            pb.by_path.contains_key(*name),
+            "peer B missing accepted path {name:?}"
+        );
+    }
+
+    // Sharper variant: two fresh peers concurrently create files with
+    // a trailing-space name. After sync, both must be present with
+    // distinct paths — one canonical, one conflict-suffixed — and both
+    // peers must agree byte-for-byte on the conflict path.
+    let mut p = Manifest::new(ActorId::new());
+    let mut q = Manifest::new(ActorId::new());
+    create_text(&mut p, "trailing space .md", 0).unwrap();
+    create_text(&mut q, "trailing space .md", 0).unwrap();
+    sync(&mut p, &mut q);
+    assert_converged("auto-apr28-001-trailing-conflict", &[&p, &q]);
+    let pp = project(&p);
+    assert!(
+        pp.by_path.contains_key("trailing space .md"),
+        "canonical trailing-space name preserved",
+    );
+    assert_eq!(
+        pp.len(),
+        2,
+        "both nodes survive the same-path collision"
+    );
+}
