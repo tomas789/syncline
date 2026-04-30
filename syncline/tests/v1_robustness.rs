@@ -2709,6 +2709,41 @@ fn auto_apr28_046_entry_with_missing_parent_id_dropped_from_projection() {
 }
 
 // ===========================================================================
+// auto-apr28-050: filenames containing FS-legal special characters
+// that some tools mishandle: spaces, parens, brackets, ampersand,
+// question mark, quote, hash, dollar, comma. All POSIX-legal in
+// filenames (no NUL or '/'). Manifest must preserve them exactly.
+// ===========================================================================
+#[test]
+fn auto_apr28_050_special_chars_in_filename_preserved() {
+    let names: &[&str] = &[
+        "What is this?.md",
+        "(parens) [brackets].md",
+        "with ' single quote.md",
+        "tag #foo $bar.md",
+        "comma, separated.md",
+        "ampersand & more.md",
+        "exclamation!.md",
+        "tilde~here.md",
+    ];
+
+    let mut a = Manifest::new(ActorId::new());
+    for n in names {
+        create_text(&mut a, n, 0).unwrap_or_else(|e| panic!("manifest must accept {n:?}: {e:?}"));
+    }
+    let mut b = Manifest::new(ActorId::new());
+    sync(&mut a, &mut b);
+    assert_converged("auto-apr28-050", &[&a, &b]);
+
+    let pa = project(&a);
+    let pb = project(&b);
+    for n in names {
+        assert!(pa.by_path.contains_key(*n), "A missing {n:?}");
+        assert!(pb.by_path.contains_key(*n), "B missing {n:?}");
+    }
+}
+
+// ===========================================================================
 // auto-apr28-048: directory and file names containing spaces, mixed
 // case, and unicode characters all in the same path. Sync should
 // preserve every byte and project the same path on both peers. This
