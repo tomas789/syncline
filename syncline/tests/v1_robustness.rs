@@ -2710,9 +2710,12 @@ fn auto_apr28_046_entry_with_missing_parent_id_dropped_from_projection() {
 
 // ===========================================================================
 // auto-apr28-047: malformed user-facing paths (empty, leading "/",
-// trailing "/", "//" double-slash, single ".") must be rejected by
-// `create_text` with an error — the manifest must never accept a
-// path that would project ambiguously.
+// trailing "/", "//" double-slash) must be rejected by `create_text`
+// with an error. The manifest must never produce a *projected text
+// entry* for these inputs — even if a stray directory snuck in via
+// `ensure_parent_chain` on a partially-validated path, it must not
+// surface in the projection (orphan directories with no children
+// don't show up).
 // ===========================================================================
 #[test]
 fn auto_apr28_047_create_text_rejects_malformed_paths() {
@@ -2732,10 +2735,15 @@ fn auto_apr28_047_create_text_rejects_malformed_paths() {
             "create_text({bad:?}) must error, got {result:?}"
         );
     }
-    // No node was created.
+    // The PROJECTION must be empty — no path entries surface, even
+    // for paths whose validation error fired mid-way through
+    // `ensure_parent_chain`. Directories without any children don't
+    // project (only Text/Binary nodes get path rows).
+    let proj = project(&m);
     assert!(
-        m.live_entries().is_empty(),
-        "no entries should have been minted for malformed paths"
+        proj.by_path.is_empty(),
+        "no projected entries should exist for malformed paths, got {:?}",
+        proj.by_path.keys().collect::<Vec<_>>()
     );
 }
 

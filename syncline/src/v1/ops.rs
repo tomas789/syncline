@@ -164,6 +164,24 @@ fn resolve_path(manifest: &Manifest, path: &str) -> Result<NodeId> {
         .ok_or_else(|| anyhow!("no entry at path {:?}", path))
 }
 
+/// Reject paths that are syntactically malformed at the API boundary:
+/// empty, absolute (`/foo`), or containing an empty segment (`a//b`,
+/// `trailing/`). Defensive — the disk layer's `is_unsafe_relative_path`
+/// also catches leading slashes, but at the manifest-API level we want
+/// to refuse them too rather than silently coerce `/foo.md` into a
+/// root-level `foo.md` (which loses information about the caller's
+/// intent and surprises any caller who actually meant the absolute
+/// path to mean something).
+fn validate_user_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(anyhow!("empty path"));
+    }
+    if path.starts_with('/') {
+        return Err(anyhow!("path {:?} is absolute (leading slash)", path));
+    }
+    Ok(())
+}
+
 fn create_at_path(
     manifest: &mut Manifest,
     path: &str,
@@ -171,9 +189,7 @@ fn create_at_path(
     chunk_hashes: &[String],
     size: u64,
 ) -> Result<NodeId> {
-    if path.is_empty() {
-        return Err(anyhow!("empty path"));
-    }
+    validate_user_path(path)?;
     {
         let proj = project(manifest);
         if proj.by_path.contains_key(path) {
@@ -195,9 +211,7 @@ fn create_at_path_allowing_collision(
     chunk_hashes: &[String],
     size: u64,
 ) -> Result<NodeId> {
-    if path.is_empty() {
-        return Err(anyhow!("empty path"));
-    }
+    validate_user_path(path)?;
     let (parent_path, leaf) = split_path(path);
     if leaf.is_empty() {
         return Err(anyhow!("path {:?} has empty leaf", path));
