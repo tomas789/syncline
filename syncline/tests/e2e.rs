@@ -3136,3 +3136,55 @@ async fn auto_apr28_008_wiped_syncline_dir_recovers_via_resync() {
     client_b2.kill().await.unwrap();
     server.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-011: zero-byte text files round-trip across peers. Edge
+// case for any system that has a "is empty?" branch (syncline does —
+// adoption uses `body.is_empty()` as a short-circuit). The empty file
+// must be created on disk on the receiving peer with size 0; not
+// silently dropped, not represented as a 1-byte file with a NUL.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_011_empty_text_file_roundtrip() {
+    let env = TestEnv::new(2).await;
+
+    // Peer 0 creates an empty text file.
+    let path0 = env.client_path(0).join("empty.md");
+    fs::write(&path0, b"").unwrap();
+
+    // Peer 0 also creates a non-empty file to ensure the manifest
+    // sync isn't itself broken (as a control).
+    fs::write(env.client_path(0).join("control.md"), b"non-empty").unwrap();
+
+    let dirs = env.dirs();
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(20)).await;
+    assert!(converged, "convergence should succeed for empty + control");
+
+    // Peer 1's empty.md must exist and be 0 bytes.
+    let path1 = env.client_path(1).join("empty.md");
+    assert!(path1.is_file(), "peer 1 must have empty.md");
+    let bytes = fs::read(&path1).unwrap();
+    assert_eq!(
+        bytes.len(),
+        0,
+        "empty.md on peer 1 should be 0 bytes, got {} bytes: {:?}",
+        bytes.len(),
+        bytes
+    );
+
+    // Now flip: peer 1 modifies empty.md to a non-empty value. Peer 0
+    // should receive it.
+    fs::write(&path1, "now has content\n").unwrap();
+    let post_path = env.client_path(0).join("empty.md");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let saw_content = poll_until(deadline, || {
+        fs::read_to_string(&post_path)
+            .map(|s| s == "now has content\n")
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        saw_content,
+        "peer 0 should observe peer 1's modification to the once-empty file"
+    );
+}
