@@ -2994,3 +2994,134 @@ async fn auto_apr28_003_server_sigkill_mid_sync_then_restart_converges() {
     client_b.kill().await.unwrap();
     server2.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-008: peer B's `.syncline/` directory is wiped (manual
+// `rm -rf` / disk corruption / failed install) while its vault files
+// remain on disk. On reconnect the peer should re-handshake with the
+// server, re-discover its actor_id is fresh, and converge to the same
+// vault contents as peer A. No duplicates, no loss, no conflict copies
+// (the disk content already agrees with the server's manifest).
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_008_wiped_syncline_dir_recovers_via_resync() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Peer A authors several files; both peers converge.
+    for i in 0..6 {
+        fs::write(
+            dir_a.path().join(format!("file-{i:02}.md")),
+            format!("content of file {i}\n"),
+        )
+        .unwrap();
+    }
+    let dirs = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+    assert!(
+        wait_for_convergence(&dirs, Duration::from_secs(20)).await,
+        "initial sync should converge"
+    );
+
+    // Sanity: peer B has them all.
+    for i in 0..6 {
+        let p = dir_b.path().join(format!("file-{i:02}.md"));
+        assert!(p.is_file(), "peer B missing initial file {p:?}");
+    }
+
+    // Kill peer B and wipe its .syncline directory entirely.
+    client_b.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let syncline_dir = dir_b.path().join(".syncline");
+    assert!(syncline_dir.is_dir(), "pre-wipe sanity");
+    fs::remove_dir_all(&syncline_dir).expect("wipe .syncline/");
+    assert!(
+        !syncline_dir.exists(),
+        "post-wipe: .syncline/ must be gone"
+    );
+
+    // Vault user files are still on disk untouched. Reconnect peer B.
+    let mut client_b2 = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+
+    // First wait for the new peer B to actually come up — its
+    // .syncline/manifest.bin should be re-created within a few seconds
+    // of process start. Without this gate, `wait_for_convergence`
+    // trivially passes (both A and B's user files were unchanged by
+    // the wipe).
+    let manifest_back_deadline =
+        std::time::Instant::now() + Duration::from_secs(20);
+    let manifest_back = poll_until(manifest_back_deadline, || {
+        syncline_dir.join("manifest.bin").is_file()
+    })
+    .await;
+    assert!(
+        manifest_back,
+        ".syncline/manifest.bin should be re-created after \
+         peer B reconnects post-wipe"
+    );
+
+    // Now actually verify a write→sync round-trip works after the
+    // wipe. Peer A authors a new file; peer B must receive it.
+    fs::write(dir_a.path().join("post-wipe-from-a.md"), "after wipe\n").unwrap();
+    let post_wipe_path_b = dir_b.path().join("post-wipe-from-a.md");
+    let post_wipe_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let post_wipe_ok = poll_until(post_wipe_deadline, || {
+        post_wipe_path_b
+            .is_file()
+            && fs::read_to_string(&post_wipe_path_b)
+                .map(|s| s == "after wipe\n")
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        post_wipe_ok,
+        "post-wipe peer B should receive new files from peer A"
+    );
+
+    // .syncline/ must be back.
+    assert!(
+        syncline_dir.is_dir(),
+        ".syncline/ should be re-created after resync"
+    );
+
+    // No conflict copies should exist on either side. The disk
+    // bytes already match the server's manifest content for every
+    // file, so the scanner's adoption rules should attach the local
+    // disk file to the existing manifest entry rather than minting a
+    // fresh colliding NodeId.
+    let conflicts_a = count_conflict_files(dir_a.path());
+    let conflicts_b = count_conflict_files(dir_b.path());
+    assert_eq!(
+        conflicts_a, 0,
+        "no conflicts on A after resync"
+    );
+    assert_eq!(
+        conflicts_b, 0,
+        "no conflicts on B after resync (disk already matched manifest)"
+    );
+
+    // Every original file must still be on B and equal A's content.
+    for i in 0..6 {
+        let pa = dir_a.path().join(format!("file-{i:02}.md"));
+        let pb = dir_b.path().join(format!("file-{i:02}.md"));
+        assert!(pb.is_file(), "B missing file-{i:02}.md after resync");
+        assert_eq!(
+            fs::read_to_string(&pa).unwrap(),
+            fs::read_to_string(&pb).unwrap(),
+            "file-{i:02}.md content diverged after wipe+resync"
+        );
+    }
+
+    client_a.kill().await.unwrap();
+    client_b2.kill().await.unwrap();
+    server.kill().await.unwrap();
+}
