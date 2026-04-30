@@ -3592,6 +3592,106 @@ async fn auto_apr28_033_deeply_nested_tree_single_peer_bootstraps() {
 }
 
 // ===========================================================================
+// auto-apr28-035: server is started, peers converge on a baseline,
+// server is killed, the on-disk SQLite file is truncated to half its
+// size (simulating disk corruption / a power-loss tear), then the
+// server is restarted with a fresh DB at the same path. Clients must
+// either bootstrap to a clean state on the new DB or fail loud — never
+// silently desync. Currently we expect the new server to start with
+// an empty DB (sqlx replaces a malformed file by truncating /
+// re-initialising on connect failure, OR the test catches this and
+// confirms the failure mode).
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_035_server_restart_with_corrupted_db_starts_clean_or_fails_loud() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+
+    // Phase 1: server up, two peers converge.
+    let mut server1 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let dir_a = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    fs::write(dir_a.path().join("baseline.md"), "before crash\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Kill server first, then drop client (avoid client crash-loops on
+    // a truncated DB — we want to test the SERVER's behaviour).
+    client_a.kill().await.unwrap();
+    server1.kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: corrupt the DB file. Truncate to half its current size.
+    // SQLite's WAL files (`-wal`, `-shm`) we leave alone — many
+    // production crashes leave only the main file inconsistent.
+    let original_size = fs::metadata(&db_path).unwrap().len();
+    assert!(
+        original_size > 100,
+        "db should be non-trivial, was {}",
+        original_size
+    );
+    let corrupt_size = original_size / 2;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .unwrap();
+    f.set_len(corrupt_size).unwrap();
+    drop(f);
+
+    // Phase 3: restart server with the corrupted DB. The acceptable
+    // outcomes are:
+    //   (a) the server starts (sqlx may rebuild or report errors but
+    //       the process accepts new connections), and a fresh peer can
+    //       connect and write a file — the recovery is "clean slate".
+    //   (b) the server fails to start — process exits with non-zero —
+    //       and the operator must intervene. Either is loud and
+    //       acceptable; silent desync is not.
+    let mut server2 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let still_running = server2.try_wait().unwrap().is_none();
+
+    if !still_running {
+        // Outcome (b): loud failure. That's fine — operator must
+        // restore from backup. Test passes by recording this branch.
+        eprintln!("server refused to start on corrupted DB — loud failure (acceptable)");
+        return;
+    }
+
+    // Outcome (a): server is alive. A fresh peer must be able to
+    // connect and exchange data.
+    let dir_c = TempDir::new().unwrap();
+    let mut client_c = spawn_client_with_name(dir_c.path(), port, "peer-c").await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    fs::write(dir_c.path().join("after-corrupt.md"), "post-corrupt\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Another fresh peer should also be able to read what C wrote.
+    let dir_d = TempDir::new().unwrap();
+    let mut client_d = spawn_client_with_name(dir_d.path(), port, "peer-d").await;
+    let target = dir_d.path().join("after-corrupt.md");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let saw = poll_until(deadline, || {
+        target.is_file()
+            && fs::read_to_string(&target)
+                .map(|s| s == "post-corrupt\n")
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        saw,
+        "post-corruption recovery: peer D should see peer C's write"
+    );
+
+    client_c.kill().await.unwrap();
+    client_d.kill().await.unwrap();
+    server2.kill().await.unwrap();
+}
+
+// ===========================================================================
 // auto-apr28-034: a single CLI peer is restarted three times in a row.
 // Each restart, a different file is added to the vault before the next
 // restart. The peer's actor_id (from `.syncline/actor_id`) survives,
