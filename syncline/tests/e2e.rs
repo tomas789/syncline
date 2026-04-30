@@ -2875,3 +2875,122 @@ async fn test_obsidian_like_onboarding_with_pre_existing_vault() {
     client_seeded2.kill().await.unwrap();
     server.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-003: server SIGKILL mid-broadcast → restart with same DB →
+// peers must re-converge cleanly. Models a real ops event: server crash
+// (or node reboot) while two CLI peers are exchanging a small batch of
+// files. After restart, the same SQLite DB carries forward, and clients
+// must re-handshake, push their post-crash deltas, and converge.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_003_server_sigkill_mid_sync_then_restart_converges() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+
+    // Phase 1: server up, two clients connect, write a baseline file.
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    fs::write(dir_a.path().join("baseline.md"), "before crash\n").unwrap();
+    let dirs = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+    assert!(
+        wait_for_convergence(&dirs, Duration::from_secs(20)).await,
+        "baseline should converge before crash",
+    );
+
+    // Phase 2: while clients are quiet, write more files on both sides
+    // and IMMEDIATELY kill the server. Some of those writes may not
+    // have made it into the DB.
+    fs::write(dir_a.path().join("a-during-crash.md"), "a wrote this\n").unwrap();
+    fs::write(dir_b.path().join("b-during-crash.md"), "b wrote this\n").unwrap();
+    // Tiny window — emulate "writes in flight, server dies".
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    server.kill().await.unwrap();
+
+    // Phase 3: server stays down briefly, then we restart against the
+    // same DB. Clients should reconnect on their own (RECONNECT_BASE_MS
+    // backoff in the CLI).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut server2 = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // After server restart, clients reconnect, push their during-crash
+    // writes, and converge. Add one more post-restart write to prove
+    // the channel is healthy.
+    fs::write(dir_a.path().join("post-restart.md"), "after restart\n").unwrap();
+    let converged_after = wait_for_convergence(&dirs, Duration::from_secs(60)).await;
+
+    // Best-effort: collect what we ended up with on both sides.
+    let user_files = |dir: &Path| -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let rel = p.strip_prefix(dir).unwrap();
+            let s = rel.to_string_lossy().to_string();
+            if s.starts_with(".syncline") {
+                continue;
+            }
+            out.push(s);
+        }
+        out.sort();
+        out
+    };
+    let a_files = user_files(dir_a.path());
+    let b_files = user_files(dir_b.path());
+    assert!(
+        converged_after,
+        "peers must converge after server restart\nA: {:?}\nB: {:?}",
+        a_files,
+        b_files,
+    );
+
+    // Sanity: every file we authored must have ended up on both peers.
+    for must in &[
+        "baseline.md",
+        "a-during-crash.md",
+        "b-during-crash.md",
+        "post-restart.md",
+    ] {
+        assert!(
+            a_files.iter().any(|f| f == must),
+            "peer A missing {must} — has {:?}",
+            a_files
+        );
+        assert!(
+            b_files.iter().any(|f| f == must),
+            "peer B missing {must} — has {:?}",
+            b_files
+        );
+    }
+
+    // No conflict copies should exist — none of these writes collided.
+    assert_eq!(
+        count_conflict_files(dir_a.path()),
+        0,
+        "no conflict files expected on peer A"
+    );
+    assert_eq!(
+        count_conflict_files(dir_b.path()),
+        0,
+        "no conflict files expected on peer B"
+    );
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server2.kill().await.unwrap();
+}
