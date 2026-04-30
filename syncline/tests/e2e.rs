@@ -3514,3 +3514,79 @@ async fn auto_apr28_031_server_killed_mid_blob_upload_recovers() {
     client_b.kill().await.unwrap();
     server2.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-033: a single peer with a deeply nested directory layout
+// (8 levels deep, multiple files per level, ~50 files total) bootstraps
+// against an empty server. A second fresh peer joins and must observe
+// the entire tree. Catches regressions in projection of deep paths and
+// directory bootstrap ordering.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_033_deeply_nested_tree_single_peer_bootstraps() {
+    build_workspace().await;
+    let port = get_available_port();
+    let server_dir = TempDir::new().unwrap();
+    let db_path = server_dir.path().join("test.db");
+
+    let mut server = spawn_server(port, &db_path).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Pre-seed peer A's vault with a deeply nested tree BEFORE the
+    // client starts — exercises offline bootstrap of an existing
+    // hierarchy.
+    let dir_a = TempDir::new().unwrap();
+    let mut all_files = Vec::new();
+    let mut current = dir_a.path().to_path_buf();
+    for level in 0..8 {
+        current = current.join(format!("level{level}"));
+        fs::create_dir_all(&current).unwrap();
+        // 5 files per level
+        for n in 0..5 {
+            let p = current.join(format!("file{level}-{n}.md"));
+            let body = format!("level={level} file={n}\n");
+            fs::write(&p, body.as_bytes()).unwrap();
+            all_files.push((p.strip_prefix(dir_a.path()).unwrap().to_path_buf(), body));
+        }
+    }
+    assert_eq!(all_files.len(), 40);
+
+    // Now start peer A — it must scan the disk and upload everything.
+    let mut client_a = spawn_client_with_name(dir_a.path(), port, "peer-a").await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // Fresh peer B joins.
+    let dir_b = TempDir::new().unwrap();
+    let mut client_b = spawn_client_with_name(dir_b.path(), port, "peer-b").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let saw_all = poll_until(deadline, || {
+        all_files.iter().all(|(rel, body)| {
+            let p = dir_b.path().join(rel);
+            p.is_file()
+                && fs::read_to_string(&p)
+                    .map(|s| s == *body)
+                    .unwrap_or(false)
+        })
+    })
+    .await;
+    assert!(
+        saw_all,
+        "fresh peer B should observe every file in the deep tree \
+         (peer A files: {}, peer B observed-on-disk: {})",
+        all_files.len(),
+        walkdir::WalkDir::new(dir_b.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file()
+                && !e.path().to_string_lossy().contains(".syncline"))
+            .count(),
+    );
+
+    assert_eq!(count_conflict_files(dir_a.path()), 0, "no conflicts on A");
+    assert_eq!(count_conflict_files(dir_b.path()), 0, "no conflicts on B");
+
+    client_a.kill().await.unwrap();
+    client_b.kill().await.unwrap();
+    server.kill().await.unwrap();
+}
