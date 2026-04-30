@@ -985,4 +985,107 @@ mod tests {
             "server must reciprocate STEP_1 even when it has no content for the doc"
         );
     }
+
+    // =====================================================================
+    // auto-apr28-006: adversarial — feed the server a barrage of
+    // garbage frames over a real WS, then prove a follow-up well-formed
+    // client can still complete a clean handshake on a NEW connection.
+    // The server must not crash, leak the connection's resources, or
+    // poison subsequent clients.
+    // =====================================================================
+    #[tokio::test]
+    async fn auto_apr28_006_server_survives_garbage_frames() {
+        let (port, _state) = setup_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/sync", port);
+
+        // Connection 1: open, blast garbage, drop.
+        let (mut ws_bad, _) = connect_async(&url).await.unwrap();
+
+        // Frame 1: too short to even hold a msg_type byte.
+        ws_bad
+            .send(TungsteniteMessage::Binary(vec![].into()))
+            .await
+            .unwrap();
+        ws_bad
+            .send(TungsteniteMessage::Binary(vec![0x42].into()))
+            .await
+            .unwrap();
+
+        // Frame 2: msg_type = 0xFF (unknown), arbitrary tail.
+        ws_bad
+            .send(TungsteniteMessage::Binary(
+                vec![0xff, 0xde, 0xad, 0xbe, 0xef].into(),
+            ))
+            .await
+            .unwrap();
+
+        // Frame 3: well-framed MSG_UPDATE on a manifest doc with
+        // garbage payload bytes that aren't a valid Yrs update.
+        let bad_update = encode_message(MSG_UPDATE, MANIFEST_DOC_ID, &[0xfa, 0xce, 0xfe, 0xed]);
+        ws_bad
+            .send(TungsteniteMessage::Binary(bad_update.into()))
+            .await
+            .unwrap();
+
+        // Frame 4: well-framed MSG_SYNC_STEP_1 with a state-vector
+        // payload that's truncated.
+        let bad_sv = encode_message(
+            MSG_SYNC_STEP_1,
+            "content:00000000-0000-0000-0000-000000000000",
+            &[0xff, 0xff, 0xff],
+        );
+        ws_bad
+            .send(TungsteniteMessage::Binary(bad_sv.into()))
+            .await
+            .unwrap();
+
+        // Frame 5: a giant payload (1 MiB) of zeros claiming to be a
+        // MSG_BLOB_UPDATE with a bogus 'hash' as doc_id.
+        let big_garbage = vec![0u8; 1024 * 1024];
+        let big_frame = encode_message(MSG_BLOB_UPDATE, "deadbeef", &big_garbage);
+        ws_bad
+            .send(TungsteniteMessage::Binary(big_frame.into()))
+            .await
+            .unwrap();
+
+        // Drop the bad connection without a clean close. Give the
+        // server a moment to clean up.
+        drop(ws_bad);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Connection 2: a fresh, well-behaved client must still
+        // complete a clean v1 handshake. If the server is wedged or
+        // crashed, this connect_async will fail or the handshake will
+        // time out.
+        let (mut ws_good, _) = connect_async(&url).await.unwrap();
+        let frame = encode_message(
+            MSG_VERSION,
+            MANIFEST_DOC_ID,
+            &encode_version_handshake(),
+        );
+        send_bin(&mut ws_good, frame).await;
+        let echo = recv_bin(&mut ws_good).await;
+        let (t, d, p) = decode_message(&echo).expect("server echoed framed VERSION");
+        assert_eq!(t, MSG_VERSION);
+        assert_eq!(d, MANIFEST_DOC_ID);
+        let (major, minor) = decode_version_handshake(p).expect("valid version payload");
+        assert_eq!((major, minor), (V1_PROTOCOL_MAJOR, V1_PROTOCOL_MINOR));
+
+        // And a normal manifest STEP_1 should still get a STEP_2.
+        let manifest = Manifest::new(ActorId::new());
+        let step1 = manifest_step1_payload(&manifest);
+        let frame = encode_message(MSG_MANIFEST_SYNC, MANIFEST_DOC_ID, &step1);
+        send_bin(&mut ws_good, frame).await;
+        // We expect a STEP_2 reply (server's own) and possibly a
+        // STEP_1 (server soliciting our state). Just verify *something*
+        // framed comes back within 2s.
+        let reply = recv_bin(&mut ws_good).await;
+        let (t, d, _p) = decode_message(&reply).expect("server reply is well-framed");
+        assert_eq!(d, MANIFEST_DOC_ID);
+        assert!(
+            t == MSG_MANIFEST_SYNC,
+            "expected MSG_MANIFEST_SYNC reply, got msg_type 0x{:02x}",
+            t
+        );
+    }
 }
