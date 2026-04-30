@@ -1803,3 +1803,67 @@ fn auto_apr28_012_case_only_difference_keeps_distinct_manifest_rows() {
     assert_eq!(pa.by_path["readme.md"].size, 2);
     assert_eq!(pa.by_path["ReadMe.md"].size, 3);
 }
+
+// ===========================================================================
+// auto-apr28-013: 5-peer rename storm. Each peer concurrently renames
+// the same file to a unique new name. After full-mesh sync, exactly
+// one rename wins (lamport+actor LWW), the file is at exactly one
+// path, and every peer agrees.
+// ===========================================================================
+#[test]
+fn auto_apr28_013_five_peer_concurrent_rename_storm_converges() {
+    // Bootstrap: every peer starts from the same baseline with
+    // shared.md.
+    let baseline = {
+        let mut m = Manifest::new(ActorId::new());
+        create_text(&mut m, "shared.md", 0).unwrap();
+        m.encode_state_as_update()
+    };
+
+    let mut peers: Vec<Manifest> = (0..5)
+        .map(|_| Manifest::from_update(ActorId::new(), Lamport::ZERO, &baseline).unwrap())
+        .collect();
+
+    // Each peer renames to a unique new name.
+    let targets = [
+        "winner-1.md",
+        "winner-2.md",
+        "winner-3.md",
+        "winner-4.md",
+        "winner-5.md",
+    ];
+    for (i, m) in peers.iter_mut().enumerate() {
+        rename(m, "shared.md", targets[i]).unwrap();
+    }
+
+    full_mesh_sync(&mut peers, 6);
+    let head_hash = projection_hash(&peers[0]);
+    for (i, p) in peers.iter().enumerate().skip(1) {
+        assert_eq!(
+            projection_hash(p),
+            head_hash,
+            "peer {i} diverged from peer 0 after rename storm"
+        );
+    }
+
+    // Every peer sees exactly one live file.
+    for (i, p) in peers.iter().enumerate() {
+        let proj = project(p);
+        assert_eq!(
+            proj.by_path.len(),
+            1,
+            "peer {i}: expected exactly one live entry, got {:?}",
+            proj.by_path.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // The winning name must be one of the candidates.
+    let winning_path: Vec<_> = project(&peers[0]).by_path.keys().cloned().collect();
+    assert_eq!(winning_path.len(), 1);
+    assert!(
+        targets.contains(&winning_path[0].as_str()),
+        "winner {:?} should be one of {:?}",
+        winning_path[0],
+        targets
+    );
+}
