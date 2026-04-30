@@ -3335,3 +3335,53 @@ async fn auto_apr28_018_three_peer_concurrent_burst_writes_converge() {
     }
     server.kill().await.unwrap();
 }
+
+// ===========================================================================
+// auto-apr28-024: binary file is created, syncs, then renamed across
+// folder boundaries on peer 0. Peer 1 must observe the rename — same
+// bytes appear at the new path, original path gone, no conflict copies.
+// ===========================================================================
+#[tokio::test]
+async fn auto_apr28_024_binary_rename_across_folders_propagates() {
+    let env = TestEnv::new(2).await;
+
+    // Peer 0 creates a binary file at the root.
+    let original = env.client_path(0).join("image.bin");
+    let bytes: Vec<u8> = (0..1024u32).flat_map(|i| (i as u32).to_le_bytes()).collect();
+    fs::write(&original, &bytes).unwrap();
+
+    // Wait until peer 1 has it.
+    let dirs = env.dirs();
+    let converged = wait_for_convergence(&dirs, Duration::from_secs(20)).await;
+    assert!(converged, "initial binary sync should converge");
+    let p1_original = env.client_path(1).join("image.bin");
+    assert!(p1_original.is_file());
+    assert_eq!(fs::read(&p1_original).unwrap(), bytes);
+
+    // Peer 0 renames the binary file into a new subfolder.
+    fs::create_dir_all(env.client_path(0).join("Pictures")).unwrap();
+    let new_path = env.client_path(0).join("Pictures/cool.bin");
+    fs::rename(&original, &new_path).unwrap();
+
+    // Wait for peer 1 to see the rename.
+    let p1_new = env.client_path(1).join("Pictures/cool.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let renamed = poll_until(deadline, || {
+        p1_new.is_file()
+            && !p1_original.exists()
+            && fs::read(&p1_new).map(|b| b == bytes).unwrap_or(false)
+    })
+    .await;
+    assert!(
+        renamed,
+        "binary rename should propagate to peer 1: \
+         new path exists? {}, original gone? {}, content match? {}",
+        p1_new.is_file(),
+        !p1_original.exists(),
+        fs::read(&p1_new).map(|b| b == bytes).unwrap_or(false),
+    );
+
+    // No conflict copies anywhere.
+    assert_eq!(count_conflict_files(env.client_path(0)), 0);
+    assert_eq!(count_conflict_files(env.client_path(1)), 0);
+}
